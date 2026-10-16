@@ -646,10 +646,19 @@ pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::D
             entries = reordered;
         }
     }
-    // 向量增强：有 keyword 时用语义向量召回与关键词命中做 RRF 融合重排，
-    // 让"语义相关但无字面命中"的 API 也能浮上来；向量索引/模型不可用时自动降级为纯关键词结果。
-    // 注意：依赖 candle 的 vector_search 仅在 embedding feature 下可用（见 embedding 模块说明），
-    // 故整个增强块用 cfg(feature = "embedding") 隔离；未启用时走纯关键词路径。
+    // 向量增强：**有关键词命中时**在关键词集合内用向量排名重排；
+    // **关键词一条都没命中时**直接用向量结果（那是唯一的机会）。
+    //
+    // 第二十四批实测定下的口径（生产代码跑出来的）：
+    // - 关键词层在精确标识符查询上 top1 3/3（`getWindowProperties` / `createWindow` /
+    //   `getBundleInfo` 全部第 1 名），在语义/中文查询上**召回 0 条（15/15）**——
+    //   召回靠 `LIKE '%keyword%'` 字面子串，而 `declaration` 含非 ASCII 的行 = 0/44,856。
+    // - 向量层在语义查询上 top10 3/15，是**唯一**能给中文查询出结果的一层。
+    // ⇒ 规则是「弱信号只在没有强信号时使用」：有关键词命中时不让向量引入新文档
+    //   （它实测 top1 0/15，压过 BM25 只会更差）；一个都没有时放行。
+    //
+    // 注意依赖 candle 的 vector_search 仅在 embedding feature 下可用
+    // （见 embedding 模块说明），故整个增强块用 cfg(feature = "embedding") 隔离。
     #[cfg(feature = "embedding")]
     {
         let keyword = query.keyword.clone().unwrap_or_default();
@@ -657,6 +666,8 @@ pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::D
             if let Ok(Some(vec_hits)) =
                 crate::services::embedding::vector_search(&conn, &keyword, 50)
             {
+                // 关键词侧的 id 已按 BM25 重排（上面那段），故此处顺序即 BM25 名次；
+                // rrf_fuse 只用名次不用分值，score 传 0.0 无影响。
                 let kw_hits: Vec<(i64, f32)> = entries
                     .iter()
                     .filter_map(|e| e.id)
@@ -683,6 +694,8 @@ pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::D
                         if let Some(e) = by_id.get(&id) {
                             reordered.push(e.clone());
                         } else if let Ok(Some(e)) = fetch_api_entry_by_id(&conn, id) {
+                            // 兜底：**当前可达**——关键词集合为空时 rrf_fuse 会放行向量命中，
+                            // 这些 id 不在 by_id 里。关键词非空时它不可达（fused ⊆ kw_hits）。
                             reordered.push(e);
                         }
                     }
@@ -693,6 +706,22 @@ pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::D
             }
         }
     }
+    // 零命中且是关键词查询 ⇒ 光说「共找到 0 条」等于把人丢在死胡同里。
+    // 关键词层靠 `LIKE '%keyword%'` 字面子串召回，而语料 declaration 含非 ASCII 的行
+    // = 0/44,856 ⇒ 中文/描述性关键词在关键词层必然 0 命中（实测 15/15）。
+    // 能不能靠语义层兜底取决于索引状态，把状态说出来，并给出下一步该做什么。
+    // **必须在 drop(conn) 之前取**；成本是一次 COUNT +（可能的）指纹比对。
+    // 注意：`semantic_layer_state` 判到 `Ready`/`StaleIndex` 时会经 `global_embedder()`
+    // **首次**加载 91MB 模型（约 1~2 秒）——原先这里写的是「模型早已被 vector_search
+    // 加载过」，**那是个假设而不是保证**：若向量层在此之前就因指纹不匹配早退、
+    // 或压根没建过索引，这条路径就是首次调用。判定结果不受影响（只是慢一次），
+    // 但那条旧注释会让人以为这里永远免费。
+    let zero_hit_hint = (entries.is_empty()
+        && query.keyword.as_deref().is_some_and(|k| !k.trim().is_empty()))
+    .then(|| {
+        let s = crate::services::embedding::semantic_layer_state(&conn);
+        (s.label(), s.hint())
+    });
     drop(conn);
 
     let mut out = format!("API 上下文：{}\n共找到 {} 条匹配（知识库总量 {total} 条）：\n\n", context.describe(), entries.len());
@@ -726,6 +755,15 @@ pub(super) async fn search_api(args: &Value, roots: &[String], db: &crate::db::D
     }
     if entries.len() > 50 {
         out.push_str(&format!("... 还有 {} 条，可缩小关键词或加 module/kit 过滤。\n", entries.len() - 50));
+    }
+    // 零命中且是关键词查询 ⇒ 光说「共找到 0 条」等于把人丢在死胡同里。
+    // 关键词层靠 `LIKE '%keyword%'` 字面子串召回，而语料 declaration 含非 ASCII 的行
+    // = 0/44,856 ⇒ 中文/描述性关键词在关键词层必然 0 命中（实测 15/15）。
+    // 能不能靠语义层兜底取决于索引状态，把状态说出来，并给出下一步该做什么。
+    if let Some((label, hint)) = zero_hit_hint {
+        out.push_str(&format!("\n未命中原因（语义层状态）：{label}\n"));
+        out.push_str(hint);
+        out.push('\n');
     }
     Ok(out)
     })

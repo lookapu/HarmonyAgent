@@ -286,7 +286,7 @@ export default function CostPage() {
         <button
           onClick={exportBillingCsv}
           disabled={!summary || summary.total_requests === 0}
-          className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-[12px] text-[var(--text-secondary)] transition-colors"
+          className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-[length:var(--app-text-sm)] text-[var(--text-secondary)] transition-colors"
           title={t('cost.exportBilling')}
         >
           <Icon name="download" size={13} />
@@ -314,7 +314,7 @@ export default function CostPage() {
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-medium text-[var(--text-secondary)]">{t('cost.balances')}</h3>
         <div className="flex items-center gap-3">
-          <label className="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] cursor-pointer select-none">
+          <label className="flex items-center gap-1.5 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] cursor-pointer select-none">
             <input
               type="checkbox"
               checked={balanceUseProxy}
@@ -326,7 +326,7 @@ export default function CostPage() {
           <button
             onClick={loadBalances}
             disabled={balanceLoading}
-            className="flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-50"
+            className="flex items-center gap-1 text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-50"
           >
             <Icon name="refresh" size={12} className={balanceLoading ? 'animate-spin' : ''} />
             {t('cost.refreshBalance')}
@@ -360,12 +360,12 @@ export default function CostPage() {
       <div className="flex items-center justify-between mb-3">
         <div>
           <h3 className="text-sm font-medium text-[var(--text-secondary)]">{t('cost.reliabilityTitle')}</h3>
-          <p className="text-[11px] text-[var(--text-muted)] mt-0.5">{t('cost.reliabilityDesc')}</p>
+          <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5">{t('cost.reliabilityDesc')}</p>
         </div>
         <button
           onClick={runReliabilityGate}
           disabled={reliabilityLoading}
-          className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-50 text-[12px] transition-colors"
+          className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-[var(--border)] hover:bg-[var(--bg-hover)] disabled:opacity-50 text-[length:var(--app-text-sm)] transition-colors"
         >
           <Icon name="refresh" size={12} className={reliabilityLoading ? 'animate-spin' : ''} />
           {t('cost.runReliabilityGate')}
@@ -374,7 +374,7 @@ export default function CostPage() {
       <div className="modern-card rounded-lg p-4 mb-6 space-y-4">
         <div className="grid grid-cols-4 gap-4">
           <StatCard label={t('cost.acceptanceRate')} value={reliability?.total_runs ? `${(reliability.acceptance_rate * 100).toFixed(1)}%` : '—'} tone={reliability?.total_runs ? rateTone(reliability.acceptance_rate) : undefined} />
-          <StatCard label={t('cost.qualityScore')} value={reliability?.total_runs ? reliability.average_quality_score.toFixed(1) : '—'} tone={reliability?.total_runs ? scoreTone(reliability.average_quality_score) : undefined} />
+          <StatCard label={t('cost.qualityScore')} value={qualityScoreValue(reliability)} tone={qualityScoreTone(reliability)} />
           <StatCard label={t('cost.evidenceCoverage')} value={`${((reliability?.structured_evidence_coverage ?? 0) * 100).toFixed(1)}%`} tone={rateTone(reliability?.structured_evidence_coverage)} />
           <StatCard label={t('cost.falseCompletions')} value={reliability?.false_completion_count ?? 0} tone={(reliability?.false_completion_count ?? 0) === 0 ? 'ok' : 'bad'} />
         </div>
@@ -425,7 +425,7 @@ export default function CostPage() {
             <select
               value={toolMetricDimension}
               onChange={(event) => setToolMetricDimension(event.target.value as typeof toolMetricDimension)}
-              className="h-7 rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-2 text-[11px]"
+              className="h-7 rounded border border-[var(--border)] bg-[var(--bg-secondary)] px-2 text-[length:var(--app-text-xs)]"
             >
               {(['tool', 'capability_pack', 'model', 'project', 'version'] as const).map((dimension) => (
                 <option key={dimension} value={dimension}>{t(`cost.toolDimension_${dimension}`)}</option>
@@ -434,7 +434,7 @@ export default function CostPage() {
           </div>
           <div className="space-y-1.5 max-h-48 overflow-auto">
             {(reliability?.tool_metric_slices ?? []).filter((row) => row.dimension === toolMetricDimension).slice(0, 20).map((row) => (
-              <div key={`${row.dimension}:${row.value}`} className="grid grid-cols-[minmax(0,1fr)_70px_80px_80px] gap-2 text-[11px]">
+              <div key={`${row.dimension}:${row.value}`} className="grid grid-cols-[minmax(0,1fr)_70px_80px_80px] gap-2 text-[length:var(--app-text-xs)]">
                 <span className="truncate font-mono text-[var(--text-secondary)]" title={row.value}>{row.value}</span>
                 <span>{row.calls} {t('cost.calls')}</span>
                 <span>{(row.success_rate * 100).toFixed(1)}% {t('cost.successShort')}</span>
@@ -450,7 +450,7 @@ export default function CostPage() {
             ))}
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px]">
+        <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3 text-[length:var(--app-text-xs)]">
           <span className="text-[var(--text-muted)]">{t('cost.schedulerStates')}</span>
           {(reliability?.scheduler_states ?? []).map((item) => (
             <span key={item.name} className="badge-tone badge-tone-info">{item.name} · {item.count}</span>
@@ -463,7 +463,7 @@ export default function CostPage() {
           </span>
         </div>
         {latestEvalSnapshot && latestEvalSnapshot.schema_version > 0 && (
-          <div className="flex flex-wrap gap-1.5 text-[11px] text-[var(--text-muted)]">
+          <div className="flex flex-wrap gap-1.5 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
             <span className="badge-tone badge-tone-info">
               {t('cost.evalDuration')} · {latestEvalSnapshot.metrics.duration_ms} ms
             </span>
@@ -494,7 +494,7 @@ export default function CostPage() {
             <p className="text-xs text-[var(--text-secondary)] mb-2">{t('cost.toolGovernance')}</p>
             <div className="space-y-1.5 max-h-40 overflow-auto">
               {reliability?.tool_governance.slice(0, 12).map((item) => (
-                <div key={`${item.issue}:${item.tool}:${item.related_tool ?? ''}`} className="flex items-center gap-2 text-[11px]">
+                <div key={`${item.issue}:${item.tool}:${item.related_tool ?? ''}`} className="flex items-center gap-2 text-[length:var(--app-text-xs)]">
                   <span className={`badge-tone ${item.issue === 'high_failure_rate' ? 'badge-tone-bad' : 'badge-tone-warn'}`}>{item.action}</span>
                   <span className="font-mono text-[var(--text-secondary)]">
                     {item.tool}{item.related_tool ? ` ↔ ${item.related_tool}` : ''}
@@ -507,7 +507,7 @@ export default function CostPage() {
           </div>
         )}
         {sloPolicy?.enabled && (
-          <p className="text-[10.5px] text-[var(--text-muted)]">
+          <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
             {t('cost.sloTargets', { acceptance: (sloPolicy.acceptance_target * 100).toFixed(0), recovery: (sloPolicy.recovery_target * 100).toFixed(0), evidence: (sloPolicy.evidence_target * 100).toFixed(0), repeat: (sloPolicy.max_side_effect_repeat_rate * 100).toFixed(1), wrong: (sloPolicy.max_wrong_tool_selection_rate * 100).toFixed(0), ineffective: (sloPolicy.max_ineffective_call_rate * 100).toFixed(0) })}
           </p>
         )}
@@ -516,7 +516,7 @@ export default function CostPage() {
             <p className="text-xs text-[var(--text-secondary)] mb-2">{t('cost.recentAlerts')}</p>
             <div className="space-y-1.5 max-h-36 overflow-auto">
               {agentAlerts.slice(0, 8).map((alert) => (
-                <div key={alert.alert_id} className="flex items-center gap-2 text-[11px]">
+                <div key={alert.alert_id} className="flex items-center gap-2 text-[length:var(--app-text-xs)]">
                   <span className={`badge-tone ${alert.severity === 'critical' ? 'badge-tone-bad' : 'badge-tone-warn'}`}>{alert.severity}</span>
                   <span className="font-mono text-[var(--text-secondary)]">{alert.code}</span>
                   <span className="truncate" title={alert.message}>{alert.message}</span>
@@ -580,7 +580,7 @@ export default function CostPage() {
                   {taskStats.by_error_kind.map((e) => (
                     <span
                       key={e.kind}
-                      className="px-2 py-0.5 rounded-md bg-[var(--danger)]/10 text-[var(--danger)] text-[11px]"
+                      className="px-2 py-0.5 rounded-md bg-[var(--danger)]/10 text-[var(--danger)] text-[length:var(--app-text-xs)]"
                     >
                       {errKindLabel(e.kind)} × {e.count}
                     </span>
@@ -656,10 +656,10 @@ export default function CostPage() {
               <div className="flex-1 min-w-[200px] rounded-lg border border-[var(--border)] p-3">
                 <p className="text-xs text-[var(--text-secondary)] mb-1.5">{t('cost.autoPoolMain')}</p>
                 {autoStats.main_pool.length === 0 ? (
-                  <p className="text-[11px] text-[var(--text-muted)]">—</p>
+                  <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">—</p>
                 ) : (
                   autoStats.main_pool.map((p) => (
-                    <div key={p.provider_id} className="flex items-center justify-between text-[11px] py-0.5">
+                    <div key={p.provider_id} className="flex items-center justify-between text-[length:var(--app-text-xs)] py-0.5">
                       <span className="truncate" title={p.name}>
                         {p.is_active ? '★ ' : ''}{p.name}
                         {p.auto_pool_mode > 0 && !p.is_active && (
@@ -674,10 +674,10 @@ export default function CostPage() {
               <div className="flex-1 min-w-[200px] rounded-lg border border-[var(--border)] p-3">
                 <p className="text-xs text-[var(--text-secondary)] mb-1.5">{t('cost.autoPoolAux')}</p>
                 {autoStats.aux_pool.length === 0 ? (
-                  <p className="text-[11px] text-[var(--text-muted)]">—</p>
+                  <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">—</p>
                 ) : (
                   autoStats.aux_pool.map((p) => (
-                    <div key={p.provider_id} className="flex items-center justify-between text-[11px] py-0.5">
+                    <div key={p.provider_id} className="flex items-center justify-between text-[length:var(--app-text-xs)] py-0.5">
                       <span className="truncate" title={p.name}>{p.is_active ? '★ ' : ''}{p.name}</span>
                       <span className="shrink-0 text-[var(--text-muted)] tnum">{p.model_count}</span>
                     </div>
@@ -688,7 +688,7 @@ export default function CostPage() {
             <div>
               <p className="text-xs text-[var(--text-secondary)] mb-1.5">{t('cost.autoPoolUsage')}</p>
               {autoStats.usage_by_model.length === 0 ? (
-                <p className="text-[11px] text-[var(--text-muted)]">{t('cost.autoPoolUsageEmpty')}</p>
+                <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('cost.autoPoolUsageEmpty')}</p>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
@@ -734,7 +734,7 @@ export default function CostPage() {
                   .then(setTaskRuns)
                   .catch(() => {})
               }}
-              className={`px-2 py-0.5 rounded-md text-[11px] transition-colors ${
+              className={`px-2 py-0.5 rounded-md text-[length:var(--app-text-xs)] transition-colors ${
                 runFilter === s
                   ? 'tab-active'
                   : 'tab-inactive'
@@ -776,7 +776,7 @@ export default function CostPage() {
                   <td className="px-4 py-2 whitespace-nowrap">{formatDateTime(r.started_at)}</td>
                   <td className="px-4 py-2">
                     <span
-                      className="px-1.5 py-0.5 rounded text-[11px]"
+                      className="px-1.5 py-0.5 rounded text-[length:var(--app-text-xs)]"
                       style={{
                         backgroundColor:
                           r.status === 'success'
@@ -813,7 +813,7 @@ export default function CostPage() {
                   <td className="px-4 py-2 max-w-[220px]">
                     {r.error_kind ? (
                       <span
-                        className="px-1.5 py-0.5 rounded text-[11px] bg-[var(--danger)]/10 text-[var(--danger)]"
+                        className="px-1.5 py-0.5 rounded text-[length:var(--app-text-xs)] bg-[var(--danger)]/10 text-[var(--danger)]"
                         title={r.error_message ?? ''}
                       >
                         {errKindLabel(r.error_kind)}
@@ -836,7 +836,7 @@ export default function CostPage() {
       <div className="flex items-center justify-between mb-3 mt-2">
         <h3 className="text-sm font-medium text-[var(--text-secondary)]">{t('cost.requestLogs')}</h3>
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1.5 text-[11px]">
+          <div className="flex items-center gap-1.5 text-[length:var(--app-text-xs)]">
             {(['all', 'success', 'error'] as const).map((s) => (
               <button
                 key={s}
@@ -852,7 +852,7 @@ export default function CostPage() {
           <button
             onClick={() => loadRequestLogs(logPage)}
             disabled={requestLogsLoading}
-            className="flex items-center gap-1 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-50"
+            className="flex items-center gap-1 text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-50"
             title={t('cost.refreshBalance')}
           >
             <Icon name="refresh" size={12} className={requestLogsLoading ? 'animate-spin' : ''} />
@@ -902,7 +902,7 @@ export default function CostPage() {
                         <td className="px-3 py-2 whitespace-nowrap">{formatDateTime(r.created_at)}</td>
                         <td className="px-3 py-2">
                           <span
-                            className="px-1.5 py-0.5 rounded text-[10.5px] font-mono"
+                            className="px-1.5 py-0.5 rounded text-[length:var(--app-text-xs)] font-mono"
                             style={{ background: statusTone, color: '#fff', opacity: isError ? 1 : 0.85 }}
                             title={r.status_code != null ? `HTTP ${r.status_code}` : t('cost.noStatusCode')}
                           >
@@ -933,13 +933,13 @@ export default function CostPage() {
                         <td className="px-3 py-2 max-w-[200px]">
                           {r.error_message ? (
                             <span
-                              className="text-[10.5px] text-[var(--danger)] line-clamp-2"
+                              className="text-[length:var(--app-text-xs)] text-[var(--danger)] line-clamp-2"
                               title={r.error_message}
                             >
                               {r.error_message}
                             </span>
                           ) : (
-                            <span className="text-[var(--text-muted)] text-[10.5px]">—</span>
+                            <span className="text-[var(--text-muted)] text-[length:var(--app-text-xs)]">—</span>
                           )}
                         </td>
                       </tr>
@@ -948,7 +948,7 @@ export default function CostPage() {
                 </tbody>
               </table>
               {/* 分页：← / → + 当前页 / 是否有下一页 */}
-              <div className="flex items-center justify-between px-3 py-2 border-t border-[var(--border)] text-[11px] text-[var(--text-muted)] tnum">
+              <div className="flex items-center justify-between px-3 py-2 border-t border-[var(--border)] text-[length:var(--app-text-xs)] text-[var(--text-muted)] tnum">
                 <span>{t('cost.page', { page: logPage + 1 })}</span>
                 <div className="flex items-center gap-2">
                   <button
@@ -1046,13 +1046,13 @@ function BalanceCard({ b }: { b: ProviderBalance }) {
               <div className="h-full rounded-full transition-[width,background-color]" style={{ width: `${pct}%`, background: tone }} />
             </div>
           )}
-          <div className="mt-1.5 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
+          <div className="mt-1.5 flex items-center justify-between text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
             <span>{t('cost.balanceUsed')}: {sym}{b.used != null ? b.used.toFixed(2) : '—'}</span>
             <span>{t('cost.balanceTotal')}: {sym}{b.total != null ? b.total.toFixed(2) : '—'}</span>
           </div>
         </>
       ) : (
-        <p className="text-[11px] text-[var(--text-muted)] leading-relaxed mt-2 line-clamp-3" title={b.error ?? ''}>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed mt-2 line-clamp-3" title={b.error ?? ''}>
           {b.error ?? t('cost.balanceUnsupported')}
         </p>
       )}
@@ -1080,6 +1080,26 @@ function rateTone(value?: number): 'ok' | 'warn' | 'bad' {
 
 function scoreTone(value?: number): 'ok' | 'warn' | 'bad' {
   return (value ?? 0) >= 90 ? 'ok' : (value ?? 0) >= 75 ? 'warn' : 'bad'
+}
+
+/**
+ * 质量分的分母是**受裁决的运行数**，不是总运行数。
+ *
+ * 契约里一条可验证判据都没有的运行（纯问答）压根没被裁决过，把它算进来会让
+ * 「从没被检查过」显示成「完美通过」——本机实测一轮 9 字提问因此报过 100 分。
+ * 一条受裁决的运行都没有时，这个数字**没有意义**，显示 0.0 会被读成「质量极差」，
+ * 与事实相反，所以显示 `—`。
+ */
+function qualityScoreValue(r?: ReliabilityDashboard | null): string {
+  if (!r?.scored_runs) return '—'
+  return r.average_quality_score.toFixed(1)
+}
+
+function qualityScoreTone(r?: ReliabilityDashboard | null): 'ok' | 'warn' | 'bad' | undefined {
+  if (!r?.scored_runs) return undefined
+  const base = scoreTone(r.average_quality_score)
+  // 有未受裁决的运行参与统计时，均值只覆盖了被裁决的那部分，不能报绿。
+  return base === 'ok' && r.unscored_runs > 0 ? 'warn' : base
 }
 
 /** 预算进度卡：日/月预算已用 vs 上限；上限为 null 时显示"未设上限" */
@@ -1116,7 +1136,7 @@ function BudgetMeter({ label, used, limit }: { label: string; used: number; limi
           style={{ width: hasLimit ? `${Math.max(pct, 1)}%` : '100%', opacity: hasLimit ? 1 : 0.3 }}
         />
       </div>
-      <p className="text-[11px] text-[var(--text-muted)] mt-1.5 tnum">
+      <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-1.5 tnum">
         {hasLimit
           ? t('cost.budgetRemaining', { amount: remaining!.toFixed(2) })
           : t('cost.budgetUnlimitedHint')}

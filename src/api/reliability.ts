@@ -75,7 +75,12 @@ export interface QualityRunRow {
 export interface ReliabilityDashboard {
   total_runs: number
   acceptance_rate: number
+  /** 仅对受裁决的运行求均值；`scored_runs === 0` 时无意义，界面应显示 `—`。 */
   average_quality_score: number
+  /** 有可验证判据、真正参与打分的运行数。 */
+  scored_runs: number
+  /** 契约无判据、完成声明未被裁决的运行数；不计入 scored_runs。 */
+  unscored_runs: number
   remediation_success_rate: number
   recovery_success_rate: number
   false_completion_count: number

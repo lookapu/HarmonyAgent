@@ -275,17 +275,17 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
             <Icon name="file" size={13} />
           </div>
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-medium truncate leading-tight">{node.name}</div>
-            <div className="text-[10px] text-[var(--text-muted)] truncate font-mono">{node.path}</div>
+            <div className="text-[length:var(--app-text-md)] font-medium truncate leading-tight">{node.name}</div>
+            <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate font-mono">{node.path}</div>
           </div>
           {node.size != null && (
-            <span className="shrink-0 text-[10px] text-[var(--text-muted)] tabular-nums bg-[var(--bg-card)] rounded-md px-2 py-1">
+            <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] tabular-nums bg-[var(--bg-card)] rounded-md px-2 py-1">
               {formatSize(node.size)}
             </span>
           )}
           <button
             onClick={copyPath}
-            className="shrink-0 h-7 px-2.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
+            className="shrink-0 h-7 px-2.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
             title={t('home.copyPath')}
           >
             {copied ? '✓' : <Icon name="copy" size={12} />}
@@ -293,7 +293,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
           </button>
           <button
             onClick={() => onReference(node.path)}
-            className="shrink-0 h-7 px-2.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
+            className="shrink-0 h-7 px-2.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
             title={t('home.sendToChat')}
           >
             <Icon name="plus" size={12} />
@@ -302,7 +302,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
           <button
             onClick={handleDownload}
             disabled={downloading}
-            className="shrink-0 h-7 px-2.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1 disabled:opacity-40"
+            className="shrink-0 h-7 px-2.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1 disabled:opacity-40"
             title={t('home.previewDownload')}
           >
             <Icon name="download" size={12} />
@@ -311,7 +311,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
           <button
             onClick={handleDelete}
             disabled={deleting}
-            className={`shrink-0 h-7 px-2.5 rounded-lg text-[11px] transition-colors flex items-center gap-1 disabled:opacity-40 ${confirmDelete ? 'text-white bg-[var(--danger)] hover:opacity-90' : 'text-[var(--text-secondary)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10'}`}
+            className={`shrink-0 h-7 px-2.5 rounded-lg text-[length:var(--app-text-xs)] transition-colors flex items-center gap-1 disabled:opacity-40 ${confirmDelete ? 'text-white bg-[var(--danger)] hover:opacity-90' : 'text-[var(--text-secondary)] hover:text-[var(--danger)] hover:bg-[var(--danger)]/10'}`}
             title={t('home.previewDelete')}
           >
             <Icon name="delete" size={12} />
@@ -321,6 +321,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
             onClick={onClose}
             className="shrink-0 w-7 h-7 rounded-lg flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             title={t('common.close')}
+            aria-label={t('common.close')}
           >
             <Icon name="close" size={14} />
           </button>
@@ -328,7 +329,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
 
         {/* 下载/删除操作反馈（成功/失败短暂提示） */}
         {feedback && (
-          <div className="shrink-0 px-4 py-1.5 text-[11px] text-[var(--text-secondary)] bg-[var(--bg-window)] border-b border-[var(--border)] break-all">
+          <div className="shrink-0 px-4 py-1.5 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] bg-[var(--bg-window)] border-b border-[var(--border)] break-all">
             {feedback}
           </div>
         )}
@@ -338,14 +339,14 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
           {/* 选区浮动操作栏：选中行后显示复制选区 / 引用到对话 */}
           {isTextLike && selectedSnippet && (
             <div className="sticky top-2 z-10 mx-auto w-fit flex items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-lg px-1.5 py-1">
-              <span className="px-2 text-[11px] text-[var(--text-muted)] tabular-nums">
+              <span className="px-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] tabular-nums">
                 {selectedSnippet.start === selectedSnippet.end
                   ? `第 ${selectedSnippet.start} 行`
                   : `第 ${selectedSnippet.start}–${selectedSnippet.end} 行 · ${selectedSnippet.end - selectedSnippet.start + 1} 行`}
               </span>
               <button
                 onClick={copySelection}
-                className="h-6 px-2 rounded-md text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
+                className="h-6 px-2 rounded-md text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
               >
                 {selCopied ? <Icon name="check" size={12} /> : <Icon name="copy" size={12} />}
                 {selCopied ? t('home.copied') : t('home.copySelection')}
@@ -353,7 +354,7 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
               {onReferenceSelection && (
                 <button
                   onClick={referenceSelection}
-                  className="h-6 px-2 rounded-md text-[11px] text-white bg-[var(--accent)] hover:opacity-90 transition-opacity flex items-center gap-1"
+                  className="h-6 px-2 rounded-md text-[length:var(--app-text-xs)] text-white bg-[var(--accent)] hover:opacity-90 transition-opacity flex items-center gap-1"
                 >
                   <Icon name="plus" size={12} white />
                   {t('home.referenceSelection')}
@@ -382,25 +383,25 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
           {isTextLike && (
             <div className="p-4">
               {kind === 'document' && !loading && !error && (
-                <div className="mb-3 rounded-lg border border-[var(--accent)]/20 bg-[var(--accent-soft)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">
+                <div className="mb-3 rounded-lg border border-[var(--accent)]/20 bg-[var(--accent-soft)] px-3 py-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)]">
                   {truncated
                     ? t('home.previewTruncated', { count: totalChars ?? 0 })
                     : t('home.documentTextNote')}
                 </div>
               )}
               {kind !== 'document' && truncated && !loading && !error && (
-                <div className="mb-3 rounded-lg border border-[var(--warning)]/30 bg-[var(--warning)]/10 px-3 py-2 text-[11px] text-[var(--warning)]">
+                <div className="mb-3 rounded-lg border border-[var(--warning)]/30 bg-[var(--warning)]/10 px-3 py-2 text-[length:var(--app-text-xs)] text-[var(--warning)]">
                   {t('home.previewTruncated', { count: totalChars ?? 0 })}
                 </div>
               )}
               {loading ? (
                 <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
                   <span className="w-6 h-6 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin" />
-                  <p className="text-[11px] text-[var(--text-muted)]">{t('common.loading')}</p>
+                  <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('common.loading')}</p>
                 </div>
               ) : error ? (
                 <div className="rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/8 px-4 py-6 text-center">
-                  <p className="text-[12px] text-[var(--danger)] break-all">{error}</p>
+                  <p className="text-[length:var(--app-text-sm)] text-[var(--danger)] break-all">{error}</p>
                 </div>
               ) : ext === 'md' || ext === 'markdown' ? (
                 <Markdown
@@ -426,8 +427,8 @@ export default function FilePreviewDialog({ node, projectId, projectPath, root, 
           {kind === 'unknown' && (
             <div className="h-full flex flex-col items-center justify-center gap-3 p-6 text-center">
               <Icon name="file" size={32} className="opacity-30" />
-              <p className="text-[12px] text-[var(--text-muted)]">{t('home.previewUnsupported')}</p>
-              <p className="text-[10px] text-[var(--text-muted)] font-mono">.{ext}</p>
+              <p className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.previewUnsupported')}</p>
+              <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] font-mono">.{ext}</p>
             </div>
           )}
         </div>

@@ -781,50 +781,11 @@ fn attachment_entry(root: &Path, raw: &str, index: usize) -> Result<BundleEntry,
 }
 
 fn sanitize_json(value: &serde_json::Value, root: &Path) -> serde_json::Value {
-    sanitize_json_paths(crate::utils::redact::redact_json_value(value), root)
-}
-
-fn sanitize_json_paths(value: serde_json::Value, root: &Path) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(fields) => serde_json::Value::Object(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key, sanitize_json_paths(value, root)))
-                .collect(),
-        ),
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .into_iter()
-                .map(|value| sanitize_json_paths(value, root))
-                .collect(),
-        ),
-        serde_json::Value::String(text) => serde_json::Value::String(scrub_paths(&text, root)),
-        other => other,
-    }
+    crate::utils::redact::sanitize_json_value(value, Some(root))
 }
 
 fn sanitize_text(text: &str, root: &Path) -> String {
-    scrub_paths(&crate::utils::redact::redact_text(text), root)
-}
-
-fn scrub_paths(text: &str, root: &Path) -> String {
-    static UNIX_HOME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)(?:/Users|/home)/[^/\\\s"']+"#).expect("valid home regex")
-    });
-    static WINDOWS_HOME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)[A-Z]:\\Users\\[^\\/\s"']+"#).expect("valid home regex")
-    });
-    let mut out = text.to_string();
-    for candidate in [
-        root.to_string_lossy().to_string(),
-        root.to_string_lossy().replace('\\', "/"),
-    ] {
-        if !candidate.is_empty() {
-            out = out.replace(&candidate, "<PROJECT_ROOT>");
-        }
-    }
-    out = UNIX_HOME.replace_all(&out, "<HOME>").into_owned();
-    WINDOWS_HOME.replace_all(&out, "<HOME>").into_owned()
+    crate::utils::redact::sanitize_text(text, Some(root))
 }
 
 fn sensitive_attachment(raw: &str) -> bool {

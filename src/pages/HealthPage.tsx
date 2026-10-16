@@ -727,7 +727,7 @@ export default function HealthPage() {
 
       <div className="space-y-3">
         {error && (
-          <div className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-4 py-3 text-[13px] text-[var(--danger)]">
+          <div className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger)]/10 px-4 py-3 text-[length:var(--app-text-md)] text-[var(--danger)]">
             {t('health.checkFailed')}：{error}
           </div>
         )}
@@ -758,7 +758,7 @@ export default function HealthPage() {
             <p className="text-[var(--text-secondary)] text-sm">{t('health.noProvider')}</p>
             <button
               onClick={() => navigate('/providers')}
-              className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
+              className="h-9 px-4 rounded-lg btn-primary text-[length:var(--app-text-md)] font-medium transition-colors"
             >
               {t('health.goAdd')}
             </button>
@@ -778,12 +778,12 @@ export default function HealthPage() {
               className={`w-3 h-3 rounded-full shrink-0 ${harmonyEnv?.sdk_root || harmonyEnv?.cli ? 'bg-[var(--success)]' : 'bg-[var(--warning)]'}`}
             />
             <div className="min-w-0">
-              <div className="text-[13px] font-medium text-[var(--text-primary)]">
+              <div className="text-[length:var(--app-text-md)] font-medium text-[var(--text-primary)]">
                 {harmonyEnv?.sdk_root || harmonyEnv?.cli
                   ? t('health.envDetected')
                   : t('health.envMissing')}
               </div>
-              <div className="text-[11px] text-[var(--text-muted)] mt-0.5">
+              <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5">
                 {harmonyEnv?.source === 'manual' ? t('health.envSourceManual') : t('health.envSourceAuto')}
                 {harmonyEnv?.studio_dir ? ` · DevEco Studio: ${harmonyEnv.studio_dir}` : ''}
               </div>
@@ -793,14 +793,14 @@ export default function HealthPage() {
             <button
               onClick={redetectEnv}
               disabled={envLoading || envSaving}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors"
+              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors"
             >
               {t('health.envRedetect')}
             </button>
             <button
               onClick={clearEnv}
               disabled={envLoading || envSaving}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors"
+              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors"
             >
               {t('health.envResetBtn')}
             </button>
@@ -854,7 +854,7 @@ export default function HealthPage() {
                 </span>{' '}
                 hdc ({sourceLabel(harmonyEnv.hdc_source ?? 'sdk')}): {harmonyEnv.hdc_path}
                 {harmonyEnv.hdc_source !== 'path' && (
-                  <span className="ml-2 text-[10px] text-[var(--text-muted)]">{t('health.toolchainHdcFallback')}</span>
+                  <span className="ml-2 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('health.toolchainHdcFallback')}</span>
                 )}
               </div>
             )}
@@ -864,8 +864,8 @@ export default function HealthPage() {
         {/* 未找到时的建议路径提示 */}
         {harmonyEnv && harmonyEnv.suggestions.length > 0 && (
           <div className="rounded-md bg-[var(--warning)]/8 border border-[var(--warning)]/20 px-3 py-2 mb-3">
-            <div className="text-[11px] text-[var(--warning)] font-medium mb-1">{t('health.envSuggestions')}</div>
-            <ul className="text-[11px] text-[var(--text-muted)] space-y-0.5 font-mono">
+            <div className="text-[length:var(--app-text-xs)] text-[var(--warning)] font-medium mb-1">{t('health.envSuggestions')}</div>
+            <ul className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] space-y-0.5 font-mono">
               {harmonyEnv.suggestions.slice(0, 6).map((s, i) => (
                 <li key={i}>{s}</li>
               ))}
@@ -876,31 +876,31 @@ export default function HealthPage() {
         {/* 手动指定路径 */}
         <div className="space-y-2">
           <div className="flex items-center gap-2">
-            <label className="text-[12px] text-[var(--text-secondary)] w-28 shrink-0">SDK 根目录</label>
+            <label className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)] w-28 shrink-0">SDK 根目录</label>
             <input
               value={sdkInput}
               onChange={(e) => setSdkInput(e.target.value)}
               placeholder="C:\Program Files\Huawei\DevEco Studio\sdk"
-              className="flex-1 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 text-[12px] text-[var(--text-primary)] font-mono outline-none focus:border-[var(--accent)]"
+              className="flex-1 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 text-[length:var(--app-text-sm)] text-[var(--text-primary)] font-mono outline-none focus:border-[var(--accent)]"
             />
             <button
               onClick={() => pickFolder('sdk')}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
+              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
             >
               {t('health.selectFolder')}
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <label className="text-[12px] text-[var(--text-secondary)] w-28 shrink-0">command-line-tools</label>
+            <label className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)] w-28 shrink-0">command-line-tools</label>
             <input
               value={cliInput}
               onChange={(e) => setCliInput(e.target.value)}
               placeholder="H:\command-line-tools"
-              className="flex-1 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 text-[12px] text-[var(--text-primary)] font-mono outline-none focus:border-[var(--accent)]"
+              className="flex-1 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 text-[length:var(--app-text-sm)] text-[var(--text-primary)] font-mono outline-none focus:border-[var(--accent)]"
             />
             <button
               onClick={() => pickFolder('cli')}
-              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
+              className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors shrink-0"
             >
               {t('health.selectFolder')}
             </button>
@@ -909,11 +909,11 @@ export default function HealthPage() {
             <button
               onClick={saveEnv}
               disabled={envLoading || envSaving}
-              className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
+              className="h-8 px-4 rounded-lg btn-primary text-[length:var(--app-text-sm)] font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
             >
               {envSaving ? t('health.envSaving') : t('health.envSave')}
             </button>
-            {envMsg && <span className="text-[11px] text-[var(--text-muted)]">{envMsg}</span>}
+            {envMsg && <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{envMsg}</span>}
           </div>
         </div>
       </div>
@@ -943,8 +943,8 @@ export default function HealthPage() {
               }`}
             />
             <div className="min-w-0">
-              <div className="text-[13px] font-medium text-[var(--text-primary)]">{alignment.message}</div>
-              <div className="text-[11px] text-[var(--text-muted)] mt-0.5 font-mono">
+              <div className="text-[length:var(--app-text-md)] font-medium text-[var(--text-primary)]">{alignment.message}</div>
+              <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5 font-mono">
                 {alignment.project_compatible && <span>工程: {alignment.project_compatible}</span>}
                 {alignment.installed_api && <span className="ml-3">已装 SDK: API {alignment.installed_api}</span>}
               </div>
@@ -973,7 +973,7 @@ export default function HealthPage() {
                 ? 'bg-[var(--success)]'
                 : docsStatus?.unreadable
                   ? 'bg-[var(--warning)]'
-                  : 'bg-[var(--muted)]'
+                  : 'bg-[var(--text-muted)]'
             }`}
           />
           <span className="text-xs text-[var(--text-secondary)]">
@@ -1006,7 +1006,7 @@ export default function HealthPage() {
         </p>
         {docsMsg && <p className="text-xs text-[var(--text-secondary)] mt-2 break-all">{docsMsg}</p>}
         {docsStatus?.root && (
-          <p className="text-[11px] text-[var(--text-muted)] mt-1 font-mono break-all">{docsStatus.root}</p>
+          <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-1 font-mono break-all">{docsStatus.root}</p>
         )}
         {docsStatus?.downloaded && (
           <div className="mt-3 border-t border-[var(--border)] pt-3">
@@ -1039,9 +1039,9 @@ export default function HealthPage() {
                   >
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-[var(--text-primary)] truncate">{d.title}</span>
-                      {d.has_example && <span className="shrink-0 text-[10px] text-[var(--accent)]">📎</span>}
+                      {d.has_example && <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--accent)]">📎</span>}
                     </div>
-                    <div className="text-[10px] text-[var(--text-muted)] truncate mt-0.5">
+                    <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate mt-0.5">
                       [{d.kit || t('health.docsKitGeneral')}] {d.preview}
                     </div>
                   </button>
@@ -1072,7 +1072,7 @@ export default function HealthPage() {
               </button>
             </div>
             <div className="flex-1 overflow-y-auto p-4">
-              <p className="text-[11px] text-[var(--text-muted)] font-mono mb-3 break-all">{docDetail.rel_path}</p>
+              <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] font-mono mb-3 break-all">{docDetail.rel_path}</p>
               <pre className="text-xs leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap break-all">{docDetail.text}</pre>
             </div>
           </div>
@@ -1188,7 +1188,7 @@ export default function HealthPage() {
                 value={rtVersion}
                 onChange={(e) => setRtVersion(e.target.value)}
                 title={t('health.nodeSelectTitle')}
-                className="flex-1 min-w-0 px-3 h-8 rounded-lg modern-card border-[var(--border)] text-[12px] font-mono outline-none focus:border-[var(--accent)] transition-colors"
+                className="flex-1 min-w-0 px-3 h-8 rounded-lg modern-card border-[var(--border)] text-[length:var(--app-text-sm)] font-mono outline-none focus:border-[var(--accent)] transition-colors"
               >
                 <option value="">{t('health.nodeSelectLatest')}</option>
                 {nodeLtsList.map((v) => (
@@ -1362,12 +1362,12 @@ export default function HealthPage() {
                   >
                     <div className="flex items-center gap-2 min-w-0">
                       {v.is_default && (
-                        <span className="px-1.5 py-0.5 rounded bg-[var(--accent)]/15 text-[var(--accent)] text-[10px] shrink-0">
+                        <span className="px-1.5 py-0.5 rounded bg-[var(--accent)]/15 text-[var(--accent)] text-[length:var(--app-text-2xs)] shrink-0">
                           {t('health.jdkDefault')}
                         </span>
                       )}
                       <span className="font-mono text-xs">JDK {v.full_version || v.feature}</span>
-                      <span className="text-[10px] text-[var(--text-muted)] shrink-0">
+                      <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] shrink-0">
                         {v.source === 'bundled'
                           ? t('health.jdkSrcBundled')
                           : v.source === 'system'
@@ -1382,7 +1382,7 @@ export default function HealthPage() {
                         <button
                           onClick={() => handleJdkInstall(v.feature, true)}
                           disabled={jdkBusy !== null}
-                          className="px-2.5 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[11px] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition-colors"
+                          className="px-2.5 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[length:var(--app-text-xs)] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition-colors"
                         >
                           {jdkBusy === v.feature
                             ? t('health.jdkUpdating')
@@ -1393,7 +1393,7 @@ export default function HealthPage() {
                         <button
                           onClick={() => handleJdkSetDefault(v.feature)}
                           disabled={jdkBusy !== null}
-                          className="px-2.5 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[11px] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition-colors"
+                          className="px-2.5 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[length:var(--app-text-xs)] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition-colors"
                         >
                           {t('health.jdkSetDefault')}
                         </button>
@@ -1402,7 +1402,7 @@ export default function HealthPage() {
                         <button
                           onClick={() => handleJdkUninstall(v.feature)}
                           disabled={jdkBusy !== null}
-                          className="px-2.5 h-7 rounded-lg border border-[var(--danger)]/40 text-[var(--danger)] text-[11px] hover:bg-[var(--danger)]/10 disabled:opacity-50 transition-colors"
+                          className="px-2.5 h-7 rounded-lg border border-[var(--danger)]/40 text-[var(--danger)] text-[length:var(--app-text-xs)] hover:bg-[var(--danger)]/10 disabled:opacity-50 transition-colors"
                         >
                           {t('health.jdkUninstall')}
                         </button>
@@ -1418,7 +1418,7 @@ export default function HealthPage() {
               <select
                 value={jdkFeature}
                 onChange={(e) => setJdkFeature(e.target.value)}
-                className="px-2 h-8 rounded-lg modern-card border-[var(--border)] text-[12px] font-mono outline-none focus:border-[var(--accent)] transition-colors"
+                className="px-2 h-8 rounded-lg modern-card border-[var(--border)] text-[length:var(--app-text-sm)] font-mono outline-none focus:border-[var(--accent)] transition-colors"
               >
                 {(jdkReleases.length > 0 ? jdkReleases : ['17']).map((r) => (
                   <option key={r} value={r}>
@@ -1445,7 +1445,7 @@ export default function HealthPage() {
             </div>
             {/* 下载状态 / 网络检查 / 解压进度（事件推送，不阻塞界面） */}
             {jdkProgress && <RuntimeProgressBar progress={jdkProgress} />}
-            <p className="text-[11px] text-[var(--text-muted)] mt-2">{t('health.jdkSourceHint')}</p>
+            <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-2">{t('health.jdkSourceHint')}</p>
             {jdkMsg && <p className="text-xs mt-2 break-all">{jdkMsg}</p>}
           </>
         ) : (
@@ -1459,7 +1459,7 @@ export default function HealthPage() {
         <div className="flex items-center gap-2">
           <button
             onClick={() => shellOpen(HARMONY_TOOLCHAIN_DOWNLOAD_URL)}
-            className="flex items-center gap-1.5 px-3 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[11px] hover:bg-[var(--accent)]/10 transition-colors"
+            className="flex items-center gap-1.5 px-3 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[length:var(--app-text-xs)] hover:bg-[var(--accent)]/10 transition-colors"
             title={t('health.toolchainOfficialTitle')}
           >
             <Icon name="download" size={12} />
@@ -1487,11 +1487,11 @@ export default function HealthPage() {
               }
             }}
             placeholder={'例如：\nC:\\Program Files\\Huawei\\DevEco Studio\\tools\\hvigor\\bin\nC:\\Program Files\\Huawei\\DevEco Studio\\sdk\\default\\openharmony\\toolchains\nC:\\Program Files\\Huawei\\DevEco Studio\\tools\\ohpm\\bin'}
-            className="flex-1 px-3 py-2 modern-card rounded-lg text-[12px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] resize-none"
+            className="flex-1 px-3 py-2 modern-card rounded-lg text-[length:var(--app-text-sm)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] resize-none"
           />
           <button
             onClick={load}
-            className="self-end px-4 h-9 rounded-lg btn-primary text-[13px] font-medium  transition-colors shrink-0"
+            className="self-end px-4 h-9 rounded-lg btn-primary text-[length:var(--app-text-md)] font-medium  transition-colors shrink-0"
           >
             {t('health.recheck')}
           </button>
@@ -1537,7 +1537,7 @@ export default function HealthPage() {
                       e.stopPropagation()
                       toggleCandidates(c.name)
                     }}
-                    className={`px-3 h-7 rounded-lg border text-[11px] transition-colors ${
+                    className={`px-3 h-7 rounded-lg border text-[length:var(--app-text-xs)] transition-colors ${
                       candMenu === c.name
                         ? 'border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--accent)]'
                         : 'border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-primary)] hover:border-[var(--accent)]/50'
@@ -1549,7 +1549,7 @@ export default function HealthPage() {
                   <button
                     onClick={() => handleImportZip(c.name)}
                     disabled={toolkitBusy !== null}
-                    className="px-3 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[11px] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition-colors"
+                    className="px-3 h-7 rounded-lg border border-[var(--accent)]/40 text-[var(--accent)] text-[length:var(--app-text-xs)] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition-colors"
                     title={t('health.toolkitImportTitle', { name: c.name })}
                   >
                     {toolkitBusy === c.name ? t('health.upgrading') : t('health.toolkitImportZip')}
@@ -1559,7 +1559,7 @@ export default function HealthPage() {
                       onClick={(e) => e.stopPropagation()}
                       className="absolute right-0 top-full mt-1 z-20 w-80 modern-card rounded-lg shadow-lg overflow-hidden"
                     >
-                      <div className="px-3 py-2 text-[10px] text-[var(--text-muted)] border-b border-[var(--border)]">
+                      <div className="px-3 py-2 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] border-b border-[var(--border)]">
                         {t('health.toolchainCandidates', { name: c.name })}
                       </div>
                       <div className="max-h-56 overflow-y-auto">
@@ -1574,8 +1574,8 @@ export default function HealthPage() {
                               onClick={() => chooseCandidate(cd.path)}
                               className="w-full text-left px-3 py-2 hover:bg-[var(--bg-hover)] border-b border-[var(--border)]/50 transition-colors"
                             >
-                              <span className="font-mono text-[11px] break-all text-[var(--text-primary)]">{cd.path}</span>
-                              <span className="inline-block ml-1.5 shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-hover)] text-[var(--text-muted)]">
+                              <span className="font-mono text-[length:var(--app-text-xs)] break-all text-[var(--text-primary)]">{cd.path}</span>
+                              <span className="inline-block ml-1.5 shrink-0 text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded bg-[var(--bg-hover)] text-[var(--text-muted)]">
                                 {sourceLabel(cd.source)}
                               </span>
                             </button>

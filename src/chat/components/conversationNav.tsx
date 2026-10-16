@@ -58,7 +58,7 @@ export const ConversationNav = memo(function ConversationNav({
       </button>
       {open && (
         <div className="absolute right-0 bottom-full mb-1.5 w-72 max-h-80 overflow-y-auto rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in">
-          <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
+          <div className="px-3 py-1.5 text-[length:var(--app-text-2xs)] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
             {t('home.conversationNavTitle', { count: userMessages.length })}
           </div>
           {userMessages.map((m, i) => {
@@ -70,10 +70,10 @@ export const ConversationNav = memo(function ConversationNav({
                 onClick={() => scrollToMsg(m.id)}
                 className="w-full flex items-start gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors"
               >
-                <span className="text-[10px] text-[var(--text-muted)] tabular-nums shrink-0 mt-0.5 w-4 text-right">
+                <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] tabular-nums shrink-0 mt-0.5 w-4 text-right">
                   {i + 1}
                 </span>
-                <span className="flex-1 min-w-0 text-[11.5px] text-[var(--text-secondary)] leading-relaxed">
+                <span className="flex-1 min-w-0 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] leading-relaxed">
                   {preview || t('home.emptyMessage')}
                 </span>
               </button>

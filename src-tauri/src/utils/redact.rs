@@ -9,6 +9,7 @@
 //! 邮箱/手机号/身份证保留部分明文结构（前几位 + 尾部），便于人工辨认。
 
 use regex::Regex;
+use std::path::Path;
 use std::sync::LazyLock;
 
 /// 一条脱敏规则：命中即整体替换为 `to`
@@ -190,6 +191,71 @@ pub fn redact_json_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 导出包场景的第二道：路径脱敏
+//
+// 与 `redact_text` 的分工——`redact_text` 按**模式**遮蔽密钥与身份信息，
+// 但它看不出「C:\Users\张三\project\a.ts」这种不含任何敏感模式的路径。
+// 路径里带的是**用户身份**（用户名）+ **目录结构**，对外发包时同样要处理。
+//
+// 这一段原先私藏在 `services::reproduction_bundle`，P2-3 诊断包要复用同一套逻辑。
+// 复制一份必然分叉（漏加一条正则 = 静默泄漏），所以提到这里由两边共同调用。
+// ---------------------------------------------------------------------------
+
+/// 路径脱敏：项目根 → `<PROJECT_ROOT>`，用户家目录 → `<HOME>`。
+///
+/// `root` 传 `None` 表示「无项目上下文」（如全局诊断包），此时只做家目录替换。
+pub fn scrub_paths(text: &str, root: Option<&Path>) -> String {
+    static UNIX_HOME: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)(?:/Users|/home)/[^/\\\s"']+"#).expect("valid home regex"));
+    static WINDOWS_HOME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)[A-Z]:\\Users\\[^\\/\s"']+"#).expect("valid home regex")
+    });
+    let mut out = text.to_string();
+    if let Some(root) = root {
+        // 同一目录在日志里可能以正斜杠或反斜杠出现，两种都替换
+        for candidate in [
+            root.to_string_lossy().to_string(),
+            root.to_string_lossy().replace('\\', "/"),
+        ] {
+            if !candidate.is_empty() {
+                out = out.replace(&candidate, "<PROJECT_ROOT>");
+            }
+        }
+    }
+    out = UNIX_HOME.replace_all(&out, "<HOME>").into_owned();
+    WINDOWS_HOME.replace_all(&out, "<HOME>").into_owned()
+}
+
+/// 导出包文本出口：模式脱敏 + 路径脱敏，按顺序叠加。
+pub fn sanitize_text(text: &str, root: Option<&Path>) -> String {
+    scrub_paths(&redact_text(text), root)
+}
+
+/// 导出包 JSON 出口：键名脱敏 + 文本脱敏 + 路径脱敏。
+///
+/// 注意与 `redact_json_value` 的区别：那个只做前两者（按键名遮蔽值、叶子过 `redact_text`），
+/// 缺路径这一道。导出包一律走本函数，避免「文本出口脱敏了、JSON 出口没脱敏」这种漏网。
+pub fn sanitize_json_value(value: &serde_json::Value, root: Option<&Path>) -> serde_json::Value {
+    scrub_json_paths(redact_json_value(value), root)
+}
+
+fn scrub_json_paths(value: serde_json::Value, root: Option<&Path>) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, scrub_json_paths(value, root)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(|v| scrub_json_paths(v, root)).collect())
+        }
+        serde_json::Value::String(text) => serde_json::Value::String(scrub_paths(&text, root)),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +331,47 @@ device_id: ABCDEF0123456789\nDATABASE_URL=postgres://alice:plainpass@db.local/ap
         assert_eq!(out["deviceSerial"], "***");
         assert_eq!(out["headers"][0]["value"], "***");
         assert!(!out["message"].as_str().unwrap().contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn test_scrub_paths_covers_unix_windows_and_project_root() {
+        let root = Path::new("/home/alice/work/app");
+        let input = "open /home/alice/work/app/src/main.rs and C:\\Users\\bob\\proj\\a.ts and /home/carol/x";
+        let out = scrub_paths(input, Some(root));
+        assert!(out.contains("<PROJECT_ROOT>/src/main.rs"), "{out}");
+        assert!(!out.contains("bob"), "Windows 家目录未替换: {out}");
+        assert!(out.contains("<HOME>"), "{out}");
+        assert!(!out.contains("carol"), "{out}");
+    }
+
+    #[test]
+    fn test_scrub_paths_root_none_only_replaces_home() {
+        let out = scrub_paths("/home/alice/work/app/x.rs", None);
+        assert_eq!(out, "<HOME>/work/app/x.rs");
+    }
+
+    #[test]
+    fn test_sanitize_text_stacks_pattern_and_path() {
+        // 同时含密钥模式与家目录路径：两道都要生效
+        let out = sanitize_text(
+            "api_key=sk-abcdefghijklmnopqrst at /Users/dave/proj/main.rs",
+            None,
+        );
+        assert!(!out.contains("sk-abcdefghijklmnopqrst"), "{out}");
+        assert!(out.contains("<HOME>/proj/main.rs"), "{out}");
+    }
+
+    #[test]
+    fn test_sanitize_json_value_applies_path_scrub_to_leaves() {
+        // redact_json_value 单独用时**不**做路径脱敏——这是两者的分工，别在测试里混为一谈
+        let input = serde_json::json!({
+            "path": "/Users/erin/app/a.ts",
+            "token": "ghp_abcdefghijklmnopqrstuvwxyz012345",
+            "nested": [{"cwd": "C:\\Users\\frank\\x"}]
+        });
+        let out = sanitize_json_value(&input, None);
+        assert_eq!(out["path"], "<HOME>/app/a.ts");
+        assert_eq!(out["token"], "***");
+        assert_eq!(out["nested"][0]["cwd"], "<HOME>\\x");
     }
 }

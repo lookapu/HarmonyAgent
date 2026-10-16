@@ -1,0 +1,452 @@
+
+[01] 中文「平均耗时」
+   cost.taskAvg                     = 'Avg Duration'
+        src/pages/CostPage.tsx:562 <p className="text-xs text-[var(--text-secondary)] mb-1">{t('cost.taskAvg')}</p>
+   cost.toolAverageDuration         = 'Average duration'
+        src/pages/CostPage.tsx:415 <ReliabilityValue label={t('cost.toolAverageDuration')} value={`${(reliability?.tool_quality.average_duration_
+
+[02] 中文「移除」
+   dialog.remove                    = 'Remove'
+        src/pages/Home.tsx:6748 aria-label={t('dialog.remove')}
+        src/pages/Home.tsx:6749 title={t('dialog.remove')}
+   provider.syncRemove              = 'Remove'
+        src/pages/ProvidersPage.tsx:1259 title={t('provider.syncRemove')}
+        src/pages/ProvidersPage.tsx:1260 aria-label={t('provider.syncRemove')}
+   apiKb.ctRemoved                  = 'Removed'
+        src/pages/ApiKnowledgePage.tsx:520 <option value="removed">{t('apiKb.ctRemoved')}</option>
+        src/pages/ApiKnowledgePage.tsx:1038 <option value="removed">{t('apiKb.ctRemoved')}</option>
+
+[03] 中文「重新探测」
+   health.sandboxProbe              = 'Probe again'
+        src/components/SandboxCapabilityPanel.tsx:86 {loading ? t('health.sandboxProbing') : t('health.sandboxProbe')}
+   health.envRedetect               = 'Re-detect'
+        src/pages/HealthPage.tsx:798 {t('health.envRedetect')}
+
+[04] 中文「添加项目」
+   home.addProject                  = 'Add Project'
+        src/chat/components/messageBlocks.tsx:839 {t('home.addProject')}
+        src/pages/Home.tsx:3986 title={t('home.addProject')}
+        …共 3 处
+   dialog.addProject                = 'Add Project'
+        src/components/AddProjectDialog.tsx:51 const selected = await open({ directory: true, multiple: false, title: t('dialog.addProject') })
+        src/components/AddProjectDialog.tsx:113 <h2 className="text-[length:var(--app-text-base)] font-semibold flex-1">{t('dialog.addProject')}</h2>
+   usage.event.project_added        = 'Project added'   [无 t() 调用]
+
+[05] 中文「依赖」
+   home.analyzeDeps                 = 'Dependencies'
+        src/chat/components/devicePanels.tsx:1244 { key: 'deps', label: t('home.analyzeDeps'), icon: 'package' },
+   home.cat_dependency              = 'Dependency'   [无 t() 调用]
+
+[06] 中文「模块」
+   home.analyzeModuleList           = 'Modules'
+        src/chat/components/devicePanels.tsx:1518 <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)]">{t('home.analyzeMo
+   apiKb.colModule                  = 'Module'
+        src/pages/ApiKnowledgePage.tsx:723 <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colModule')}</th>
+        src/pages/ApiKnowledgePage.tsx:786 <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colModule')}</th>
+        …共 4 处
+
+[07] 中文「归档会话」
+   home.archive                     = 'Archive chat'
+        src/pages/Home.tsx:4188 {convMenu.conv.archived ? t('home.unarchive') : t('home.archive')}
+        src/pages/Home.tsx:4672 label={c.archived ? t('home.unarchive') : t('home.archive')}
+   home.auditLabelConvArchive       = 'Archive'
+        src/pages/Home.tsx:3606 label: archived ? t('home.auditLabelConvUnarchive') : t('home.auditLabelConvArchive'),
+
+[08] 中文「取消」
+   home.cancel                      = 'Cancel'
+        src/chat/components/dialogs.tsx:32 {t('home.cancel')}
+        src/chat/components/dialogs.tsx:169 {t('home.cancel')}
+        …共 11 处
+   dialog.cancel                    = 'Cancel'
+        src/components/AddProjectDialog.tsx:226 {t('dialog.cancel')}
+        src/pages/Home.tsx:6769 {t('dialog.cancel')}
+   trust.reject                     = 'Cancel'
+        src/components/TrustDialog.tsx:69 {t('trust.reject')}
+   provider.cancel                  = 'Cancel'
+        src/pages/ProvidersPage.tsx:858 {showForm ? t('provider.cancel') : t('provider.add')}
+        src/pages/ProvidersPage.tsx:1535 {t('provider.cancel')}
+        …共 4 处
+   cost.cancelled                   = 'Cancelled'
+        src/pages/CostPage.tsx:751 : t('cost.cancelled')}
+        src/pages/CostPage.tsx:798 ? t('cost.cancelled')
+   mcp.cancel                       = 'Cancel'
+        src/components/home/MessageItem.tsx:601 {t('mcp.cancel')}
+        src/pages/KnowledgePage.tsx:115 {showForm ? t('mcp.cancel') : t('knowledge.add')}
+        …共 5 处
+   apiKb.cancel                     = 'Cancel'
+        src/pages/ApiKnowledgePage.tsx:1226 {t('apiKb.cancel')}
+   common.cancel                    = 'Cancel'
+        src/chat/components/panels.tsx:255 {t('common.cancel')}
+
+[09] 中文「删除」
+   home.deleteMessage               = 'Delete'
+        src/components/home/MessageItem.tsx:319 : t('home.deleteMessage')
+        src/components/home/MessageItem.tsx:322 {confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
+        …共 4 处
+   home.delete                      = 'Delete'
+        src/components/home/MessageItem.tsx:650 {t('home.delete')}
+   home.diffRemoved                 = 'Removed'
+        src/chat/components/dialogs.tsx:131 <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[var(--danger)]/50" />{t('hom
+   home.gitRemove                   = 'Remove'
+        src/components/GitPanel.tsx:370 title={t('home.gitRemove')}
+        src/components/GitPanel.tsx:371 aria-label={t('home.gitRemove')}
+   home.memoryDelete                = 'Delete'
+        src/chat/components/panels.tsx:319 title={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
+        src/chat/components/panels.tsx:320 aria-label={confirmDeleteId === m.id ? t('home.memoryDeleteConfirm') : t('home.memoryDelete')}
+   home.previewDelete               = 'Delete'
+        src/components/FilePreviewDialog.tsx:315 title={t('home.previewDelete')}
+        src/components/FilePreviewDialog.tsx:318 {deleting ? '…' : confirmDelete ? t('home.previewDeleteConfirm') : t('home.previewDelete')}
+   home.deviceShotDelete            = 'Delete'
+        src/chat/components/devicePanels.tsx:917 <Icon name="delete" size={11} /> {t('home.deviceShotDelete')}
+        src/chat/components/devicePanels.tsx:996 <Icon name="delete" size={11} /> {confirmDeleteShot === previewFile.path ? t('home.deviceShotDeleteConfirm') :
+   provider.delete                  = 'Delete'
+        src/pages/ProvidersPage.tsx:1630 {t('provider.delete')}
+   mcp.delete                       = 'Delete'
+        src/pages/McpPage.tsx:951 {t('mcp.delete')}
+   knowledge.delete                 = 'Delete'
+        src/pages/KnowledgePage.tsx:266 {t('knowledge.delete')}
+   apiKb.delete                     = 'Delete'
+        src/pages/ApiKnowledgePage.tsx:758 {t('apiKb.delete')}
+        src/pages/ApiKnowledgePage.tsx:826 {t('apiKb.delete')}
+   common.delete                    = 'Delete'   [无 t() 调用]
+
+[10] 中文「确认删除？」
+   home.deleteMessageConfirm        = 'Confirm?'
+        src/components/home/MessageItem.tsx:318 ? t('home.deleteMessageConfirm')
+        src/components/home/MessageItem.tsx:322 {confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
+        …共 4 处
+   home.previewDeleteConfirm        = 'Confirm delete?'
+        src/components/FilePreviewDialog.tsx:318 {deleting ? '…' : confirmDelete ? t('home.previewDeleteConfirm') : t('home.previewDelete')}
+
+[11] 中文「启动」
+   home.deviceAppLaunch             = 'Launch'
+        src/chat/components/devicePanels.tsx:711 {t('home.deviceAppLaunch')}
+   proxy.start                      = 'Start'
+        src/pages/ProxyPage.tsx:93 {t('proxy.start')}
+
+[12] 中文「内存」
+   home.devicePerfMem               = 'Memory'
+        src/chat/components/devicePanels.tsx:847 label={t('home.devicePerfMem')}
+   home.detailRam                   = 'RAM'
+        src/chat/components/devicePanels.tsx:1854 { label: t('home.detailRam'), value: ram },
+
+[13] 中文「新增」
+   home.diffAdded                   = 'Added'
+        src/chat/components/dialogs.tsx:130 <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[var(--success)]/50" />{t('ho
+   home.memoryAdd                   = 'Add'
+        src/chat/components/panels.tsx:209 {t('home.memoryAdd')}
+   apiKb.ctAdded                    = 'Added'
+        src/pages/ApiKnowledgePage.tsx:518 <option value="added">{t('apiKb.ctAdded')}</option>
+        src/pages/ApiKnowledgePage.tsx:1036 <option value="added">{t('apiKb.ctAdded')}</option>
+
+[14] 中文「编辑消息」
+   home.editMessage                 = 'Edit message'
+        src/chat/components/dialogs.tsx:223 {t('home.editMessage')}
+        src/components/home/MessageItem.tsx:303 title={t('home.editMessage')}
+        …共 3 处
+   usage.event.message_edited       = 'Message edited'   [无 t() 调用]
+
+[15] 中文「生成」
+   home.generate                    = 'Generate'
+        src/pages/Home.tsx:6142 title={t('home.generate')}
+        src/pages/Home.tsx:6143 aria-label={t('home.generate')}
+   config.lanTokenCreateBtn         = 'Create'
+        src/components/LanTokenPanel.tsx:194 {t('config.lanTokenCreateBtn')}
+
+[16] 中文「处理中…」
+   home.gitOpRunning                = 'Working…'
+        src/components/FileTreePanel.tsx:699 {menuBusy === 'ignore' ? t('home.gitOpRunning') : t('home.gitIgnoreAdd')}
+        src/components/FileTreePanel.tsx:709 {menuBusy === 'untrack' ? t('home.gitOpRunning') : t('home.gitUntrack')}
+        …共 5 处
+   provider.syncBusy                = 'Working...'
+        src/pages/ProvidersPage.tsx:1241 {syncBusy['__all_' + p.id] === 'remove' ? t('provider.syncBusy') : t('provider.syncRemoveAll')}
+        src/pages/ProvidersPage.tsx:1262 {syncBusy[modelId] === 'remove' ? t('provider.syncBusy') : <Icon name="close" size={10} />}
+        …共 4 处
+
+[17] 中文「已删除」
+   home.gitStatusDeleted            = 'Deleted'
+        src/components/FileTreePanel.tsx:379 case 'deleted': return { label: t('home.gitStatusDeleted'), color: 'text-[var(--danger)]' }
+   skillStats.removed               = 'Removed'
+        src/pages/SkillsPage.tsx:558 {t('skillStats.removed')}
+
+[18] 中文「复制全文」
+   home.importCopyAll               = 'Copy all'
+        src/components/home/HomeDialogs.tsx:249 {copied ? t('home.importCopied') : t('home.importCopyAll')}
+   home.exportCopy                  = 'Copy full text'
+        src/pages/Home.tsx:4937 {t('home.exportCopy')}
+
+[19] 中文「应用」
+   home.modelRecApply               = 'Apply'
+        src/chat/components/plan.tsx:237 {t('home.modelRecApply')}
+   home.deviceTabApps               = 'Apps'
+        src/chat/components/devicePanels.tsx:646 {t('home.deviceTabApps')}
+
+[20] 中文「已用」
+   home.modelRecInUse               = 'In use'
+        src/chat/components/plan.tsx:227 {t('home.modelRecInUse')}
+   cost.balanceUsed                 = 'Used'
+        src/pages/CostPage.tsx:1050 <span>{t('cost.balanceUsed')}: {sym}{b.used != null ? b.used.toFixed(2) : '—'}</span>
+
+[21] 中文「置顶会话」
+   home.pin                         = 'Pin chat'
+        src/pages/Home.tsx:4181 {convMenu.conv.is_pinned ? t('home.unpin') : t('home.pin')}
+        src/pages/Home.tsx:4665 aria-label={c.is_pinned ? t('home.unpin') : t('home.pin')}
+        …共 3 处
+   home.auditLabelConvPin           = 'Pin conversation'
+        src/pages/Home.tsx:3593 label: pinned ? t('home.auditLabelConvUnpin') : t('home.auditLabelConvPin'),
+
+[22] 中文「项目路径」
+   home.projectPath                 = 'Path'
+        src/pages/Home.tsx:6534 <OverviewRow icon="folder" label={t('home.projectPath')} value={currentProject.path} mono />
+   trust.path                       = 'Project path'
+        src/components/TrustDialog.tsx:29 <span className="text-[var(--text-secondary)] text-[length:var(--app-text-sm)] shrink-0 pt-px">{t('trust.path'
+
+[23] 中文「当前」
+   home.projectSwitcherCurrent      = 'Current'
+        src/components/home/HomeOverlays.tsx:284 <span className="text-[length:var(--app-text-2xs)] px-1 rounded bg-[var(--accent)]/15 text-[var(--accent)]">{t
+   home.branchCurrent               = 'current'
+        src/chat/components/plan.tsx:108 {b === current && <span className="text-[length:var(--app-text-2xs)] opacity-60">{t('home.branchCurrent')}</sp
+        src/components/GitPanel.tsx:311 {t('home.branchCurrent')}
+   home.timelineCurrent             = 'Current'
+        src/pages/Home.tsx:7307 {isCurrent && <span className="ml-1.5 text-[var(--success)]">{t('home.timelineCurrent')}</span>}
+   provider.current                 = 'Active'   [无 t() 调用]
+        src/pages/Home.tsx:6045 (模板字面量) kind: t(`home.genKind.${currentGen.kind}`),
+        src/pages/Home.tsx:6541 (模板字面量) value={t(`home.index.${currentProject.index_state}`)}
+   version.currentTag               = 'current'
+        src/pages/VersionsPage.tsx:135 <span className="text-xs px-2 py-0.5 bg-[var(--success)] text-white rounded">{t('version.currentTag')}</span>
+
+[24] 中文「引用文件」
+   home.refHint                     = 'Reference file'
+        src/pages/Home.tsx:5945 {t('home.refHint')}「@{refQuery}」
+   home.externalFileLabel           = 'Referenced file'
+        src/pages/Home.tsx:2166 t('home.externalFileLabel'),
+
+[25] 中文「刷新」
+   home.refresh                     = 'Refresh'
+        src/chat/components/panels.tsx:335 {t('home.refresh')}
+        src/chat/components/panels.tsx:408 title={t('home.refresh')}
+        …共 5 处
+   home.previewReload               = 'Reload'
+        src/chat/components/panels.tsx:675 title={t('home.previewReload')}
+        src/chat/components/panels.tsx:676 aria-label={t('home.previewReload')}
+   cost.refresh                     = 'Refresh'
+        src/pages/CostPage.tsx:859 {t('cost.refresh')}
+   mcp.refresh                      = 'Refresh'
+        src/pages/McpPage.tsx:1028 {t('mcp.refresh')}
+        src/pages/SkillsPage.tsx:497 {t('mcp.refresh')}
+   health.refresh                   = 'Refresh'
+        src/pages/HealthPage.tsx:724 {loading ? t('health.checking') : t('health.refresh')}
+   health.apiRefresh                = 'Refresh'
+        src/components/SdkApiBrowser.tsx:121 {loading ? '…' : t('health.apiRefresh')}
+   common.refresh                   = 'Refresh'
+        src/chat/components/devicePanels.tsx:473 title={t('common.refresh')}
+        src/chat/components/devicePanels.tsx:474 aria-label={t('common.refresh')}
+        …共 3 处
+   ohpm.refresh                     = 'Refresh'
+        src/pages/OhpmPage.tsx:310 {busy ? t('ohpm.syncing') : t('ohpm.refresh')}
+        src/pages/OhpmPage.tsx:342 {busy ? t('ohpm.syncing') : t('ohpm.refresh')}
+
+[26] 中文「沟通风格」
+   home.ruleTemplateCategory.meta   = 'Communication'   [无 t() 调用]
+   home.ruleTemplate.concise        = 'Concise Communication'   [无 t() 调用]
+
+[27] 中文「保存失败」
+   home.rulesSaveFail               = 'Failed to save'
+        src/pages/Home.tsx:3122 alert(`${t('home.rulesSaveFail')}: ${String(e)}`)
+   config.saveError                 = 'Save failed'
+        src/pages/ConfigPage.tsx:320 setJsonError(`${t('config.saveError')}: ${e}`)
+   config.lanSaveFailed             = 'Save failed'   [无 t() 调用]
+   limits.saveError                 = 'Save failed'
+        src/pages/LimitsPage.tsx:110 setError(t('limits.saveError') + `: ${e}`)
+        src/pages/LimitsPage.tsx:130 setError(t('limits.saveError') + `: ${e}`)
+
+[28] 中文「保存中…」
+   home.rulesSaving                 = 'Saving…'
+        src/chat/components/dialogs.tsx:398 {saving ? t('home.rulesSaving') : t('home.rulesSave')}
+   provider.saving                  = 'Saving...'
+        src/pages/ProvidersPage.tsx:1548 {editSaving ? t('provider.saving') : t('provider.saveEdit')}
+   health.envSaving                 = 'Saving…'
+        src/pages/HealthPage.tsx:914 {envSaving ? t('health.envSaving') : t('health.envSave')}
+
+[29] 中文「继续任务」
+   home.slashContinue               = 'Continue task'
+        src/pages/Home.tsx:173 { id: 'continue', icon: 'arrow-down', title: t('home.slashContinue'), prompt: t('home.continuePrompt') },
+   home.continueTask                = 'Continue'
+        src/pages/Home.tsx:5825 : t('home.continueTask')}
+
+[30] 中文「成功率 {{rate}}%」
+   home.statsRate                   = '{{rate}}% success'
+        src/chat/components/panels.tsx:506 {t('home.statsRate', { rate })} · {t('home.statsAvgMs', { ms: s.avg_duration_ms ?? '—' })}
+   mcp.rate                         = '{{rate}}% ok'
+        src/pages/McpPage.tsx:977 <span className="tabular-nums">{t('mcp.rate', { rate })}</span>
+        src/pages/McpPage.tsx:1074 <span>{t('mcp.rate', { rate })}</span>
+        …共 3 处
+
+[31] 中文「切换模型」
+   home.switchModel                 = 'Switch Model'   [无 t() 调用]
+   usage.event.model_switched       = 'Model switched'   [无 t() 调用]
+
+[32] 中文「系统」
+   home.timelineEventSystem         = 'System'
+        src/components/TimelinePanel.tsx:36 case 'system_note': return t('home.timelineEventSystem')
+   home.detailOs                    = 'OS'
+        src/chat/components/devicePanels.tsx:1847 { label: t('home.detailOs'), value: d.os_version },
+   health.jdkSrcSystem              = 'System'
+        src/pages/HealthPage.tsx:1374 ? t('health.jdkSrcSystem')
+
+[33] 中文「工具调用」
+   home.timelineEventToolCall       = 'Tool'
+        src/components/TimelinePanel.tsx:34 case 'tool_call': return t('home.timelineEventToolCall')
+   home.toolCallsShort              = 'Tool calls'
+        src/chat/components/messageBlocks.tsx:1000 <span className="text-[var(--text-muted)]">{t('home.toolCallsShort')}</span>
+   license.quotaToolCalls           = 'Tool calls'
+        src/pages/LicensePage.tsx:203 <QuotaCell label={t('license.quotaToolCalls')} used={quota.tool_calls} />
+
+[34] 中文「取消置顶」
+   home.unpinProject                = 'Unpin'
+        src/pages/Home.tsx:4078 aria-label={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
+        src/pages/Home.tsx:4079 title={p.pinned ? t('home.unpinProject') : t('home.pinProject')}
+   home.unpin                       = 'Unpin'
+        src/pages/Home.tsx:4181 {convMenu.conv.is_pinned ? t('home.unpin') : t('home.pin')}
+        src/pages/Home.tsx:4665 aria-label={c.is_pinned ? t('home.unpin') : t('home.pin')}
+        …共 3 处
+   home.unpinFromTop                = 'Unpin from top'
+        src/components/home/HomeBars.tsx:200 aria-label={t('home.unpinFromTop')}
+        src/components/home/HomeBars.tsx:201 title={t('home.unpinFromTop')}
+        …共 3 处
+   home.auditLabelConvUnpin         = 'Unpin'
+        src/pages/Home.tsx:3593 label: pinned ? t('home.auditLabelConvUnpin') : t('home.auditLabelConvPin'),
+
+[35] 中文「内置」
+   knowledge.builtin                = 'Built-in'
+        src/pages/KnowledgePage.tsx:216 {t('knowledge.builtin')}
+   health.installNode               = 'Install bundled'
+        src/pages/HealthPage.tsx:1203 {rtBusy ? t('health.upgrading') : nodeRt.source === 'none' ? t('health.installNode') : t('health.upgrade')}
+
+[36] 中文「分钟」
+   limits.unitMin                   = 'min'   [无 t() 调用]
+   cost.minutes                     = ' min'
+        src/pages/CostPage.tsx:547 value={taskStats.p50_ms != null ? formatDuration(taskStats.p50_ms, t('cost.minutes')) : '—'}
+        src/pages/CostPage.tsx:551 value={taskStats.p95_ms != null ? formatDuration(taskStats.p95_ms, t('cost.minutes')) : '—'}
+        …共 4 处
+
+[37] 中文「调用 {{n}} 次」
+   mcp.calls                        = '{{n}} calls'
+        src/pages/McpPage.tsx:972 <span className="tabular-nums">{t('mcp.calls', { n: stat.call_count })}</span>
+   skillStats.callsUnit             = 'Called {{n}} times'
+        src/pages/SkillsPage.tsx:523 {t('skillStats.callsUnit', { n: summary.top.call_count })}
+
+[38] 中文「禁用」
+   mcp.disable                      = 'Disable'
+        src/pages/KnowledgePage.tsx:243 {e.enabled ? t('mcp.disable') : t('mcp.enable')}
+        src/pages/McpPage.tsx:834 {s.enabled ? t('mcp.enable') : t('mcp.disable')}
+        …共 3 处
+   skill.disable                    = 'Disable'
+        src/pages/SkillsPage.tsx:414 {s.enabled ? t('skill.disable') : t('skill.enable')}
+   skill.disabled                   = 'Disabled'
+        src/pages/SkillsPage.tsx:382 {s.enabled ? t('skill.enabled') : t('skill.disabled')}
+        src/pages/SkillsPage.tsx:568 {skill.enabled ? t('skill.enabled') : t('skill.disabled')}
+
+[39] 中文「启用」
+   mcp.enable                       = 'Enable'
+        src/pages/KnowledgePage.tsx:243 {e.enabled ? t('mcp.disable') : t('mcp.enable')}
+        src/pages/McpPage.tsx:834 {s.enabled ? t('mcp.enable') : t('mcp.disable')}
+        …共 3 处
+   skill.enable                     = 'Enable'
+        src/pages/SkillsPage.tsx:414 {s.enabled ? t('skill.disable') : t('skill.enable')}
+   skill.enabled                    = 'Enabled'
+        src/pages/SkillsPage.tsx:382 {s.enabled ? t('skill.enabled') : t('skill.disabled')}
+        src/pages/SkillsPage.tsx:568 {skill.enabled ? t('skill.enabled') : t('skill.disabled')}
+   knowledge.enabled                = 'Enabled'
+        src/pages/KnowledgePage.tsx:190 {t('knowledge.enabled')}
+
+[40] 中文「推荐」
+   mcp.popular                      = 'Popular'
+        src/pages/McpPage.tsx:129 <span className="shrink-0 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[length:var(--app
+   skill.popular                    = 'Popular'
+        src/pages/SkillsPage.tsx:356 <span className="ml-1 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[length:var(--app-tex
+   health.jdkRecommended            = 'Recommended'
+        src/pages/HealthPage.tsx:1425 JDK {r}{r === '17' ? ` (${t('health.jdkRecommended')})` : ''}
+
+[41] 中文「问题复现包」
+   nav.reproductionBundles          = 'Reproduction Bundles'   [无 t() 调用]
+        src/App.tsx:58 (labelKey: 'nav.reproductionBundles')
+        src/pages/Home.tsx:7661 (labelKey: 'nav.reproductionBundles')
+   repro.title                      = 'Issue Reproduction Bundles'
+        src/pages/ReproductionBundlesPage.tsx:54 <div><h2 className="text-xl font-semibold">{t('repro.title')}</h2><p className="mt-1 text-xs text-[var(--text-
+
+[42] 中文「使用统计」
+   nav.usage                        = 'Usage'
+        src/pages/ConfigPage.tsx:411 {t('nav.usage')}
+   config.telemetry                 = 'Usage stats'
+        src/pages/ConfigPage.tsx:394 <Row label={t('config.telemetry')} hint={t('config.telemetryHint')}>
+        src/pages/ConfigPage.tsx:397 label={t('config.telemetry')}
+   usage.title                      = 'Usage Stats'
+        src/pages/UsagePage.tsx:136 <h2 className="text-[length:var(--app-text-lg)] font-semibold">{t('usage.title')}</h2>
+   mcp.usageView                    = 'Usage'
+        src/pages/McpPage.tsx:560 {t('mcp.usageView')}
+   skill.usageView                  = 'Usage'
+        src/pages/SkillsPage.tsx:223 {t('skill.usageView')}
+
+[43] 中文「添加工程」
+   onboarding.step.project          = 'Add a project'
+        src/components/Onboarding.tsx:391 <StepBody icon="check" title={t('onboarding.step.project')} desc={t('onboarding.projectDesc')}>
+        src/components/Onboarding.tsx:400 <StepBody icon="folder" title={t('onboarding.step.project')} desc={t('onboarding.projectDesc')}>
+   onboarding.projectAdd            = 'Add project'
+        src/components/Onboarding.tsx:411 {t('onboarding.projectAdd')}
+
+[44] 中文「默认模型」
+   provider.models                  = 'Models'
+        src/pages/ProvidersPage.tsx:954 <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.models')}</label>
+        src/pages/ProvidersPage.tsx:1376 <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.models')}</label>
+   provider.modelDefault            = 'Default model'
+        src/chat/components/plan.tsx:272 <option value="">{t('provider.modelDefault')}</option>
+        src/pages/Home.tsx:3849 return t('provider.modelDefault')
+        …共 3 处
+
+[45] 中文「技能」
+   skill.skillsView                 = 'Skills'
+        src/pages/SkillsPage.tsx:217 {t('skill.skillsView')}
+   skillStats.colSkill              = 'Skill'
+        src/pages/SkillsPage.tsx:544 <th className="py-2 pr-3 font-medium">{t('skillStats.colSkill')}</th>
+
+[46] 中文「关闭」
+   teamShare.off                    = 'Off'   [无 t() 调用]
+   home.close                       = 'Close'
+        src/chat/components/dialogs.tsx:81 {t('home.close')}
+        src/components/home/MessageItem.tsx:468 label={t('home.close')}
+   common.close                     = 'Close'
+        src/chat/components/devicePanels.tsx:944 aria-label={t('common.close')}
+        src/chat/components/devicePanels.tsx:945 title={t('common.close')}
+        …共 17 处
+
+[47] 中文「重试」
+   teamShare.retry                  = 'Retry'
+        src/pages/TeamSharingPage.tsx:43 {error && <div className="rounded-lg border border-[var(--danger)]/40 bg-[var(--danger)]/10 p-3 text-xs text-[
+   repro.retry                      = 'Retry'
+        src/pages/ReproductionBundlesPage.tsx:55 {error && <div className="rounded-lg border border-[var(--danger)]/40 bg-[var(--danger)]/10 p-3 text-xs text-[
+   home.retry                       = 'Retry'
+        src/chat/components/toolRuns.tsx:299 {t('home.retry')}
+        src/pages/Home.tsx:5368 retryLabel={t('home.retry')}
+   home.timelineRetry               = 'retry'
+        src/components/TimelinePanel.tsx:475 ↻ {t('home.timelineRetry')}
+   license.retry                    = 'Retry'
+        src/pages/LicensePage.tsx:126 {t('license.retry')}
+   cost.retry                       = 'Retries'
+        src/pages/CostPage.tsx:767 <th className="text-right px-4 py-2 tnum">{t('cost.retry')}</th>
+   common.retry                     = 'Retry'
+        src/components/Onboarding.tsx:340 {t('common.retry')}
+        src/components/Onboarding.tsx:443 {t('common.retry')}
+        …共 4 处
+
+[48] 中文「撤销」
+   teamShare.revert                 = 'Revert'
+        src/pages/TeamSharingPage.tsx:52 <section className="space-y-2"><h3 className="font-medium">{t('teamShare.history')}</h3>{!loading && imports.l
+   config.lanTokenRevoke            = 'Revoke'
+        src/components/LanTokenPanel.tsx:283 {t('config.lanTokenRevoke')}
+
+[49] 中文「读取失败」
+   usage.loadError                  = 'Failed to load'
+        src/pages/UsagePage.tsx:195 {t('usage.loadError')}: {error}
+   health.versionReadFailed         = 'Read failed'
+        src/pages/HealthPage.tsx:393 return [c.detail, `${t('health.versionReadFailed')}（${String(e).slice(0, 120)}）`] as const

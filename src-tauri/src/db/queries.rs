@@ -1168,6 +1168,158 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), rusq
     Ok(())
 }
 
+// ---------- 本地使用统计（usage_events） ----------
+//
+// 契约：
+// 1. **默认关闭**。开关是 settings 表的 `telemetry_enabled`；键不存在即关闭。
+//    关闭时 `record_usage_event` 直接返回 Ok(()) 而不写库——这是「默认关闭」
+//    的**可验证实现**：即使前端被绕过、直接调 command，也写不进任何数据。
+// 2. **事件名走白名单**。埋点漂移（今天 page_view、明天 view_page）是这类系统
+//    最常见的失败模式：SQL 不报错、报表静默对不上、没人发现。故白名单外的名字
+//    一律拒绝，不做「未登记的先记下再说」。
+// 3. **只落本地**。本模块没有任何网络路径；也没有「上报」command。
+// 4. **有上限**。见 prune_usage_events。
+
+pub const TELEMETRY_ENABLED_KEY: &str = "telemetry_enabled";
+
+/// 允许记录的事件名全集。
+///
+/// **改动前先确认**：新增事件要同时更新这里、前端 `src/utils/telemetry.ts`
+/// 的同名单，以及 i18n 里的展示名。三处任一漏改，后果不同：
+/// 白名单漏了 → 静默不记录；前端漏了 → 后端有、前端没埋；i18n 漏了 → 面板显示原始 key。
+pub const EVENT_NAMES: &[&str] = &[
+    // 会话与 Agent
+    "conversation_created",
+    "agent_run_finished",
+    "agent_run_failed",
+    "message_regenerated",
+    "message_edited",
+    "message_feedback",
+    "context_compacted",
+    // 功能触达
+    "page_view",
+    "command_palette_used",
+    "onboarding_step_viewed",
+    "onboarding_finished",
+    "onboarding_skipped",
+    "settings_changed",
+    // 工具与项目
+    "tool_used",
+    "tool_denied",
+    "project_added",
+    "build_finished",
+    "build_failed",
+    // Provider
+    "provider_configured",
+    "provider_tested",
+    "model_switched",
+    // 资源
+    "export_run",
+    "import_run",
+];
+
+/// 统计开关是否开启。**键不存在 = 关闭**（默认关闭的落点）。
+pub fn usage_events_enabled(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    Ok(get_setting(conn, TELEMETRY_ENABLED_KEY)?.as_deref() == Some("1"))
+}
+
+/// 设置统计开关。关时顺带清空已记录数据——用户关掉它通常意味着不想留。
+pub fn set_usage_events_enabled(
+    conn: &Connection,
+    enabled: bool,
+) -> Result<(), rusqlite::Error> {
+    set_setting(conn, TELEMETRY_ENABLED_KEY, if enabled { "1" } else { "0" })?;
+    if !enabled {
+        clear_usage_events(conn)?;
+    }
+    Ok(())
+}
+
+/// 保留最近这么多条，超出删最旧的
+const USAGE_EVENTS_MAX: i64 = 20_000;
+
+/// 写一条使用事件。
+///
+/// **关闭时静默返回 Ok(())**：埋点在正常路径上，不该因为「用户没开统计」
+/// 而让调用方 try/catch 一串错误——没开统计不是错误状态。
+pub fn record_usage_event(
+    conn: &Connection,
+    event_name: &str,
+    app_version: &str,
+    props: &str,
+) -> Result<(), rusqlite::Error> {
+    if !usage_events_enabled(conn)? {
+        return Ok(());
+    }
+    if !EVENT_NAMES.contains(&event_name) {
+        // 白名单外的名字一律拒绝：记下来只会让「按事件名聚合」静默失真
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "unknown event_name: {event_name}"
+        )));
+    }
+    conn.execute(
+        "INSERT INTO usage_events (event_name, app_version, props, created_at)
+         VALUES (?1, ?2, ?3, unixepoch())",
+        params![event_name, app_version, props],
+    )?;
+    prune_usage_events(conn)
+}
+
+/// 裁剪到最近 `USAGE_EVENTS_MAX` 条。
+fn prune_usage_events(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM usage_events WHERE id NOT IN (
+            SELECT id FROM usage_events ORDER BY id DESC LIMIT ?1
+         )",
+        params![USAGE_EVENTS_MAX],
+    )?;
+    Ok(())
+}
+
+/// 清空全部统计记录
+pub fn clear_usage_events(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM usage_events", [])?;
+    Ok(())
+}
+
+/// 汇总：一个事件名一条，含总次数与最近一次时间。
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct UsageEventSummary {
+    pub event_name: String,
+    pub count: i64,
+    pub last_seen_at: i64,
+}
+
+/// 按事件名聚合计数。`since_ts` 传 0 表示不限起始时间。
+///
+/// 排序：次数降序。**同次数按事件名升序**，让结果在多次查询间稳定——
+/// 否则同分项的顺序由 SQLite 决定，导出对比时会出现「无意义的差异」。
+pub fn usage_event_summary(
+    conn: &Connection,
+    since_ts: i64,
+) -> Result<Vec<UsageEventSummary>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT event_name, COUNT(*) AS n, MAX(created_at) AS last_seen
+         FROM usage_events
+         WHERE created_at >= ?1
+         GROUP BY event_name
+         ORDER BY n DESC, event_name ASC",
+    )?;
+    let rows = stmt.query_map(params![since_ts], |r| {
+        Ok(UsageEventSummary {
+            event_name: r.get(0)?,
+            count: r.get(1)?,
+            last_seen_at: r.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 统计里的总条数（面板顶部显示）
+pub fn usage_event_total(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+}
+
 // ---------- 知识库条目 ----------
 
 /// 按项目路径查 project_id（用于工具执行时把路径映射到作用域）。
@@ -1410,5 +1562,89 @@ mod tests {
         // 无命中
         let rows = search_knowledge_fuzzy(&conn, None, "不存在的关键词 xyz", 5).unwrap();
         assert!(rows.is_empty());
+    }
+
+    // ---------- usage_events：本地使用统计 ----------
+
+    fn usage_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/085_usage_events.sql"))
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn usage_events_default_to_disabled_and_record_nothing() {
+        let conn = usage_conn();
+        // 键不存在 = 关闭
+        assert!(!usage_events_enabled(&conn).unwrap());
+        // 关闭时写入不报错，但也不落库——这是「默认关闭」的可验证实现
+        record_usage_event(&conn, "page_view", "2.3.0", "{}").unwrap();
+        assert_eq!(usage_event_total(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn usage_events_reject_unknown_event_name() {
+        let conn = usage_conn();
+        set_usage_events_enabled(&conn, true).unwrap();
+        // 白名单外一律拒绝：埋点漂移会让聚合静默失真
+        let err = record_usage_event(&conn, "viewPage", "2.3.0", "{}").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+        assert_eq!(usage_event_total(&conn).unwrap(), 0);
+        // 白名单内正常写入
+        record_usage_event(&conn, "page_view", "2.3.0", "{}").unwrap();
+        assert_eq!(usage_event_total(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn disabling_clears_existing_records() {
+        let conn = usage_conn();
+        set_usage_events_enabled(&conn, true).unwrap();
+        record_usage_event(&conn, "page_view", "2.3.0", "{}").unwrap();
+        record_usage_event(&conn, "build_finished", "2.3.0", "{}").unwrap();
+        assert_eq!(usage_event_total(&conn).unwrap(), 2);
+        // 用户关掉统计通常意味着不想留数据，故连带清空
+        set_usage_events_enabled(&conn, false).unwrap();
+        assert_eq!(usage_event_total(&conn).unwrap(), 0);
+        assert!(!usage_events_enabled(&conn).unwrap());
+    }
+
+    #[test]
+    fn summary_groups_by_name_and_breaks_ties_stably() {
+        let conn = usage_conn();
+        set_usage_events_enabled(&conn, true).unwrap();
+        record_usage_event(&conn, "page_view", "2.3.0", "{}").unwrap();
+        record_usage_event(&conn, "page_view", "2.3.0", "{}").unwrap();
+        record_usage_event(&conn, "build_finished", "2.3.0", "{}").unwrap();
+        record_usage_event(&conn, "agent_run_failed", "2.3.0", "{}").unwrap();
+        let s = usage_event_summary(&conn, 0).unwrap();
+        assert_eq!(s.len(), 3);
+        // 次数降序
+        assert_eq!(s[0].event_name, "page_view");
+        assert_eq!(s[0].count, 2);
+        // 同次数按事件名升序：多次查询结果必须稳定，否则导出对比时出现无意义差异
+        assert_eq!(s[1].event_name, "agent_run_failed");
+        assert_eq!(s[2].event_name, "build_finished");
+    }
+
+    #[test]
+    fn summary_since_filters_out_old_rows() {
+        let conn = usage_conn();
+        set_usage_events_enabled(&conn, true).unwrap();
+        conn.execute(
+            "INSERT INTO usage_events (event_name, app_version, props, created_at)
+             VALUES ('page_view', '2.2.0', '{}', 1000)",
+            [],
+        )
+        .unwrap();
+        record_usage_event(&conn, "page_view", "2.3.0", "{}").unwrap();
+        // since=0 全都要
+        assert_eq!(usage_event_total(&conn).unwrap(), 2);
+        // since 晚于那条旧记录 → 只剩 1 条
+        let s = usage_event_summary(&conn, 2000).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].count, 1);
     }
 }

@@ -131,14 +131,14 @@ SDK 路径自动探测：`DEVECO_SDK_HOME` → DevEco Studio 安装路径 → �
 │  React 19 + TypeScript + Tailwind 4 + Vite 8        │
 │  - i18next (中/英/auto) + react-markdown + katex    │
 │  - Zustand store: project / theme / chat / memory   │
-│  - 14 pages（Home 工作区 + 13 个管理页）              │
+│  - 19 pages（Home 工作区 + 18 个管理页）              │
 └─────────────────────────────────────────────────────┘
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 305 个 Tauri IPC 入口 · 62 个 service 模块        │
+│  - 321 个 Tauri IPC 入口 · 64 个 service 模块        │
 │  - agent/ 58 个顶层模块 · tools/ 35 文件 · 204 工具  │
-│  - SQLite + 84 个迁移 · Run/步骤/工具全链路事件溯源  │
+│  - SQLite + 86 个迁移 · Run/步骤/工具全链路事件溯源  │
 │  - 内置运行时：Node + JDK + Git（runtime/）          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -206,9 +206,11 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   运行时质量（6 工具）
 │       ├── quality_media.rs     #   媒体质量（2 工具）
 │       └── schedule_tools.rs    # 定时提醒（schedule_create/list/delete）
-├── commands/               # 38 个命令模块（合计 299 个 IPC 注册入口）
-├── services/               # 业务服务（62 个）
+├── commands/               # 41 个命令模块（合计 321 个 IPC 注册入口）
+├── services/               # 业务服务（64 个）
 │   ├── proxy_service.rs    #   - 本地代理
+│   ├── diagnostic_bundle.rs #  - 诊断包（P2-3：版本 + 环境 + 近期错误，脱敏）
+│   ├── licensing.rs        #   - 授权分级（P2-2：档位权益矩阵 + 配额网关）
 │   ├── circuit_breaker.rs  #   - 熔断器
 │   ├── model_router.rs     #   - 模型路由
 │   ├── embedding.rs        #   - 向量嵌入（GPU 优先自动回退）
@@ -220,7 +222,7 @@ src-tauri/src/
 │   ├── reminders.rs        #   - 定时提醒派发（30s 轮询）
 │   ├── harmony_*.rs        #   - 鸿蒙集成（6 文件）
 │   └── ...
-├── db/                     # SQLite + 68 个顺序迁移
+├── db/                     # SQLite + 85 个顺序迁移
 ├── utils/                  # 工具（13 文件，含任务看门狗）
 ├── tray/                   # 系统托盘
 └── runtime/                # 内置 Node + JDK + Git（约 700MB，不入库，见下）
@@ -309,7 +311,7 @@ npm run clean:generated
 - 前端入口：`src/App.tsx` + `src/pages/Home.tsx`（Agent Workspace 主界面）
 - 后端入口：`src-tauri/src/lib.rs` + `src-tauri/src/main.rs`
 - Agent 工具注册：`src-tauri/src/agent/tools/mod.rs` 的 `TOOL_SPECS` 数组
-- 数据库迁移：`src-tauri/migrations/`（当前 68 个，已执行的迁移不可修改，新增请递增编号）
+- 数据库迁移：`src-tauri/migrations/`（当前 85 个，已执行的迁移不可修改，新增请递增编号）
 - 旧调试脚本：`scripts/legacy/`（仅留档，请勿引用）
 
 ## 打赏支持

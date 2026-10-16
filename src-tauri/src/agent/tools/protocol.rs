@@ -529,14 +529,55 @@ pub struct ToolArgumentIssue {
     pub sensitive: bool,
 }
 
+/// App 自己在提示里印出来的、**不是真实参数**的占位符字面量。
+///
+/// 现象（本机实测，会话 `047424ea`）：系统提示教格式时写的是
+/// `【TOOL|工具名|JSON参数】`，模型把 `JSON参数` **原样当参数发了过来**。
+/// 于是 `serde_json` 在「第 1 行第 1 列」解析失败——而对着一个「发来占位符」的
+/// 行为说「第 1 行第 1 列」等于没说。模型据此得出**错误**结论（本例是
+/// 「我写了 multi-line JSON / 反斜杠转义」），随后在正文里继续吐 raw JSON 解释，
+/// 而那些与真实入参无关。**错误信息一旦无用，模型的自我诊断必然也是错的。**
+///
+/// 与「忘记传参」（空串）严格分开：空串有 `{}` 兜底，占位符**没有**——
+/// 它是错的内容，不是没有内容。
+///
+/// **本列表必须与提示里的实际措辞保持一致**，由
+/// `placeholder_tokens_match_prompt` 双向钉住：提示改了而本表没改，测试立刻报红。
+/// 写成注释约定是不够的——注释从不出错，这正是 `todo_write` 那个坑的成因。
+const DOC_PLACEHOLDER_ARGS: &[&str] = &["JSON参数"];
+
+/// 识别「发来的参数其实是提示里的占位符」，给出指名道姓的纠正建议。
+///
+/// 不回显参数原文：既有约定是建议文本不携带参数值，避免敏感信息二次扩散。
+/// 占位符本身是**文档里印过的固定词**，不是敏感内容，点名它是安全的。
+fn doc_placeholder_issue(args_raw: &str) -> Option<ToolArgumentIssue> {
+    let token = args_raw.trim().trim_matches(|c| "<>[]（）() \t\r\n".contains(c));
+    if !DOC_PLACEHOLDER_ARGS.contains(&token) {
+        return None;
+    }
+    Some(ToolArgumentIssue {
+        code: "placeholder_argument",
+        field: None,
+        suggestion: format!(
+            "你发来的参数字面量是「{token}」——那是系统提示里用来占位的格式示例，不是真实参数。\
+             请把它替换成实际的 JSON 对象，例如 {{\"path\":\"src/main.ets\"}}。"
+        ),
+        sensitive: false,
+    })
+}
+
 /// 按注册表 schema 检查原生工具参数并返回纠错建议。
 ///
 /// 此函数只诊断、从不改写参数。MCP 工具的 schema 由运行期服务提供，不在静态注册表
-/// 内，因此仍交给 MCP 服务校验。建议文本不包含参数值，避免敏感信息二次扩散。
+/// 内，因此仍交给 MCP 服务校验——**这意味着占位符识别同样不覆盖 MCP 工具**
+/// （未注册工具名在这里直接返回空）。建议文本不包含参数值，避免敏感信息二次扩散。
 pub fn validate_tool_arguments(name: &str, args_raw: &str) -> Vec<ToolArgumentIssue> {
     let Some(spec) = TOOL_SPECS.iter().find(|spec| spec.name == name) else {
         return Vec::new();
     };
+    if let Some(issue) = doc_placeholder_issue(args_raw) {
+        return vec![issue];
+    }
     let seg = parameter_segment(spec.desc);
     let params = parameter_map(&seg);
     let required = required_parameter_keys(&seg, params.keys().cloned());
@@ -1044,9 +1085,66 @@ mod tests {
         }
     }
 
+    /// 回归钉子（会话 047424ea 的真实入参）：模型把系统提示里的占位符
+    /// `JSON参数` **原样当参数发了过来**，而错误信息只说「第 1 行第 1 列」。
+    /// 对着这种行为说行列号等于没说，模型据此得出了错误结论。
     #[test]
-    fn argument_validation_suggests_schema_field_without_rewriting() {
-        let issues = validate_tool_arguments("read_file", r#"{"pth":"src/main.rs"}"#);
+    fn placeholder_argument_is_named_instead_of_reported_as_line1_col1() {
+        let issues = validate_tool_arguments("get_project_info", "JSON参数");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "placeholder_argument");
+        assert!(
+            issues[0].suggestion.contains("占位"),
+            "建议必须点明这是占位符：{}",
+            issues[0].suggestion
+        );
+        assert!(issues[0].suggestion.contains("JSON"), "{}", issues[0].suggestion);
+        assert!(!issues[0].sensitive);
+        // 外层尖括号/空白也要认（模型常写成 <JSON参数>）
+        assert_eq!(
+            validate_tool_arguments("get_project_info", " <JSON参数> ")[0].code,
+            "placeholder_argument"
+        );
+    }
+
+    /// 反向：非占位符的非法 JSON 仍走原来的行列诊断，**不许被新分支吞掉**。
+    #[test]
+    fn non_placeholder_garbage_still_reports_json_position() {
+        let issues = validate_tool_arguments("read_file", "{not json");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "invalid_json");
+        assert!(issues[0].suggestion.contains("第 1 行"), "{}", issues[0].suggestion);
+        // 空串仍走 {} 兜底 → 只报缺必填字段，不算占位符
+        let empty = validate_tool_arguments("read_file", "   ");
+        assert!(
+            !empty.iter().any(|issue| issue.code == "placeholder_argument"),
+            "空串不是占位符：{empty:?}"
+        );
+    }
+
+    /// 占位符识别器与提示里的措辞**双向绑定**。
+    ///
+    /// 这是防漂移的关键：系统提示把格式模板写成 `【TOOL|工具名|JSON参数】`，
+    /// 而识别器靠的是一个手维护的词表。任一边单改而另一边没跟上，
+    /// 这个「本该被指名」的形态就会退回「第 1 行第 1 列」——
+    /// **注释约定从不出错，所以必须让测试来守。**
+    #[test]
+    fn placeholder_tokens_match_prompt() {
+        let hint = system_hint_from_specs(TOOL_SPECS.iter());
+        assert!(
+            hint.contains("【TOOL|工具名|JSON参数】"),
+            "格式模板已改；请同步更新 DOC_PLACEHOLDER_ARGS"
+        );
+        for token in DOC_PLACEHOLDER_ARGS {
+            assert!(
+                hint.contains(token),
+                "DOC_PLACEHOLDER_ARGS 里的 {token} 在提示里已不存在，删掉它"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_validation_suggests_schema_field_without_rewriting() {        let issues = validate_tool_arguments("read_file", r#"{"pth":"src/main.rs"}"#);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "unknown_field");
         assert_eq!(issues[0].field.as_deref(), Some("pth"));

@@ -110,7 +110,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
           <div className="w-8 h-8 rounded-[10px] bg-[var(--accent-soft)] flex items-center justify-center">
             <Icon name="folder" size={16} />
           </div>
-          <h2 className="text-[15px] font-semibold flex-1">{t('dialog.addProject')}</h2>
+          <h2 className="text-[length:var(--app-text-base)] font-semibold flex-1">{t('dialog.addProject')}</h2>
           <button
             onClick={onClose}
             className="p-1.5 rounded-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -123,7 +123,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
         <div className="p-5 space-y-4 overflow-y-auto">
           <button
             onClick={pickFolder}
-            className={`w-full flex items-center gap-2.5 px-4 py-3.5 rounded-xl border text-[13px] transition-colors ${
+            className={`w-full flex items-center gap-2.5 px-4 py-3.5 rounded-xl border text-[length:var(--app-text-md)] transition-colors ${
               inspect
                 ? 'border-[var(--accent)]/40 bg-[var(--accent-soft)] text-[var(--text-primary)]'
                 : 'border-dashed border-[var(--border-strong)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] hover:bg-[var(--accent-soft)]'
@@ -137,27 +137,27 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
           </button>
 
           {scanning && (
-            <div className="text-[12px] text-[var(--text-secondary)] flex items-center gap-2">
+            <div className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)] flex items-center gap-2">
               <span className="inline-block w-3 h-3 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
               {t('dialog.scanning')}
             </div>
           )}
 
           {error && (
-            <p className="text-[12px] text-[var(--danger)] bg-[var(--danger)]/10 border border-[var(--danger)]/20 rounded-lg px-3 py-2 break-all">
+            <p className="text-[length:var(--app-text-sm)] text-[var(--danger)] bg-[var(--danger)]/10 border border-[var(--danger)]/20 rounded-lg px-3 py-2 break-all">
               {error}
             </p>
           )}
 
           {inspect && typeBadge && (
-            <div className="rounded-xl modern-card p-4 space-y-2.5 text-[13px] animate-fade-in-up">
+            <div className="rounded-xl modern-card p-4 space-y-2.5 text-[length:var(--app-text-md)] animate-fade-in-up">
               <div className="flex items-center gap-2">
                 <span className="text-[var(--text-secondary)] w-16 shrink-0">{t('dialog.projectName')}</span>
                 <span className="font-medium truncate">{inspect.name}</span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[var(--text-secondary)] w-16 shrink-0">{t('dialog.projectType')}</span>
-                <span className={`px-2 py-0.5 rounded-full text-[11px] font-medium ${typeBadge.cls}`}>
+                <span className={`px-2 py-0.5 rounded-full text-[length:var(--app-text-xs)] font-medium ${typeBadge.cls}`}>
                   {typeBadge.text}
                 </span>
               </div>
@@ -165,7 +165,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
                 <span className="text-[var(--text-secondary)] w-16 shrink-0">{t('dialog.fileCount')}</span>
                 <span>{inspect.file_count}</span>
                 {inspect.has_git && (
-                  <span className="px-2 py-0.5 rounded-full text-[11px] bg-[var(--success-100)] text-[var(--success)] font-medium">
+                  <span className="px-2 py-0.5 rounded-full text-[length:var(--app-text-xs)] bg-[var(--success-100)] text-[var(--success)] font-medium">
                     git
                   </span>
                 )}
@@ -177,7 +177,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
                 </div>
               )}
               {inspect.already_added && (
-                <p className="text-[12px] text-[var(--warning)] bg-[var(--warning)]/10 rounded-lg px-3 py-1.5">
+                <p className="text-[length:var(--app-text-sm)] text-[var(--warning)] bg-[var(--warning)]/10 rounded-lg px-3 py-1.5">
                   {t('dialog.alreadyAdded')}
                 </p>
               )}
@@ -189,7 +189,7 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
             <div className="rounded-xl border border-[var(--accent)]/25 bg-[var(--accent)]/5 overflow-hidden animate-fade-in-up">
               <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[var(--border)]">
                 <Icon name="check" size={14} className="text-[var(--success)]" />
-                <span className="text-[12px] font-medium">
+                <span className="text-[length:var(--app-text-sm)] font-medium">
                   {t('dialog.modulesFound', { count: modules.length })}
                 </span>
               </div>
@@ -201,17 +201,17 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
                   >
                     <Icon name="folder" size={13} className="text-[var(--accent)] shrink-0" />
                     <div className="min-w-0 flex-1">
-                      <div className="font-mono text-[11px] text-[var(--text-primary)] truncate" title={s.rel_path}>
+                      <div className="font-mono text-[length:var(--app-text-xs)] text-[var(--text-primary)] truncate" title={s.rel_path}>
                         {s.rel_path}
                       </div>
                     </div>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 ${KIND_COLOR[s.kind]}`}>
+                    <span className={`px-1.5 py-0.5 rounded text-[length:var(--app-text-2xs)] font-medium shrink-0 ${KIND_COLOR[s.kind]}`}>
                       {MODULE_KIND_LABELS[s.kind]}
                     </span>
                   </div>
                 ))}
               </div>
-              <div className="px-4 py-2 text-[11px] text-[var(--text-muted)] bg-[var(--bg-secondary)] border-t border-[var(--border)]">
+              <div className="px-4 py-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] bg-[var(--bg-secondary)] border-t border-[var(--border)]">
                 {t('dialog.modulesHint')}
               </div>
             </div>
@@ -221,14 +221,14 @@ export default function AddProjectDialog({ onConfirm, onClose }: Props) {
         <div className="flex justify-end gap-2 px-5 py-4 border-t border-[var(--border)]">
           <button
             onClick={onClose}
-            className="px-4 h-9 rounded-[10px] text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            className="px-4 h-9 rounded-[10px] text-[length:var(--app-text-md)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             {t('dialog.cancel')}
           </button>
           <button
             onClick={confirm}
             disabled={!inspect || inspect.already_added || busy || scanning}
-            className="px-4 h-9 rounded-[10px] text-[13px] font-medium btn-primary  disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity]"
+            className="px-4 h-9 rounded-[10px] text-[length:var(--app-text-md)] font-medium btn-primary  disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity]"
           >
             {busy ? '…' : t('dialog.confirmAdd')}
           </button>

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title data-fill="meta.title">DevEco Switch</title>
+  <meta name="description" content="（待填写：一句话描述，搜索结果里显示的就是它）" data-fill="meta.description" />
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="assets/styles.css" />
+</head>
+<body>
+  <!--
+    ============================================================================
+    P2-5 官网骨架 —— 结构与样式已就位，**文案全部留空待填**。
+
+    填写约定（后续填充时按这个来，不用改结构）：
+      1. 每个待填内容都带 data-fill="<唯一键>"，便于脚本批量定位/校验；
+      2. 键名分三段：  区段.字段   例：hero.title / feature.1.body
+      3. 图片放在 assets/screenshots/，并在对应位置改 src；
+      4. 下载链接改 <a data-fill="download.windows"> 的 href（现在是 #）；
+      5. 删掉整段内容就删 <section>，样式不依赖任何固定 id。
+
+    刻意不引第三方 CDN（字体/图标/统计）：
+      官网要在离线环境与内网机器上也能打开，CDN 挂了就白屏。
+      图标用内联 SVG，字体走系统栈。
+    ============================================================================
+  -->
+
+  <a class="skip-link" href="#main">跳到主内容</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="#top" data-fill="nav.brand">DevEco Switch</a>
+      <nav class="site-nav" aria-label="主导航">
+        <a href="#features" data-fill="nav.features">特性</a>
+        <a href="#screenshots" data-fill="nav.screenshots">截图</a>
+        <a href="#download" data-fill="nav.download">下载</a>
+        <a href="#faq" data-fill="nav.faq">常见问题</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- ============================ Hero ============================ -->
+    <section class="hero" id="top">
+      <div class="wrap hero-inner">
+        <div class="hero-copy">
+          <h1 data-fill="hero.title">（待填写：一句话说明这是什么）</h1>
+          <p class="lede" data-fill="hero.subtitle">（待填写：两三句讲清它替用户解决了什么）</p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#download" data-fill="hero.cta.primary">（待填写：主行动）</a>
+            <a class="btn btn-ghost" href="#features" data-fill="hero.cta.secondary">（待填写：次行动）</a>
+          </div>
+          <p class="hero-note" data-fill="hero.note">（待填写：平台 / 开源协议 / 大小等一行事实）</p>
+        </div>
+        <figure class="hero-shot">
+          <!-- 主视觉：现用 07（项目已打开），换成最终 hero 图时只改 src -->
+          <img src="assets/screenshots/07_project_opened.png"
+               alt="（待填写：主截图的替代文本）"
+               data-fill="hero.image.src"
+               width="1102" height="752" />
+        </figure>
+      </div>
+    </section>
+
+    <!-- ========================== 特性 ========================== -->
+    <section class="section" id="features">
+      <div class="wrap">
+        <h2 data-fill="features.title">（待填写：特性区标题）</h2>
+        <p class="section-lede" data-fill="features.lede">（待填写：一句话交代这组特性想说明什么）</p>
+        <ul class="cards">
+          <!-- 复制整张 <li> 增删即可；不依赖固定 id -->
+          <li class="card">
+            <h3 data-fill="feature.1.title">（待填写：特性一）</h3>
+            <p data-fill="feature.1.body">（待填写：一到两句，讲用户能拿到什么，不讲实现）</p>
+          </li>
+          <li class="card">
+            <h3 data-fill="feature.2.title">（待填写：特性二）</h3>
+            <p data-fill="feature.2.body">（待填写）</p>
+          </li>
+          <li class="card">
+            <h3 data-fill="feature.3.title">（待填写：特性三）</h3>
+            <p data-fill="feature.3.body">（待填写）</p>
+          </li>
+          <li class="card">
+            <h3 data-fill="feature.4.title">（待填写：特性四）</h3>
+            <p data-fill="feature.4.body">（待填写）</p>
+          </li>
+          <li class="card">
+            <h3 data-fill="feature.5.title">（待填写：特性五）</h3>
+            <p data-fill="feature.5.body">（待填写）</p>
+          </li>
+          <li class="card">
+            <h3 data-fill="feature.6.title">（待填写：特性六）</h3>
+            <p data-fill="feature.6.body">（待填写）</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ========================== 截图 ========================== -->
+    <section class="section section-alt" id="screenshots">
+      <div class="wrap">
+        <h2 data-fill="screenshots.title">（待填写：截图区标题）</h2>
+        <div class="shots">
+          <figure class="shot">
+            <img src="assets/screenshots/01_initial.png"
+                 alt="（待填写）" data-fill="screenshots.1.alt"
+                 width="1102" height="752" loading="lazy" />
+            <figcaption data-fill="screenshots.1.caption">（待填写：图注）</figcaption>
+          </figure>
+          <figure class="shot">
+            <img src="assets/screenshots/07_project_opened.png"
+                 alt="（待填写）" data-fill="screenshots.2.alt"
+                 width="1102" height="752" loading="lazy" />
+            <figcaption data-fill="screenshots.2.caption">（待填写：图注）</figcaption>
+          </figure>
+          <!-- 素材位：截图放 assets/screenshots/ 后复制一个 <figure class="shot"> 即可 -->
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================== 下载 ========================== -->
+    <section class="section" id="download">
+      <div class="wrap">
+        <h2 data-fill="download.title">（待填写：下载区标题）</h2>
+        <div class="downloads">
+          <a class="dl" href="#" data-fill="download.windows">
+            <strong>Windows</strong>
+            <span data-fill="download.windows.note">（待填写：格式 / 大小）</span>
+          </a>
+          <a class="dl" href="#" data-fill="download.macos">
+            <strong>macOS</strong>
+            <span data-fill="download.macos.note">（待填写：格式 / 大小）</span>
+          </a>
+          <a class="dl dl-muted" href="#" data-fill="download.source">
+            <strong>源码</strong>
+            <span data-fill="download.source.note">（待填写：仓库地址）</span>
+          </a>
+        </div>
+        <p class="section-note" data-fill="download.note">（待填写：安装前提、系统要求等）</p>
+      </div>
+    </section>
+
+    <!-- ========================== FAQ ========================== -->
+    <section class="section section-alt" id="faq">
+      <div class="wrap wrap-narrow">
+        <h2 data-fill="faq.title">（待填写：常见问题）</h2>
+        <details class="faq-item">
+          <summary data-fill="faq.1.q">（待填写：问题一）</summary>
+          <p data-fill="faq.1.a">（待填写：答案）</p>
+        </details>
+        <details class="faq-item">
+          <summary data-fill="faq.2.q">（待填写：问题二）</summary>
+          <p data-fill="faq.2.a">（待填写：答案）</p>
+        </details>
+        <details class="faq-item">
+          <summary data-fill="faq.3.q">（待填写：问题三）</summary>
+          <p data-fill="faq.3.a">（待填写：答案）</p>
+        </details>
+        <details class="faq-item">
+          <summary data-fill="faq.4.q">（待填写：问题四）</summary>
+          <p data-fill="faq.4.a">（待填写：答案）</p>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <p data-fill="footer.copyright">（待填写：版权行）</p>
+      <nav class="footer-nav" aria-label="页脚导航">
+        <a href="#" data-fill="footer.links.docs">（待填写：文档）</a>
+        <a href="#" data-fill="footer.links.issues">（待填写：反馈）</a>
+        <a href="#" data-fill="footer.links.license">（待填写：协议）</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="assets/site.js" defer></script>
+</body>
+</html>

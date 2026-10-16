@@ -1,6 +1,7 @@
 use tauri::State;
 
 use crate::db::DbState;
+use crate::services::licensing::{self, Capability};
 use crate::services::team_sharing::{
     ShareChangeRecord, ShareImportRecord, SharePreview, TeamEvalRun, TeamEvalSetRecord,
     TeamSharePackage, TeamShareSource,
@@ -14,6 +15,8 @@ pub fn preview_team_share(
 ) -> Result<SharePreview, String> {
     let package = crate::services::team_sharing::parse_and_validate(&package)?;
     let conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::TeamSharing)?;
     crate::services::team_sharing::preview(&conn, &project_id, &package)
 }
 
@@ -25,6 +28,8 @@ pub fn apply_team_share(
 ) -> Result<ShareImportRecord, String> {
     let package = crate::services::team_sharing::parse_and_validate(&package)?;
     let mut conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::TeamSharing)?;
     crate::services::team_sharing::apply(&mut conn, &project_id, &package)
 }
 
@@ -35,6 +40,8 @@ pub fn revert_team_share(
     batch_id: String,
 ) -> Result<usize, String> {
     let mut conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::TeamSharing)?;
     crate::services::team_sharing::revert(&mut conn, &project_id, &batch_id)
 }
 
@@ -44,6 +51,8 @@ pub fn list_team_share_imports(
     project_id: String,
 ) -> Result<Vec<ShareImportRecord>, String> {
     let conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::TeamSharing)?;
     crate::services::team_sharing::list_imports(&conn, &project_id)
 }
 
@@ -54,6 +63,8 @@ pub fn list_team_share_changes(
     batch_id: String,
 ) -> Result<Vec<ShareChangeRecord>, String> {
     let conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::TeamSharing)?;
     crate::services::team_sharing::list_changes(&conn, &project_id, &batch_id)
 }
 
@@ -68,6 +79,8 @@ pub fn export_team_share(
     source_revision: String,
 ) -> Result<TeamSharePackage, String> {
     let conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::TeamSharing)?;
     crate::services::team_sharing::export(
         &conn,
         &project_id,
@@ -88,6 +101,8 @@ pub fn run_team_eval_set(
     set_id: String,
 ) -> Result<TeamEvalRun, String> {
     let conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::EvalReports)?;
     crate::services::team_sharing::run_eval_set(&conn, &project_id, &set_id)
 }
 
@@ -97,5 +112,7 @@ pub fn list_team_eval_sets(
     project_id: String,
 ) -> Result<Vec<TeamEvalSetRecord>, String> {
     let conn = db.0.lock().map_err(|error| error.to_string())?;
+    // 能力网关：档位判断只发生在 licensing 里，command 层不自己比较
+    licensing::check(&conn, Capability::EvalReports)?;
     crate::services::team_sharing::list_eval_sets(&conn, &project_id)
 }

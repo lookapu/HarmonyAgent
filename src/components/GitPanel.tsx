@@ -142,7 +142,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
     <div className="p-3 space-y-2.5">
       {/* 反馈条（可手动关闭） */}
       {err && (
-        <div className="flex items-start gap-1.5 rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-2.5 text-[11px] text-[var(--danger)]">
+        <div className="flex items-start gap-1.5 rounded-xl border border-[var(--danger)]/30 bg-[var(--danger)]/10 p-2.5 text-[length:var(--app-text-xs)] text-[var(--danger)]">
           <span className="flex-1 min-w-0 whitespace-pre-wrap break-all">{err}</span>
           <button
             onClick={() => setErr(null)}
@@ -155,7 +155,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
         </div>
       )}
       {msg && (
-        <div className="flex items-start gap-1.5 rounded-xl border border-[var(--success)]/30 bg-[var(--success)]/10 p-2.5 text-[11px] text-[var(--success)]">
+        <div className="flex items-start gap-1.5 rounded-xl border border-[var(--success)]/30 bg-[var(--success)]/10 p-2.5 text-[length:var(--app-text-xs)] text-[var(--success)]">
           <span className="flex-1 min-w-0 whitespace-pre-wrap break-all">{msg}</span>
           <button
             onClick={() => setMsg(null)}
@@ -173,14 +173,14 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
         <div className="rounded-xl border border-[var(--accent)]/25 bg-[var(--accent-soft)]/40 p-2.5">
           <div className="flex items-center gap-1.5">
             <Icon name="git-branch" size={12} className="text-[var(--accent)] shrink-0" />
-            <span className="text-[10.5px] font-medium text-[var(--accent)]">{t('home.gitSessionWorktree')}</span>
+            <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--accent)]">{t('home.gitSessionWorktree')}</span>
             {sessionWorktree.branch && (
-              <span className="ml-auto shrink-0 text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent)]/10 text-[var(--accent)] font-mono">
+              <span className="ml-auto shrink-0 text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--accent)]/10 text-[var(--accent)] font-mono">
                 {sessionWorktree.branch}
               </span>
             )}
           </div>
-          <div className="mt-1 text-[10px] font-mono text-[var(--text-muted)] truncate" title={sessionWorktree.path}>
+          <div className="mt-1 text-[length:var(--app-text-2xs)] font-mono text-[var(--text-muted)] truncate" title={sessionWorktree.path}>
             {sessionWorktree.path}
           </div>
         </div>
@@ -199,7 +199,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                 writeGitRepo(project.id, v)
               }}
               title={t('home.gitSelectRepo')}
-              className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors"
+              className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors"
             >
               {repos.map((r) => (
                 <option key={r} value={r}>
@@ -215,13 +215,13 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
       <div className="rounded-xl modern-card p-3">
         <div className="flex items-center gap-1.5 mb-2.5">
           <Icon name="git-branch" size={13} className="text-[var(--text-secondary)]" />
-          <span className="text-[12px] font-medium">{t('home.gitBranches')}</span>
+          <span className="text-[length:var(--app-text-sm)] font-medium">{t('home.gitBranches')}</span>
           {isRepo && (
             <div className="ml-auto flex items-center gap-1">
-              <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--warning)]/10 text-[var(--warning)]">
+              <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--warning)]/10 text-[var(--warning)]">
                 {t('home.gitChanged', { n: info!.changed })}
               </span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)]">
+              <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)]">
                 {t('home.gitUntracked', { n: info!.untracked })}
               </span>
             </div>
@@ -234,12 +234,12 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
           </div>
         ) : !isRepo ? (
           <div className="py-3 text-center space-y-2">
-            <div className="text-[11.5px] text-[var(--text-muted)]">{t('home.gitNoRepo')}</div>
-            <div className="text-[10.5px] text-[var(--text-muted)]/80 leading-relaxed">{t('home.gitInitRepoTip')}</div>
+            <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.gitNoRepo')}</div>
+            <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]/80 leading-relaxed">{t('home.gitInitRepoTip')}</div>
             <button
               onClick={() => run('init', () => gitInitRepo(gitRoot))}
               disabled={busy !== null}
-              className="inline-flex items-center gap-1.5 h-7 px-3 rounded-lg btn-primary text-[11px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
+              className="inline-flex items-center gap-1.5 h-7 px-3 rounded-lg btn-primary text-[length:var(--app-text-xs)] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
             >
               {busy === 'init' ? (
                 <span className="w-3 h-3 rounded-full border border-white/40 border-t-transparent animate-spin" />
@@ -255,8 +255,8 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
             <div className="flex items-center gap-2 mb-2">
               <span className="flex-1 min-w-0 flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[var(--bg-window)] border border-[var(--border)]">
                 <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] shrink-0" />
-                <span className="text-[11px] text-[var(--text-muted)] shrink-0">{t('home.gitBranchCurrent')}</span>
-                <span className="text-[11.5px] font-mono font-medium truncate">{info!.current || '—'}</span>
+                <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] shrink-0">{t('home.gitBranchCurrent')}</span>
+                <span className="text-[length:var(--app-text-xs)] font-mono font-medium truncate">{info!.current || '—'}</span>
               </span>
               <button
                 onClick={() => setStatusOpen((v) => !v)}
@@ -268,7 +268,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
               </button>
             </div>
             {statusOpen && info!.status_text.trim() && (
-              <pre className="mb-2 max-h-40 overflow-y-auto rounded-lg bg-[var(--bg-window)] border border-[var(--border)] p-2 text-[10.5px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap">
+              <pre className="mb-2 max-h-40 overflow-y-auto rounded-lg bg-[var(--bg-window)] border border-[var(--border)] p-2 text-[length:var(--app-text-xs)] font-mono text-[var(--text-secondary)] whitespace-pre-wrap">
                 {info!.status_text}
               </pre>
             )}
@@ -278,7 +278,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
               {info!.branches.map((b) => (
                 <div
                   key={`${b.is_remote ? 'r' : 'l'}:${b.name}`}
-                  className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[11.5px] ${
+                  className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[length:var(--app-text-xs)] ${
                     b.is_current ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'hover:bg-[var(--bg-hover)]'
                   }`}
                 >
@@ -302,12 +302,12 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                     {b.name}
                   </button>
                   {b.is_remote && (
-                    <span className="text-[9px] px-1 py-0.5 rounded bg-[var(--bg-hover)] text-[var(--text-muted)] shrink-0">
+                    <span className="text-[length:var(--app-text-micro)] px-1 py-0.5 rounded bg-[var(--bg-hover)] text-[var(--text-muted)] shrink-0">
                       {t('home.gitRemote')}
                     </span>
                   )}
                   {b.is_current && (
-                    <span className="text-[9px] px-1 py-0.5 rounded bg-[var(--accent)]/10 shrink-0">
+                    <span className="text-[length:var(--app-text-micro)] px-1 py-0.5 rounded bg-[var(--accent)]/10 shrink-0">
                       {t('home.branchCurrent')}
                     </span>
                   )}
@@ -317,7 +317,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                 </div>
               ))}
               {info!.branches.length === 0 && (
-                <div className="py-2 text-center text-[11px] text-[var(--text-muted)]">—</div>
+                <div className="py-2 text-center text-[length:var(--app-text-xs)] text-[var(--text-muted)]">—</div>
               )}
             </div>
           </>
@@ -329,9 +329,9 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
         <div className="rounded-xl modern-card p-3">
           <div className="flex items-center gap-1.5 mb-1">
             <Icon name="folder" size={13} className="text-[var(--text-secondary)]" />
-            <span className="text-[12px] font-medium">{t('home.gitWorktrees')}</span>
+            <span className="text-[length:var(--app-text-sm)] font-medium">{t('home.gitWorktrees')}</span>
           </div>
-          <p className="text-[10.5px] text-[var(--text-muted)] leading-relaxed mb-2.5">{t('home.gitWorktreeTip')}</p>
+          <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed mb-2.5">{t('home.gitWorktreeTip')}</p>
 
           {/* worktree 列表 */}
           <div className="space-y-1.5">
@@ -339,10 +339,10 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                 <div key={wt.path} className="rounded-lg border p-2 border-[var(--border)] bg-[var(--bg-window)]/50">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <Icon name={wt.is_main ? 'bolt' : 'folder'} size={11} className="shrink-0 opacity-50" />
-                    <span className="text-[11px] font-mono font-medium truncate" title={wt.path}>
+                    <span className="text-[length:var(--app-text-xs)] font-mono font-medium truncate" title={wt.path}>
                       {wt.is_main ? wt.path : wt.path.split(/[\\/]/).pop()}
                     </span>
-                    <span className="ml-auto shrink-0 text-[9px] px-1 py-0.5 rounded bg-[var(--bg-hover)] text-[var(--text-muted)]">
+                    <span className="ml-auto shrink-0 text-[length:var(--app-text-micro)] px-1 py-0.5 rounded bg-[var(--bg-hover)] text-[var(--text-muted)]">
                       {wt.is_main ? t('home.gitMain') : wt.branch}
                     </span>
                   </div>
@@ -352,7 +352,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                         onClick={() => newConvWt(wt)}
                         disabled={busy !== null}
                         title={t('home.newConversation')}
-                        className="flex-1 text-[10px] px-1.5 py-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                        className="flex-1 text-[length:var(--app-text-2xs)] px-1.5 py-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                       >
                         {t('home.newConversation')}
                       </button>
@@ -360,7 +360,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                         onClick={() => mergeWt(wt)}
                         disabled={busy !== null}
                         title={t('home.gitMerge')}
-                        className="flex-1 text-[10px] px-1.5 py-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--success)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                        className="flex-1 text-[length:var(--app-text-2xs)] px-1.5 py-1 rounded-md text-[var(--text-secondary)] hover:text-[var(--success)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                       >
                         {t('home.gitMerge')}
                       </button>
@@ -378,21 +378,21 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
                 </div>
               ))}
             {worktrees.length === 0 && (
-              <div className="py-3 text-center text-[11px] text-[var(--text-muted)]">{t('home.gitWorktreeEmpty')}</div>
+              <div className="py-3 text-center text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.gitWorktreeEmpty')}</div>
             )}
           </div>
 
           {/* 创建表单 */}
           <div className="mt-2.5 pt-2.5 border-t border-[var(--border)]">
             <div className="flex items-center gap-1.5 mb-1.5">
-              <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.gitCreateWorktree')}</span>
+              <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)]">{t('home.gitCreateWorktree')}</span>
             </div>
             <div className="flex gap-1.5">
               <select
                 value={createBranch}
                 onChange={(e) => setCreateBranch(e.target.value)}
                 title={t('home.gitSelectBranch')}
-                className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors"
+                className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)] transition-colors"
               >
                 <option value="">{t('home.gitSelectBranch')}</option>
                 {branchOptions.map((b) => (
@@ -404,7 +404,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
               <button
                 onClick={createWt}
                 disabled={!createBranch.trim() || busy !== null}
-                className="shrink-0 h-7 px-3 rounded-lg btn-primary text-[11px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
+                className="shrink-0 h-7 px-3 rounded-lg btn-primary text-[length:var(--app-text-xs)] font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
               >
                 {busy === 'create' ? '…' : t('home.gitCreate')}
               </button>
@@ -413,7 +413,7 @@ export default function GitPanel({ project, sessionWorktree, onNewWorktreeConver
               value={createNewBranch}
               onChange={(e) => setCreateNewBranch(e.target.value)}
               placeholder={t('home.gitNewBranchName')}
-              className="mt-1.5 w-full h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
+              className="mt-1.5 w-full h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
             />
           </div>
         </div>

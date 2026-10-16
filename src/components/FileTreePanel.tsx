@@ -405,7 +405,7 @@ export default function FileTreePanel({
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-14 text-center">
         <span className="w-6 h-6 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin" />
-        <p className="text-[11px] text-[var(--text-muted)]">{t('home.indexBuilding')}</p>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.indexBuilding')}</p>
       </div>
     )
   }
@@ -414,10 +414,10 @@ export default function FileTreePanel({
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-14 text-center">
         <Icon name="folder" size={22} className="opacity-40" />
-        <p className="text-[11px] text-[var(--text-muted)]">{t('home.indexEmpty')}</p>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.indexEmpty')}</p>
         <button
           onClick={onRefresh}
-          className="h-7 px-3 rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:bg-[var(--accent)] hover:text-white transition-colors"
+          className="h-7 px-3 rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] text-[length:var(--app-text-xs)] font-medium hover:bg-[var(--accent)] hover:text-white transition-colors"
         >
           {t('home.rebuildIndex')}
         </button>
@@ -430,9 +430,9 @@ export default function FileTreePanel({
       {/* 头部：项目名 + 展开/收起 + 刷新 */}
       <div className="flex items-center justify-between px-2 pb-2">
         <span className="flex items-center gap-2 min-w-0">
-          <span className="text-[11px] font-medium text-[var(--text-secondary)] truncate">{tree.name}</span>
+          <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)] truncate">{tree.name}</span>
           {indexProgress != null && (
-            <span className="shrink-0 flex items-center gap-1 text-[10px] text-[var(--accent)] tabular-nums">
+            <span className="shrink-0 flex items-center gap-1 text-[length:var(--app-text-2xs)] text-[var(--accent)] tabular-nums">
               <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
               {t('home.indexing', { count: indexProgress.toLocaleString() })}
             </span>
@@ -494,7 +494,7 @@ export default function FileTreePanel({
               }}
               placeholder={t('home.searchFilePlaceholder')}
               spellCheck={false}
-              className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[11px] text-[var(--text-secondary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
+              className="flex-1 min-w-0 h-7 rounded-lg bg-[var(--bg-window)] border border-[var(--border)] px-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] transition-colors"
             />
             {searchQuery && (
               <button
@@ -508,16 +508,16 @@ export default function FileTreePanel({
             )}
           </div>
           {!searchQuery.trim() ? (
-            <div className="px-2 py-3 text-[11px] text-[var(--text-muted)] leading-relaxed">
+            <div className="px-2 py-3 text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed">
               {t('home.searchFileHint')}
             </div>
           ) : searching ? (
-            <div className="flex items-center gap-2 px-2 py-3 text-[11px] text-[var(--text-muted)]">
+            <div className="flex items-center gap-2 px-2 py-3 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
               <span className="w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
               {t('home.searching')}
             </div>
           ) : searchResults.length === 0 ? (
-            <div className="px-2 py-3 text-[11px] text-[var(--text-muted)]">{t('home.searchNoResult')}</div>
+            <div className="px-2 py-3 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.searchNoResult')}</div>
           ) : (
             <div className="space-y-px max-h-[60vh] overflow-y-auto pr-0.5">
               {searchResults.map((hit) => {
@@ -530,7 +530,7 @@ export default function FileTreePanel({
                 return (
                   <div
                     key={hit.path}
-                    className={`group flex items-center gap-1 rounded-md py-[3px] pl-2 pr-1 text-[12px] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${
+                    className={`group flex items-center gap-1 rounded-md py-[3px] pl-2 pr-1 text-[length:var(--app-text-sm)] cursor-pointer select-none transition-colors text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${
                       ctxSelected === hit.path ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]' : ''
                     }`}
                     onClick={() => openSearchHit(hit)}
@@ -541,7 +541,7 @@ export default function FileTreePanel({
                     <Icon name="file" size={13} className={`shrink-0 opacity-60 ${treeStatusColor(hitStatus)}`} />
                     <span className={`flex-1 truncate ${treeStatusColor(hitStatus)}`}>{hit.name}</span>
                     {dir && (
-                      <span className="shrink-0 max-w-[45%] truncate text-[10px] text-[var(--text-muted)] opacity-70 group-hover:opacity-100" title={dir}>
+                      <span className="shrink-0 max-w-[45%] truncate text-[length:var(--app-text-2xs)] text-[var(--text-muted)] opacity-70 group-hover:opacity-100" title={dir}>
                         {dir}
                       </span>
                     )}
@@ -610,7 +610,7 @@ export default function FileTreePanel({
               <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[var(--border)]">
                 <Icon name="history" size={12} className="text-[var(--accent)] shrink-0" />
                 <span
-                  className="text-[11px] font-medium text-[var(--text-secondary)] flex-1 min-w-0 truncate"
+                  className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)] flex-1 min-w-0 truncate"
                   title={menu.node.path}
                 >
                   {menu.node.path}
@@ -620,23 +620,23 @@ export default function FileTreePanel({
                     setMenuView('ops')
                     setMenuErr(null)
                   }}
-                  className="shrink-0 text-[10px] text-[var(--accent)] hover:underline"
+                  className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--accent)] hover:underline"
                 >
                   {t('home.gitLogBack')}
                 </button>
               </div>
               <div className="max-h-56 overflow-y-auto p-2">
                 {menuBusy === 'log' ? (
-                  <div className="flex items-center gap-1.5 py-2 text-[11px] text-[var(--text-muted)]">
+                  <div className="flex items-center gap-1.5 py-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
                     <span className="w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
                     {t('home.loading')}
                   </div>
                 ) : logContent ? (
-                  <pre className="font-mono text-[10.5px] text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">
+                  <pre className="font-mono text-[length:var(--app-text-xs)] text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">
                     {logContent}
                   </pre>
                 ) : menuErr ? (
-                  <div className="text-[10.5px] text-[var(--danger)] break-all">{menuErr}</div>
+                  <div className="text-[length:var(--app-text-xs)] text-[var(--danger)] break-all">{menuErr}</div>
                 ) : null}
               </div>
             </>
@@ -647,12 +647,12 @@ export default function FileTreePanel({
               {statusLoading ? (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[var(--border)]">
                   <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
-                  <span className="text-[10px] text-[var(--text-muted)]">{t('home.loading')}</span>
+                  <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('home.loading')}</span>
                 </div>
               ) : menuStatus?.is_repo ? (
                 <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[var(--border)]">
                   <Icon name="git-branch" size={11} className="opacity-60 shrink-0" />
-                  <span className={`text-[10px] font-medium ${gitStatusMeta(menuStatus.status).color}`}>
+                  <span className={`text-[length:var(--app-text-2xs)] font-medium ${gitStatusMeta(menuStatus.status).color}`}>
                     {gitStatusMeta(menuStatus.status).label}
                   </span>
                 </div>
@@ -664,7 +664,7 @@ export default function FileTreePanel({
                     setPreview(menu.node)
                     setMenu(null)
                   }}
-                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                 >
                   <Icon name="devices" size={13} className="opacity-60" />
                   {t('home.preview')}
@@ -672,14 +672,14 @@ export default function FileTreePanel({
               )}
               <button
                 onClick={copyPath}
-                className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 <Icon name="copy" size={13} className="opacity-60" />
                 {copied ? t('home.copied') : t('home.copyPath')}
               </button>
               <button
                 onClick={sendToChat}
-                className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 <Icon name="plus" size={13} className="opacity-60" />
                 {t('home.sendToChat')}
@@ -693,7 +693,7 @@ export default function FileTreePanel({
                     <button
                       onClick={() => void runGitOp('ignore', () => gitIgnoreAdd(projectPath, menu.node.path))}
                       disabled={menuBusy !== null}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
                     >
                       <Icon name="archive" size={13} className="opacity-60" />
                       {menuBusy === 'ignore' ? t('home.gitOpRunning') : t('home.gitIgnoreAdd')}
@@ -703,7 +703,7 @@ export default function FileTreePanel({
                     <button
                       onClick={() => void runGitOp('untrack', () => gitUntrack(projectPath, menu.node.path))}
                       disabled={menuBusy !== null}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
                     >
                       <Icon name="delete" size={13} className="opacity-60" />
                       {menuBusy === 'untrack' ? t('home.gitOpRunning') : t('home.gitUntrack')}
@@ -713,7 +713,7 @@ export default function FileTreePanel({
                     <button
                       onClick={() => void runGitOp('stage', () => gitStage(projectPath, menu.node.path))}
                       disabled={menuBusy !== null}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
                     >
                       <Icon name="check" size={13} className="opacity-60" />
                       {menuBusy === 'stage' ? t('home.gitOpRunning') : t('home.gitStage')}
@@ -723,7 +723,7 @@ export default function FileTreePanel({
                     <button
                       onClick={handleRevert}
                       disabled={menuBusy !== null}
-                      className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] transition-colors disabled:opacity-40 disabled:cursor-default ${
+                      className={`w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] transition-colors disabled:opacity-40 disabled:cursor-default ${
                         confirmRevert
                           ? 'text-[var(--danger)] bg-[var(--danger)]/10 hover:bg-[var(--danger)]/15'
                           : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -741,7 +741,7 @@ export default function FileTreePanel({
                     <button
                       onClick={() => void runGitOp('log', () => gitFileLog(projectPath, menu.node.path))}
                       disabled={menuBusy !== null}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-default"
                     >
                       <Icon name="history" size={13} className="opacity-60" />
                       {menuBusy === 'log' ? t('home.gitOpRunning') : t('home.gitFileLog')}
@@ -752,12 +752,12 @@ export default function FileTreePanel({
 
               {/* 操作结果反馈 */}
               {menuErr && (
-                <div className="px-3 py-1.5 text-[10px] text-[var(--danger)] border-t border-[var(--border)] break-all">
+                <div className="px-3 py-1.5 text-[length:var(--app-text-2xs)] text-[var(--danger)] border-t border-[var(--border)] break-all">
                   {menuErr}
                 </div>
               )}
               {menuDone && (
-                <div className="px-3 py-1.5 text-[10px] text-[var(--success)] border-t border-[var(--border)] break-all">
+                <div className="px-3 py-1.5 text-[length:var(--app-text-2xs)] text-[var(--success)] border-t border-[var(--border)] break-all">
                   {menuDone}
                 </div>
               )}
@@ -890,7 +890,7 @@ function TreeNodeItem({
   return (
     <div>
       <div
-        className={`group flex items-center gap-1 rounded-md py-[3px] pr-1 text-[12px] cursor-pointer select-none transition-colors ${
+        className={`group flex items-center gap-1 rounded-md py-[3px] pr-1 text-[length:var(--app-text-sm)] cursor-pointer select-none transition-colors ${
           isDir ? '' : 'hover:bg-[var(--bg-hover)]'
         } ${depth === 0 ? 'font-medium text-[var(--text-primary)]' : 'text-[var(--text-secondary)]'} ${
           ctxSelected === node.path ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]' : ''
@@ -920,7 +920,7 @@ function TreeNodeItem({
         </span>
         {!isDir && (counts[node.path] ?? 0) > 0 && (
           <span
-            className="text-[9px] text-[var(--text-muted)] shrink-0 tabular-nums opacity-70 group-hover:opacity-100"
+            className="text-[length:var(--app-text-micro)] text-[var(--text-muted)] shrink-0 tabular-nums opacity-70 group-hover:opacity-100"
             title={`${counts[node.path]} ${t('home.symbols')}`}
           >
             {counts[node.path]}
@@ -943,21 +943,21 @@ function TreeNodeItem({
       {isDir && isOpen && (
         <div className="space-y-px">
           {loading && !cached ? (
-            <div className="flex items-center gap-1.5 py-1 pl-6 text-[11px] text-[var(--text-muted)]">
+            <div className="flex items-center gap-1.5 py-1 pl-6 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
               <span className="w-3 h-3 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />
               {t('home.loadingDir')}
             </div>
           ) : failed ? (
             <button
               onClick={ensureLoaded}
-              className="flex items-center gap-1.5 py-1 pl-6 text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
+              className="flex items-center gap-1.5 py-1 pl-6 text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
             >
               <Icon name="refresh" size={11} />
               {t('home.loadRetry')}
             </button>
           ) : cached ? (
             cached.length === 0 ? (
-              <div className="py-1 pl-6 text-[11px] text-[var(--text-muted)] italic">{t('home.emptyDir')}</div>
+              <div className="py-1 pl-6 text-[length:var(--app-text-xs)] text-[var(--text-muted)] italic">{t('home.emptyDir')}</div>
             ) : (
               cached.map((child) => (
                 <TreeNodeItem

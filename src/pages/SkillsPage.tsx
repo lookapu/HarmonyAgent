@@ -18,6 +18,7 @@ import { useProjectStore } from '../stores/projectStore'
 import Icon from '../icons/Icon'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
 import { Skeleton } from '../components/ui/Spinner'
+import { EmptyState } from '../components/ui/EmptyState'
 
 /** 从 Git 仓库地址（GitHub/Gitee 的 URL / git@ / owner/name）提取 owner 和 name */
 function parseGithubUrl(input: string): { owner: string; name: string } | null {
@@ -197,7 +198,7 @@ export default function SkillsPage() {
         {view === 'skills' && (
           <button
             onClick={() => setShowForm(!showForm)}
-            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-[color,background-color,border-color,opacity] shadow-lg shadow-[var(--accent)]/15"
+            className="h-9 px-4 rounded-[10px] btn-primary text-[length:var(--app-text-md)] font-medium transition-[color,background-color,border-color,opacity] shadow-lg shadow-[var(--accent)]/15"
           >
             <span className="flex items-center gap-1.5">
               <Icon name={showForm ? 'close' : 'download'} size={14} white />
@@ -208,7 +209,7 @@ export default function SkillsPage() {
       </div>
 
       {/* 视图切换：技能列表 / 使用统计 */}
-      <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[12px]">
+      <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[length:var(--app-text-sm)]">
         <button
           onClick={() => setView('skills')}
           className={`px-3 h-7 rounded-md transition-colors ${view === 'skills' ? 'tab-active' : 'tab-inactive'}`}
@@ -235,7 +236,7 @@ export default function SkillsPage() {
       ) : (
         <>
       {projectId && (
-        <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[12px]">
+        <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[length:var(--app-text-sm)]">
           <button
             onClick={() => setScope('global')}
             className={`px-3 h-7 rounded-md transition-colors ${scope === 'global' ? 'tab-active' : 'tab-inactive'}`}
@@ -251,10 +252,10 @@ export default function SkillsPage() {
         </div>
       )}
       {!projectId && (
-        <p className="text-[11px] text-[var(--text-muted)] mb-4">{t('common.scopeGlobalOnly')}</p>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mb-4">{t('common.scopeGlobalOnly')}</p>
       )}
       {projectId && effectiveScope === 'project' && !currentProject?.trusted && (
-        <div className="mb-4 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[11px] text-[var(--warning)]">
+        <div className="mb-4 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[length:var(--app-text-xs)] text-[var(--warning)]">
           ⚠️ {t('common.untrustedScopeWarn')}
         </div>
       )}
@@ -262,26 +263,26 @@ export default function SkillsPage() {
       {showForm && (
         <div className="modern-card rounded-2xl p-4 mb-6 space-y-3 animate-fade-in-up">
           <div className="space-y-1.5">
-            <label className="text-[11px] text-[var(--text-muted)]">{t('skill.repoUrl')}</label>
+            <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('skill.repoUrl')}</label>
             <input
               placeholder={t('skill.repoUrlPlaceholder')}
               value={repoUrl}
               onChange={(e) => setRepoUrl(e.target.value)}
-              className="w-full h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
             />
             {parsed && (
-              <p className="text-[11px] text-[var(--success)] font-mono">
+              <p className="text-[length:var(--app-text-xs)] text-[var(--success)] font-mono">
                 ✓ {parsed.owner}/{parsed.name}
               </p>
             )}
           </div>
           <div className="space-y-1.5">
-            <label className="text-[11px] text-[var(--text-muted)]">{t('skill.branch')}</label>
+            <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('skill.branch')}</label>
             <input
               placeholder="main"
               value={branch}
               onChange={(e) => setBranch(e.target.value)}
-              className="w-full h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
             />
           </div>
           {/* 走系统代理克隆（国内网络访问 GitHub 时常用） */}
@@ -292,14 +293,14 @@ export default function SkillsPage() {
               onChange={(e) => setUseProxy(e.target.checked)}
               className="w-3.5 h-3.5 accent-[var(--accent)]"
             />
-            <span className="text-[12px] text-[var(--text-secondary)]">{t('skill.useProxy')}</span>
+            <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">{t('skill.useProxy')}</span>
           </label>
           <div className="flex items-center gap-3">
             {error && <span className="text-xs text-[var(--danger)] break-all flex-1">{error}</span>}
             <button
               onClick={handleImport}
               disabled={!parsed || importing}
-              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[length:var(--app-text-md)] font-medium hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {importing ? t('skill.importing') : t('skill.import')}
             </button>
@@ -311,8 +312,8 @@ export default function SkillsPage() {
       <div className="modern-card rounded-2xl p-4 mb-6">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <div className="text-[11px] font-medium text-[var(--text-muted)]">{t('skill.builtinTitle')}</div>
-            <p className="text-[10px] text-[var(--text-muted)] mt-0.5 mb-3">{t('skill.builtinHint')}</p>
+            <div className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)]">{t('skill.builtinTitle')}</div>
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-0.5 mb-3">{t('skill.builtinHint')}</p>
           </div>
           {/* 内置技能安装同样支持走系统代理（国内网络访问 GitHub 时常用） */}
           <label className="flex items-center gap-1.5 cursor-pointer select-none shrink-0 pt-0.5">
@@ -322,7 +323,7 @@ export default function SkillsPage() {
               onChange={(e) => setUseProxy(e.target.checked)}
               className="w-3.5 h-3.5 accent-[var(--accent)]"
             />
-            <span className="text-[12px] text-[var(--text-secondary)] whitespace-nowrap">{t('skill.useProxy')}</span>
+            <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)] whitespace-nowrap">{t('skill.useProxy')}</span>
           </label>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
@@ -343,35 +344,34 @@ export default function SkillsPage() {
                 title={`${tpl.description}\n${tpl.popularity ? t('skill.popularity', { data: tpl.popularity }) : ''}\n${tpl.badge}\n${t('skill.clickToImport')}`}
               >
                 <span
-                  className={`block text-[12px] font-medium truncate ${
+                  className={`block text-[length:var(--app-text-sm)] font-medium truncate ${
                     installed ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'
                   }`}
                 >
                   {importing ? t('skill.installing') : installed ? `✓ ${t('skill.installed')}` : tpl.name}
                   {rec === 'hot' && !installed && !importing && (
-                    <span className="ml-1 px-1 py-px rounded bg-[#f59e0b]/15 text-[#f59e0b] text-[9px] font-bold align-middle">🔥 {t('skill.hot')}</span>
+                    <span className="ml-1 px-1 py-px rounded bg-[#f59e0b]/15 text-[#f59e0b] text-[length:var(--app-text-micro)] font-bold align-middle">🔥 {t('skill.hot')}</span>
                   )}
                   {rec === 'popular' && !installed && !importing && (
-                    <span className="ml-1 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[9px] font-bold align-middle">⭐ {t('skill.popular')}</span>
+                    <span className="ml-1 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[length:var(--app-text-micro)] font-bold align-middle">⭐ {t('skill.popular')}</span>
                   )}
                 </span>
-                <span className="block text-[11px] text-[var(--text-secondary)] mt-0.5 leading-snug">{tpl.description}</span>
-                <span className="block text-[10px] text-[var(--text-muted)] mt-1 font-mono truncate">{tpl.badge}</span>
+                <span className="block text-[length:var(--app-text-xs)] text-[var(--text-secondary)] mt-0.5 leading-snug">{tpl.description}</span>
+                <span className="block text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-1 font-mono truncate">{tpl.badge}</span>
               </button>
             )
           })}
         </div>
-        <p className="text-[10px] text-[var(--text-muted)] mt-2">{t('skill.recommendedTip')}</p>
+        <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-2">{t('skill.recommendedTip')}</p>
       </div>
 
       <div className="space-y-3">
         {visibleSkills.length === 0 && (
-          <div className="modern-card rounded-lg p-8 text-center">
-            <p className="text-[var(--text-secondary)] text-sm">{t('skill.empty')}</p>
-            <p className="text-xs text-[var(--text-secondary)] mt-2">
-              {t('skill.importTitle')}：{t('skill.importHint')}
-            </p>
-          </div>
+          <EmptyState
+            icon="skill"
+            title={t('skill.empty')}
+            description={`${t('skill.importTitle')}：${t('skill.importHint')}`}
+          />
         )}
         {visibleSkills.map((s) => (
           <div key={s.id} className="modern-card rounded-lg p-4 flex items-center justify-between">
@@ -381,7 +381,7 @@ export default function SkillsPage() {
                 <span className={`text-xs px-2 py-0.5 rounded ${s.enabled ? 'bg-[var(--success)] text-white' : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'}`}>
                   {s.enabled ? t('skill.enabled') : t('skill.disabled')}
                 </span>
-                <span className="text-[10px] px-2 py-0.5 rounded bg-[var(--bg-card)] text-[var(--text-secondary)] font-mono">
+                <span className="text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded bg-[var(--bg-card)] text-[var(--text-secondary)] font-mono">
                   v{s.skill_version} · {s.compatibility_status}
                 </span>
               </div>
@@ -392,7 +392,7 @@ export default function SkillsPage() {
                 </p>
               )}
               {governance[s.id] && (
-                <p className={`text-[10px] mt-1 ${governance[s.id].verification_state === 'verified' ? 'text-[var(--success)]' : governance[s.id].verification_state === 'drifted' || governance[s.id].verification_state === 'invalid' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
+                <p className={`text-[length:var(--app-text-2xs)] mt-1 ${governance[s.id].verification_state === 'verified' ? 'text-[var(--success)]' : governance[s.id].verification_state === 'drifted' || governance[s.id].verification_state === 'invalid' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
                   扩展治理：{governance[s.id].verification_state === 'verified' ? 'Ed25519 签名有效（发布者身份未钉住）' : governance[s.id].verification_state === 'unsigned' ? '未签名' : '已隔离'}
                   {' · '}{governance[s.id].calls_per_minute}/分钟 · 连续失败 {governance[s.id].consecutive_failures}/{governance[s.id].failure_threshold}
                 </p>
@@ -487,7 +487,7 @@ function SkillUsageView({
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] text-[var(--text-muted)]">
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
           {scope === 'project' ? t('skill.usageProjectHint') : t('skill.usageGlobalHint')}
         </p>
         <button
@@ -503,23 +503,23 @@ function SkillUsageView({
       {/* 汇总卡片 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         <div className="modern-card rounded-2xl p-4">
-          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.installedCount')}</div>
+          <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('skillStats.installedCount')}</div>
           <div className="text-2xl font-bold mt-1 tnum">{skills.length}</div>
         </div>
         <div className="modern-card rounded-2xl p-4">
-          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.totalCalls')}</div>
+          <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('skillStats.totalCalls')}</div>
           <div className="text-2xl font-bold mt-1 tnum">{summary.totalCalls}</div>
         </div>
         <div className="modern-card rounded-2xl p-4">
-          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.usedCount')}</div>
+          <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('skillStats.usedCount')}</div>
           <div className="text-2xl font-bold mt-1 tnum">{summary.usedCount}</div>
         </div>
         <div className="modern-card rounded-2xl p-4">
-          <div className="text-[11px] text-[var(--text-muted)]">{t('skillStats.mostUsed')}</div>
+          <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('skillStats.mostUsed')}</div>
           {summary.top ? (
             <>
               <div className="text-lg font-semibold mt-1 truncate">{summary.top.skill_name}</div>
-              <div className="text-[11px] text-[var(--accent)] mt-0.5 tnum">
+              <div className="text-[length:var(--app-text-xs)] text-[var(--accent)] mt-0.5 tnum">
                 {t('skillStats.callsUnit', { n: summary.top.call_count })}
               </div>
             </>
@@ -531,14 +531,16 @@ function SkillUsageView({
 
       {/* 技能调用排行 */}
       <div className="modern-card rounded-2xl p-4">
-        <div className="text-[13px] font-semibold mb-3">{t('skillStats.ranking')}</div>
+        <div className="text-[length:var(--app-text-md)] font-semibold mb-3">{t('skillStats.ranking')}</div>
         {ranking.length === 0 ? (
-          <p className="text-xs text-[var(--text-muted)] py-6 text-center">{t('skill.empty')}</p>
+          // 此前这里用的是 skill.empty（「尚未安装 Skill」）——与上方「技能调用排行」
+          // 的语境不符：排行为空不代表没装 Skill。改用 skillStats.noEvents。
+          <EmptyState compact icon="tune" title={t('skillStats.noEvents')} />
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-[12.5px]">
+            <table className="w-full text-[length:var(--app-text-sm)]">
               <thead>
-                <tr className="text-left text-[11px] text-[var(--text-muted)] border-b border-[var(--border)]">
+                <tr className="text-left text-[length:var(--app-text-xs)] text-[var(--text-muted)] border-b border-[var(--border)]">
                   <th className="py-2 pr-3 font-medium">{t('skillStats.colSkill')}</th>
                   <th className="py-2 pr-3 font-medium">{t('skillStats.colScope')}</th>
                   <th className="py-2 pr-3 font-medium">{t('skillStats.colStatus')}</th>
@@ -552,7 +554,7 @@ function SkillUsageView({
                     <td className="py-2 pr-3">
                       <span className="font-medium">{skill?.name ?? stat!.skill_name}</span>
                       {!skill && (
-                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[10px] text-[var(--text-muted)]">
+                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-[var(--bg-card)] text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                           {t('skillStats.removed')}
                         </span>
                       )}
@@ -562,7 +564,7 @@ function SkillUsageView({
                     </td>
                     <td className="py-2 pr-3">
                       {skill ? (
-                        <span className={`px-2 py-0.5 rounded text-[11px] ${skill.enabled ? 'bg-[var(--success)]/15 text-[var(--success)]' : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'}`}>
+                        <span className={`px-2 py-0.5 rounded text-[length:var(--app-text-xs)] ${skill.enabled ? 'bg-[var(--success)]/15 text-[var(--success)]' : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'}`}>
                           {skill.enabled ? t('skill.enabled') : t('skill.disabled')}
                         </span>
                       ) : (
@@ -583,15 +585,15 @@ function SkillUsageView({
 
       {/* 最近调用时间线 */}
       <div className="modern-card rounded-2xl p-4">
-        <div className="text-[13px] font-semibold mb-3">{t('skillStats.recentCalls')}</div>
+        <div className="text-[length:var(--app-text-md)] font-semibold mb-3">{t('skillStats.recentCalls')}</div>
         {events.length === 0 ? (
-          <p className="text-xs text-[var(--text-muted)] py-6 text-center">{t('skillStats.noEvents')}</p>
+          <EmptyState compact icon="history" title={t('skillStats.noEvents')} />
         ) : (
           <ul className="space-y-2">
             {events.map((e) => (
-              <li key={e.id} className="flex items-center gap-3 text-[12.5px] py-1.5 border-b border-[var(--border)] last:border-b-0">
-                <span className="shrink-0 w-24 text-[11px] text-[var(--text-muted)] tnum">{fmtTime(e.created_at)}</span>
-                <span className="px-2 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium shrink-0">
+              <li key={e.id} className="flex items-center gap-3 text-[length:var(--app-text-sm)] py-1.5 border-b border-[var(--border)] last:border-b-0">
+                <span className="shrink-0 w-24 text-[length:var(--app-text-xs)] text-[var(--text-muted)] tnum">{fmtTime(e.created_at)}</span>
+                <span className="px-2 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[length:var(--app-text-xs)] font-medium shrink-0">
                   {e.skill_name}
                 </span>
                 <span className="truncate text-[var(--text-secondary)]">{e.conversation_title || '—'}</span>

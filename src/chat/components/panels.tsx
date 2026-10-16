@@ -27,11 +27,11 @@ export function OverviewRow({
   const color = tone === 'ok' ? 'text-[var(--success)]' : tone === 'warn' ? 'text-[var(--warning)]' : 'text-[var(--text-primary)]'
   return (
     <div className="flex items-start justify-between gap-3">
-      <span className="flex items-center gap-1.5 text-[var(--text-secondary)] text-[11px] shrink-0 pt-px">
+      <span className="flex items-center gap-1.5 text-[var(--text-secondary)] text-[length:var(--app-text-xs)] shrink-0 pt-px">
         <Icon name={icon} size={13} className="opacity-50" />
         {label}
       </span>
-      <span className={`text-right text-[11px] break-all ${mono ? 'font-mono' : ''} ${color}`}>{value}</span>
+      <span className={`text-right text-[length:var(--app-text-xs)] break-all ${mono ? 'font-mono' : ''} ${color}`}>{value}</span>
     </div>
   )
 }
@@ -82,11 +82,11 @@ export function OverviewGitSummary({
     <div className="rounded-xl modern-card p-3">
       <div className="flex items-center gap-1.5">
         <Icon name="git-branch" size={12} className="text-[var(--text-secondary)]" />
-        <span className="text-[12px] font-medium">{t('home.gitChanges')}</span>
+        <span className="text-[length:var(--app-text-sm)] font-medium">{t('home.gitChanges')}</span>
         <button
           type="button"
           onClick={onOpenGit}
-          className="ml-auto text-[10.5px] px-2 py-0.5 rounded-md text-[var(--accent)] bg-[var(--accent-soft)] hover:bg-[var(--accent)]/15 transition-colors"
+          className="ml-auto text-[length:var(--app-text-xs)] px-2 py-0.5 rounded-md text-[var(--accent)] bg-[var(--accent-soft)] hover:bg-[var(--accent)]/15 transition-colors"
         >
           {t('home.viewChanges')}
         </button>
@@ -95,7 +95,7 @@ export function OverviewGitSummary({
         info.is_repo ? (
           <div className="mt-2 space-y-1.5">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] text-[var(--text-secondary)]">{t('home.gitBranch')}</span>
+              <span className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)]">{t('home.gitBranch')}</span>
               <BranchSelector current={info.current} branches={branches ?? []} onSwitch={onSwitchBranch} />
             </div>
             <OverviewRow
@@ -107,13 +107,13 @@ export function OverviewGitSummary({
           </div>
         ) : (
           <div className="mt-2 space-y-1.5">
-            <div className="text-[11px] text-[var(--text-muted)]">{t('home.gitNotRepo')}</div>
-            {initErr && <div className="text-[10.5px] text-[var(--danger)] break-all">{initErr}</div>}
+            <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.gitNotRepo')}</div>
+            {initErr && <div className="text-[length:var(--app-text-xs)] text-[var(--danger)] break-all">{initErr}</div>}
             <button
               type="button"
               onClick={() => void initRepo()}
               disabled={initBusy}
-              className="inline-flex items-center gap-1.5 h-6 px-2.5 rounded-md text-[10.5px] font-medium bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)]/15 transition-colors disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 h-6 px-2.5 rounded-md text-[length:var(--app-text-xs)] font-medium bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)]/15 transition-colors disabled:opacity-50"
             >
               {initBusy && <span className="w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin" />}
               {initBusy ? '…' : t('home.gitInitRepo')}
@@ -121,7 +121,7 @@ export function OverviewGitSummary({
           </div>
         )
       ) : (
-        <div className="mt-2 text-[11px] text-[var(--text-muted)] animate-pulse">{t('home.loading')}</div>
+        <div className="mt-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] animate-pulse">{t('home.loading')}</div>
       )}
     </div>
   )
@@ -200,10 +200,10 @@ export function MemoriesPanel({
     <div className="p-3 space-y-2.5">
       {/* 说明 + 新增 */}
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.memoriesTip')}</p>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed">{t('home.memoriesTip')}</p>
         <button
           onClick={startAdd}
-          className="shrink-0 h-7 px-2.5 rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] text-[11px] font-medium flex items-center gap-1 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform]"
+          className="shrink-0 h-7 px-2.5 rounded-lg bg-[var(--accent)]/10 text-[var(--accent)] text-[length:var(--app-text-xs)] font-medium flex items-center gap-1 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform]"
         >
           <Icon name="plus" size={12} />
           {t('home.memoryAdd')}
@@ -217,12 +217,12 @@ export function MemoriesPanel({
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder={t('home.memoryTitlePlaceholder')}
-            className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+            className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)] transition-colors"
           />
           <select
             value={category}
             onChange={(e) => setCategory(e.target.value)}
-            className="w-full h-8 px-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
+            className="w-full h-8 px-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
           >
             {categories.map((c) => (
               <option key={c} value={c}>
@@ -235,29 +235,29 @@ export function MemoriesPanel({
             onChange={(e) => setContent(e.target.value)}
             placeholder={t('home.memoryContentPlaceholder')}
             rows={4}
-            className="w-full px-2.5 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors resize-y"
+            className="w-full px-2.5 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)] transition-colors resize-y"
           />
           <input
             value={invalidationCondition}
             onChange={(e) => setInvalidationCondition(e.target.value)}
             placeholder={t('home.memoryInvalidationPlaceholder')}
-            className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+            className="w-full h-8 px-2.5 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)] transition-colors"
           />
-          <label className="flex items-center gap-2 text-[11px] text-[var(--text-secondary)]">
+          <label className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)]">
             <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} />
             {t('home.memoryPinned')}
           </label>
           <div className="flex items-center justify-end gap-2">
             <button
               onClick={() => setShowForm(false)}
-              className="h-7 px-3 rounded-lg text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="h-7 px-3 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               {t('common.cancel')}
             </button>
             <button
               onClick={submit}
               disabled={busy || !title.trim() || !content.trim()}
-              className="h-7 px-3 rounded-lg btn-primary text-[11px] font-medium active:scale-95 disabled:opacity-40 transition-[color,background-color,border-color,opacity,transform]"
+              className="h-7 px-3 rounded-lg btn-primary text-[length:var(--app-text-xs)] font-medium active:scale-95 disabled:opacity-40 transition-[color,background-color,border-color,opacity,transform]"
             >
               {t('common.save')}
             </button>
@@ -268,7 +268,7 @@ export function MemoriesPanel({
       {/* 记忆列表 */}
       {memories.length === 0 ? (
         <div className="rounded-xl border border-dashed border-[var(--border)] p-5 text-center">
-          <p className="text-[12px] text-[var(--text-muted)]">{t('home.memoriesEmpty')}</p>
+          <p className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.memoriesEmpty')}</p>
         </div>
       ) : (
         memories.map((m) => (
@@ -277,18 +277,18 @@ export function MemoriesPanel({
             className={`rounded-xl modern-card p-3 transition-opacity ${m.enabled && !m.invalidated_at ? '' : 'opacity-55'}`}
           >
             <div className="flex items-center gap-2">
-              <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)]">
+              <span className="shrink-0 text-[length:var(--app-text-micro)] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)]">
                 {t(`home.memoryCat.${m.category}`)}
               </span>
               {m.title.startsWith('构建错误自动修复记录') && (
-                <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500">
+                <span className="shrink-0 text-[length:var(--app-text-micro)] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500">
                   {t('home.memoryAuto')}
                 </span>
               )}
-              <span className="flex-1 min-w-0 text-[12px] font-medium truncate">{m.title}</span>
+              <span className="flex-1 min-w-0 text-[length:var(--app-text-sm)] font-medium truncate">{m.title}</span>
               {m.pinned && <Icon name="pin" size={11} />}
               {m.invalidated_at && (
-                <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500">
+                <span className="shrink-0 text-[length:var(--app-text-micro)] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500">
                   {t('home.memoryInvalidated')}
                 </span>
               )}
@@ -322,16 +322,16 @@ export function MemoriesPanel({
                 <Icon name="delete" size={12} white={confirmDeleteId === m.id} />
               </button>
             </div>
-            <p className="mt-1.5 text-[11px] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap break-all">
+            <p className="mt-1.5 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap break-all">
               {m.content}
             </p>
             <div className="mt-1.5 flex items-center justify-between">
-              <span className="text-[9px] text-[var(--text-muted)]" title={m.invalidated_at ? m.invalidation_reason ?? '' : `${m.source_kind} · v${m.version} · ${Math.round(m.confidence * 100)}%`}>
+              <span className="text-[length:var(--app-text-micro)] text-[var(--text-muted)]" title={m.invalidated_at ? m.invalidation_reason ?? '' : `${m.source_kind} · v${m.version} · ${Math.round(m.confidence * 100)}%`}>
                 {m.invalidated_at
                   ? `${t('home.memoryInvalidatedReason')}: ${m.invalidation_reason ?? '-'}`
                   : `${new Date(m.updated_at * 1000).toLocaleDateString()} · ${m.source_kind} · v${m.version}`}
               </span>
-              <button onClick={onRefresh} className="text-[9px] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors">
+              <button onClick={onRefresh} className="text-[length:var(--app-text-micro)] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors">
                 {t('home.refresh')}
               </button>
             </div>
@@ -401,7 +401,7 @@ export function ToolStatsPanel({
   return (
     <div className="p-3 space-y-2.5">
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.toolStatsTip')}</p>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed">{t('home.toolStatsTip')}</p>
         <button
           onClick={onRefresh}
           className="shrink-0 p-1.5 rounded-lg text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -416,15 +416,15 @@ export function ToolStatsPanel({
       <div className="grid grid-cols-3 gap-2">
         <div className="rounded-xl modern-card p-2.5 text-center">
           <div className="text-lg font-semibold tabular-nums">{totalCalls}</div>
-          <div className="text-[10px] text-[var(--text-muted)]">{t('home.statsTotalCalls')}</div>
+          <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('home.statsTotalCalls')}</div>
         </div>
         <div className="rounded-xl modern-card p-2.5 text-center">
           <div className="text-lg font-semibold tabular-nums text-[var(--success)]">{totalCalls - totalFail}</div>
-          <div className="text-[10px] text-[var(--text-muted)]">{t('home.statsSuccess')}</div>
+          <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('home.statsSuccess')}</div>
         </div>
         <div className="rounded-xl modern-card p-2.5 text-center">
           <div className="text-lg font-semibold tabular-nums text-[var(--danger)]">{totalFail}</div>
-          <div className="text-[10px] text-[var(--text-muted)]">{t('home.statsFailed')}</div>
+          <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('home.statsFailed')}</div>
         </div>
       </div>
 
@@ -432,8 +432,8 @@ export function ToolStatsPanel({
       {tokenStats.length > 0 && (
         <div className="rounded-xl modern-card p-3">
           <div className="flex items-center justify-between gap-2">
-            <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">{t('home.statsTokenTip')}</p>
-            <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] leading-relaxed">{t('home.statsTokenTip')}</p>
+            <span className="shrink-0 text-[length:var(--app-text-2xs)] tabular-nums text-[var(--text-muted)]">
               {t('home.statsTokenRequests', { count: tokenStats.length })}
             </span>
           </div>
@@ -443,14 +443,14 @@ export function ToolStatsPanel({
               const max = tokenStats[0] ? tokenStats[0].input_tokens + tokenStats[0].output_tokens : 1
               return (
                 <div key={ts.tool_name} className="flex items-center gap-2">
-                  <span className="w-28 shrink-0 text-[11px] font-mono truncate" title={ts.tool_name}>{ts.tool_name}</span>
+                  <span className="w-28 shrink-0 text-[length:var(--app-text-xs)] font-mono truncate" title={ts.tool_name}>{ts.tool_name}</span>
                   <div className="flex-1 h-1 rounded-full bg-[var(--bg-primary)] overflow-hidden">
                     <div
                       className="h-full rounded-full bg-gradient-to-r from-[var(--accent)] to-[#8b5cf6]"
                       style={{ width: `${max > 0 ? Math.max(4, Math.round((total / max) * 100)) : 0}%` }}
                     />
                   </div>
-                  <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">
+                  <span className="shrink-0 text-[length:var(--app-text-2xs)] tabular-nums text-[var(--text-muted)]">
                     {t('home.statsTokenIn', { tokens: fmtTokens(ts.input_tokens) })} · {t('home.statsTokenOut', { tokens: fmtTokens(ts.output_tokens) })}
                     {ts.total_cost_cny > 0.001 && <span> · {t('home.statsTokenCost', { cost: ts.total_cost_cny.toFixed(2) })}</span>}
                   </span>
@@ -464,7 +464,7 @@ export function ToolStatsPanel({
       {/* [75] 按任务分组折叠的工具明细 */}
       {stats.length === 0 ? (
         <div className="rounded-xl border border-dashed border-[var(--border)] p-5 text-center">
-          <p className="text-[12px] text-[var(--text-muted)]">{t('home.statsEmpty')}</p>
+          <p className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.statsEmpty')}</p>
         </div>
       ) : (
         <div className="space-y-2">
@@ -478,12 +478,12 @@ export function ToolStatsPanel({
                   className="w-full flex items-center justify-between gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)] transition-colors"
                   title={collapsed ? t('home.statsGroupExpand') : t('home.statsGroupCollapse')}
                 >
-                  <span className="flex items-center gap-1.5 text-[11px] font-medium">
+                  <span className="flex items-center gap-1.5 text-[length:var(--app-text-xs)] font-medium">
                     <Icon name="chevron-right" size={12} className={`transition-transform ${collapsed ? '' : 'rotate-90'}`} />
                     {t(TASK_GROUP_LABEL_KEY[group] ?? 'home.statsGroupOther')}
-                    <span className="text-[10px] tabular-nums text-[var(--text-muted)]">{list.length} 个 · {groupCalls}×</span>
+                    <span className="text-[length:var(--app-text-2xs)] tabular-nums text-[var(--text-muted)]">{list.length} 个 · {groupCalls}×</span>
                   </span>
-                  {collapsed && <span className="text-[10px] text-[var(--text-muted)]">{t('home.statsGroupExpand')}</span>}
+                  {collapsed && <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('home.statsGroupExpand')}</span>}
                 </button>
                 {!collapsed && (
                   <div className="px-3 pb-3 space-y-2">
@@ -492,8 +492,8 @@ export function ToolStatsPanel({
                       return (
                         <div key={s.tool_name} className="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-2.5">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-[12px] font-medium font-mono truncate">{s.tool_name}</span>
-                            <span className="shrink-0 text-[11px] tabular-nums">{s.call_count}×</span>
+                            <span className="text-[length:var(--app-text-sm)] font-medium font-mono truncate">{s.tool_name}</span>
+                            <span className="shrink-0 text-[length:var(--app-text-xs)] tabular-nums">{s.call_count}×</span>
                           </div>
                           <div className="mt-2 h-1.5 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                             <div
@@ -501,7 +501,7 @@ export function ToolStatsPanel({
                               style={{ width: `${rate}%` }}
                             />
                           </div>
-                          <div className="mt-1.5 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
+                          <div className="mt-1.5 flex items-center justify-between text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                             <span>
                               {t('home.statsRate', { rate })} · {t('home.statsAvgMs', { ms: s.avg_duration_ms ?? '—' })}
                             </span>
@@ -603,7 +603,7 @@ export function PreviewPanel({
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center gap-1.5 p-2 border-b border-[var(--border)] shrink-0">
-        <span className="text-[12px] font-medium text-[var(--text-primary)]">
+        <span className="text-[length:var(--app-text-sm)] font-medium text-[var(--text-primary)]">
           {t('home.previewDeviceTitle')}
         </span>
         <span className="flex-1" />
@@ -611,7 +611,7 @@ export function PreviewPanel({
           <button
             onClick={() => void stopDevice()}
             disabled={busy}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 shrink-0"
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 shrink-0"
           >
             {t('home.previewDeviceStop')}
           </button>
@@ -620,7 +620,7 @@ export function PreviewPanel({
             onClick={() => void startDevice()}
             disabled={busy || !project}
             title={project ? undefined : t('home.previewDeviceEmpty')}
-            className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
+            className="h-8 px-3 rounded-lg btn-primary text-[length:var(--app-text-sm)] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
           >
             {busy ? t('home.previewDeviceStarting') : t('home.previewDeviceStart')}
           </button>
@@ -636,16 +636,16 @@ export function PreviewPanel({
         ) : (
           <div className="flex flex-col items-center justify-center gap-2 text-center px-6">
             <Icon name="devices" size={28} className="opacity-40" />
-            <span className="text-[12px] text-[var(--text-muted)]">
+            <span className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">
               {busy ? t('home.previewDeviceStarting') : t('home.previewDeviceEmpty')}
             </span>
             {error && (
-              <span className="text-[11px] text-[var(--danger)] break-all">
+              <span className="text-[length:var(--app-text-xs)] text-[var(--danger)] break-all">
                 {t('home.previewDeviceFailed')}：{error}
               </span>
             )}
             {error && (
-              <span className="text-[11px] text-[var(--text-muted)]/70">
+              <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]/70">
                 {t('home.previewDeviceFallback')}
               </span>
             )}
@@ -659,13 +659,13 @@ export function PreviewPanel({
           onKeyDown={(e) => e.key === 'Enter' && onOpen()}
           placeholder={t('home.previewPlaceholder')}
           spellCheck={false}
-          className="flex-1 min-w-0 h-8 px-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] text-[12px] outline-none focus:border-[var(--accent)] transition-colors"
+          className="flex-1 min-w-0 h-8 px-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)] transition-colors"
         />
         <button
           onClick={onOpen}
           disabled={!url.trim()}
           title={t('home.open')}
-          className="h-8 px-3 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
+          className="h-8 px-3 rounded-lg btn-primary text-[length:var(--app-text-sm)] font-medium transition-[color,background-color,border-color,opacity] disabled:opacity-40 shrink-0"
         >
           {t('home.open')}
         </button>
@@ -691,10 +691,10 @@ export function PreviewPanel({
         ) : (
           <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
             <Icon name="devices" size={24} className="opacity-40" />
-            <span className="text-[12px] text-[var(--text-muted)]">{t('home.previewEmpty')}</span>
-            <span className="text-[11px] text-[var(--text-muted)]/70">{t('home.previewBlocked')}</span>
+            <span className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.previewEmpty')}</span>
+            <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]/70">{t('home.previewBlocked')}</span>
             {isLoopbackUrl(url) && (
-              <span className="text-[11px] text-[var(--text-muted)]/70">{t('home.previewLocalHint')}</span>
+              <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]/70">{t('home.previewLocalHint')}</span>
             )}
           </div>
         )}
@@ -775,7 +775,7 @@ export function TerminalPanel({
         <div className="flex items-center gap-1">
           <button
             onClick={() => setTab('tools')}
-            className={`px-2 h-6 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'tools' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'tab-inactive'}`}
+            className={`px-2 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors flex items-center gap-1.5 ${tab === 'tools' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'tab-inactive'}`}
           >
             <Icon name="terminal" size={12} />
             {t('home.terminalLogs')}
@@ -788,7 +788,7 @@ export function TerminalPanel({
           </button>
           <button
             onClick={() => setTab('build')}
-            className={`px-2 h-6 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'build' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'tab-inactive'}`}
+            className={`px-2 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors flex items-center gap-1.5 ${tab === 'build' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'tab-inactive'}`}
           >
             <Icon name="package" size={12} />
             {t('home.buildLog')}
@@ -805,7 +805,7 @@ export function TerminalPanel({
               onChange={(e) => setFilter(e.target.value)}
               placeholder={t('home.terminalFilter')}
               spellCheck={false}
-              className="w-full h-6 pl-6 pr-6 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-[10.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)] transition-colors"
+              className="w-full h-6 pl-6 pr-6 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-[length:var(--app-text-xs)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)] transition-colors"
             />
             {filter && (
               <button
@@ -823,17 +823,17 @@ export function TerminalPanel({
           onClick={() => (tab === 'tools' ? onClear() : onClearBuild())}
           disabled={tab === 'tools' ? filteredEntries.length === 0 : filteredBuild.length === 0}
           title={t('home.terminalClear')}
-          className="px-2 h-6 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-30"
+          className="px-2 h-6 rounded-md text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-30"
         >
           {t('home.terminalClear')}
         </button>
       </div>
       {tab === 'tools' ? (
-        <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[11.5px] leading-relaxed">
+        <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[length:var(--app-text-xs)] leading-relaxed">
           {filteredEntries.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
               <Icon name="terminal" size={26} className="opacity-30" />
-              <span className="text-[11.5px] text-[#8b949e]">
+              <span className="text-[length:var(--app-text-xs)] text-[#8b949e]">
                 {kw ? t('home.terminalFilterEmpty') : t('home.terminalEmpty')}
               </span>
             </div>
@@ -848,7 +848,7 @@ export function TerminalPanel({
                       {e.args && <span className="text-[#8b949e] ml-1">{e.args.slice(0, 200)}{e.args.length > 200 ? '…' : ''}</span>}
                     </span>
                     <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot[e.status]}`} />
-                    <span className={`text-[10.5px] shrink-0 ${statusColor[e.status]}`}>
+                    <span className={`text-[length:var(--app-text-xs)] shrink-0 ${statusColor[e.status]}`}>
                       {e.status === 'running'
                         ? t('home.taskElapsed', { time: fmtElapsed(Math.max(0, Math.floor((Date.now() - e.startedAt) / 1000))) })
                         : fmtElapsed(Math.max(0, Math.floor((e.durationMs ?? 0) / 1000)))}
@@ -868,11 +868,11 @@ export function TerminalPanel({
           <div ref={bottomRef} />
         </div>
       ) : (
-        <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[11.5px] leading-relaxed">
+        <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[length:var(--app-text-xs)] leading-relaxed">
           {filteredBuild.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
               <Icon name="package" size={26} className="opacity-30" />
-              <span className="text-[11.5px] text-[#8b949e]">
+              <span className="text-[length:var(--app-text-xs)] text-[#8b949e]">
                 {kw ? t('home.terminalFilterEmpty') : t('home.buildLogEmpty')}
               </span>
             </div>
@@ -1018,23 +1018,23 @@ export function ShellPanel({ projectId, projectPath }: { projectId: string; proj
       <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-[var(--border)] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <Icon name="terminal" size={12} className="text-[var(--accent)] shrink-0" />
-          <span className="text-[10.5px] text-[var(--text-muted)] shrink-0">{t('home.terminal')}</span>
-          <span className="text-[10px] font-mono text-[var(--text-secondary)] truncate">{cwd}</span>
+          <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] shrink-0">{t('home.terminal')}</span>
+          <span className="text-[length:var(--app-text-2xs)] font-mono text-[var(--text-secondary)] truncate">{cwd}</span>
         </div>
         {busy && (
           <button
             onClick={() => void stop()}
-            className="px-2 h-6 rounded-md text-[11px] border border-[var(--border)] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors flex items-center gap-1 shrink-0"
+            className="px-2 h-6 rounded-md text-[length:var(--app-text-xs)] border border-[var(--border)] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors flex items-center gap-1 shrink-0"
           >
             <Icon name="close" size={10} /> {t('home.shellStop')}
           </button>
         )}
       </div>
-      <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[11.5px] leading-relaxed">
+      <div className="flex-1 min-h-0 overflow-y-auto bg-[#0d1117] p-2.5 font-mono text-[length:var(--app-text-xs)] leading-relaxed">
         {lines.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-2 text-center px-6">
             <Icon name="terminal" size={26} className="opacity-30" />
-            <span className="text-[11.5px] text-[#8b949e]">{t('home.shellHint')}</span>
+            <span className="text-[length:var(--app-text-xs)] text-[#8b949e]">{t('home.shellHint')}</span>
           </div>
         ) : (
           <div className="space-y-0.5">
@@ -1060,7 +1060,7 @@ export function ShellPanel({ projectId, projectPath }: { projectId: string; proj
       </div>
       {/* 输入区固定深色底：与输出区一致，明暗主题下文字均为亮色可读 */}
       <div className="flex items-end gap-2 px-2.5 py-2 border-t border-[var(--border)] bg-[#0d1117] shrink-0">
-        <span className="text-[#3fb950] font-mono text-[12px] select-none leading-6">❯</span>
+        <span className="text-[#3fb950] font-mono text-[length:var(--app-text-sm)] select-none leading-6">❯</span>
         <textarea
           ref={inputRef}
           value={input}
@@ -1071,7 +1071,7 @@ export function ShellPanel({ projectId, projectPath }: { projectId: string; proj
           spellCheck={false}
           rows={1}
           style={{ color: '#e6edf3', caretColor: '#e6edf3', WebkitTextFillColor: '#e6edf3' }}
-          className="flex-1 min-w-0 bg-transparent font-mono text-[11.5px] placeholder:text-[#484f58] outline-none resize-none leading-6 max-h-24 overflow-y-auto py-0.5"
+          className="flex-1 min-w-0 bg-transparent font-mono text-[length:var(--app-text-xs)] placeholder:text-[#484f58] outline-none resize-none leading-6 max-h-24 overflow-y-auto py-0.5"
         />
       </div>
     </div>

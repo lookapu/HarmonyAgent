@@ -35,6 +35,8 @@ pub mod lan_server;
 pub mod language;
 pub mod llm_replay;
 pub mod maintenance;
+pub mod licensing;
+pub mod diagnostic_bundle;
 pub mod mcp_client;
 pub mod mcp_manager;
 pub mod mcp_policy;

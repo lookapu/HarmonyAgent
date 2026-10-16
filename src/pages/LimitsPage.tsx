@@ -150,7 +150,7 @@ export default function LimitsPage() {
           <button
             onClick={handleReset}
             disabled={busy}
-            className="px-4 py-2 border border-[var(--border)] text-[var(--text-primary)] rounded-lg text-sm hover:bg-[var(--bg-muted)] transition-colors disabled:opacity-50"
+            className="px-4 py-2 border border-[var(--border)] text-[var(--text-primary)] rounded-lg text-sm hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-50"
           >
             {t('limits.reset')}
           </button>
@@ -174,7 +174,7 @@ export default function LimitsPage() {
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium text-[var(--text-primary)]">{t(f.labelKey)}</span>
                       {dirty && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)]">
+                        <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)]">
                           {t('limits.modified')}
                         </span>
                       )}
@@ -188,7 +188,7 @@ export default function LimitsPage() {
                       className={`px-2 py-1 rounded-md text-xs border transition-colors ${
                         unlimited
                           ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]'
-                          : 'border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-muted)]'
+                          : 'border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
                       }`}
                     >
                       {t('limits.unlimited')}

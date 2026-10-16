@@ -5,7 +5,12 @@
 中英文 README / ARCHITECTURE / TOOL_ENHANCEMENTS / TOOLCHAIN_ACCEPTANCE /
 TOOL_RESULT_V2 / CHANGELOG / VERSION_COMPATIBILITY 中的对应数字；
 校验 ROADMAP 与 docs 内相对链接目标存在、ROADMAP 反引号路径存在；
-校验 quality.yml / release.yml 引用的 Rust 测试、集成测试与脚本存在。
+校验 quality.yml / release.yml 引用的 Rust 测试、集成测试与脚本存在；
+校验 `##`/`###` 章节**必须有正文**（标题下面只剩标题 = 空章节），
+其中代码围栏内的 `#` 不算标题、`####` 子标题不算「无正文」。
+
+CHANGELOG 的特殊约定：只在**最新版本段**（第一个 `## ` 到下一个 `## ` 之前）
+匹配当前规模声明。历史版本段里的旧数字在当时是对的，改它就是篡改历史。
 
 用法：
   python3 scripts/check-docs.py                    # 校验真实仓库
@@ -52,7 +57,15 @@ def count_migrations(repo: Path) -> tuple[int, int]:
 
 
 def count_pages(repo: Path) -> int:
-    return len(list((repo / "src/pages").glob("*.tsx")))
+    """页面数。**排除 *.test.tsx**——同目录下的页面测试也是 .tsx。
+
+    排除规则与 scripts/check-ui-states.py 的页面枚举保持一致：两处若不同步，
+    加一个页面测试就会同时触发「文档页数对不上」与「页面未声明 @ui-states」，
+    同一个改动两种错法，排查时容易误判成两个独立问题。
+    """
+    return len(
+        [p for p in (repo / "src/pages").glob("*.tsx") if not p.name.endswith(".test.tsx")]
+    )
 
 
 def count_files(repo: Path, rel_dir: str, exclude: tuple[str, ...]) -> int:
@@ -158,6 +171,16 @@ def check_counts(repo: Path) -> list[str]:
             problems.append(f"文档不存在：{doc}")
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        # CHANGELOG 是**按版本分节的历史记录**：v2.1.0 里写的「迁移总数达到 **84**」
+        # 在当时是对的，改成 85 就是篡改历史。所以只在**最新版本段**里找当前规模声明
+        # ——从第一个 `## ` 到**下一个** `## ` 之前（只取一段，不是从第一个到文末，
+        # 否则后面历史段里的旧数字仍会被匹配到，那正是第一版写法的 bug）。
+        # 2026-10-01 加这条：加第 85 个迁移时门禁把 v2.1.0 的历史数字判成漂移。
+        if doc.startswith("CHANGELOG"):
+            head = re.search(r"(?m)^## ", text)
+            if head:
+                nxt = re.search(r"(?m)^## ", text[head.end():])
+                text = text[head.start():head.end() + nxt.start()] if nxt else text[head.start():]
         match = re.search(pattern, text)
         if not match:
             problems.append(f"{label}：{doc} 未找到模式 {pattern!r}")
@@ -244,18 +267,122 @@ def check_ci_interfaces(repo: Path) -> list[str]:
     return problems
 
 
+def check_empty_sections(repo: Path) -> list[str]:
+    """`##`/`###` 章节必须有正文：标题下面只剩标题 = 空章节。
+
+    ## 为什么要有这条（2026-10-08，第二十四批自查时真的撞上）
+
+    `docs/TECH_DEBT.md` 里当时同时存在两个 `### P-6` 标题：旧的写着「等拍板」，
+    新的写着「撤回重开」，而**旧的那个下面什么都没有**。后果不是「多了个字」：
+
+    - 台账顶部声明「产品判断 **6** 条待决」，而文件里实际有 **7** 个 `### P-`
+      标题 ⇒ **声明与事实对不上，且没有任何一处会报红**；
+    - 更要紧的是：扫台账的人在「等拍板」处就停了，**永远读不到下面那句
+      「原拍板已作废，不要按它实现」**——而那半句才是危险所在。
+
+    成因不是粗心，是**新旧并存**：想「给旧条目加个状态标注」时，实际动作是
+    **新加一个标题**。这类改法在「按状态维护」的台账里会反复出现，所以值得判。
+
+    ## 判据边界（三条都实测过，不是推测）
+
+    - **只看 `##`/`###` 及更深，不看 `#`**：H1 后面紧跟 `##` 是正常结构
+      （CHANGELOG 就是「# 标题」+「## Unreleased」），把 H1 判进去全是误报。
+      ⚠️ **如实标注承重方**：变异实测，把 H1 纳进来在**真源语料**上命中 **0 条**
+      （现有文档的 H1 恰好都有正文）——**真正钉住它的是自测合成仓库**里
+      `# other` 这种单标题文件。删掉这行守卫，真源不会立刻变红，但自测会。
+    - **子标题不算正文**：`### X` / `#### 子标题` / 正文 ⇒ `### X` **不算空**。
+      所以判据是「到下一个**同级或更高级**标题为止，有没有非标题的正文」，
+      **不是**「下一行是不是标题」——后者会把上面这种合法结构全判成空。
+      这条**承重于真源**：削弱成「下一行」后真源立刻误报 **63 条**。
+    - **代码围栏内的 `#` 不是标题**：否则文档里贴一段 `## foo` 的 shell 命令
+      就会被当成章节。
+      ✅ **这条在真源上是承重的**，而且是被**本项目自己的记录**逼出来的：
+      把这个缺陷写进文档时，惯用的是 ` ```markdown ` 围栏 + 里面两行 `### P-6`，
+      **那正是这条规则要抓的形状**。实测去掉围栏感知 ⇒ 真源立刻 **4 条误报**
+      （`CHANGELOG.md` / `CHANGELOG.en.md` / `docs/TECH_DEBT.md` /
+      `docs/UI_REFINEMENT_PLAN.md`，各一处，全部是记录本缺陷的示例块）。
+      误报比漏报更致命：门禁一旦只会喊狼，早晚被人关掉。
+    """
+    problems: list[str] = []
+    docs_dir = repo / "docs"
+    targets = sorted(
+        [*(docs_dir.glob("*.md") if docs_dir.exists() else []),
+         *repo.glob("README*.md"), *repo.glob("CHANGELOG*.md")]
+    )
+    for doc in targets:
+        lines = doc.read_text(encoding="utf-8", errors="replace").splitlines()
+        # 先标出「真标题」：跳过代码围栏内的 # 注释
+        headings: list[tuple[int, int, str]] = []
+        heading_idx: set[int] = set()
+        in_fence = False
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            m = re.match(r"^(#{1,6})\s+(.*)$", line)
+            if m:
+                headings.append((i, len(m.group(1)), m.group(2).strip()))
+                heading_idx.add(i)
+        for idx, (start, level, title) in enumerate(headings):
+            if level < 2:
+                continue
+            end = len(lines)
+            for j, lv2, _t in headings[idx + 1:]:
+                if lv2 <= level:
+                    end = j
+                    break
+            has_body = any(
+                ln.strip() and (start + 1 + k) not in heading_idx
+                for k, ln in enumerate(lines[start + 1:end])
+            )
+            if not has_body:
+                problems.append(
+                    f"{doc.name}:{start + 1} 空章节：[{level} 级] {title}（标题下没有任何正文）"
+                )
+    return problems
+
+
 def check_repo(repo: Path) -> list[str]:
     problems = []
     problems += check_counts(repo)
     problems += check_links(repo)
     problems += check_path_refs(repo)
     problems += check_ci_interfaces(repo)
+    problems += check_empty_sections(repo)
     return problems
 
 
 def self_test() -> None:
     """合成仓库：干净全绿；篡改数字、删除链接目标、改名测试均必须被检出。"""
     import tempfile
+
+    # 用例数 = 本函数里的 assert 条数，**扫源码数出来**而不是手写常量。
+    # 手写的数字会随自测增删用例而静默过期，而过期数字比没有数字更糟——
+    # 文档里写着「docs 自测 12 条」、实际 11 条时，没有任何一处会报红。
+    #
+    # 静态计数只在「所有 assert 都在函数体顶层顺序执行」时等于实际执行条数。
+    # 一旦有人把某个 assert 挪进 for/if，静态数就会**少报**，所以下面那条
+    # 护栏断言会让这种改动当场报红，而不是悄悄让计数失真。
+    # （曾试过 sys.settrace 统计实际执行行：它不追溯已开始的当前帧，实测恒为 0。）
+    _src = Path(__file__).read_text(encoding="utf-8").splitlines()
+    _start = self_test.__code__.co_firstlineno
+    _end = next(
+        (i for i in range(_start, len(_src)) if _src[i] and not _src[i][0].isspace()),
+        len(_src),
+    )
+    _assert_lines = [
+        (i + 1, _src[i]) for i in range(_start - 1, _end) if _src[i].lstrip().startswith("assert")
+    ]
+    # 真实用例都在 `with` 块内（缩进 8）；比 8 更深的才是「被挪进循环或分支」。
+    # 本函数自己的那条护栏断言在缩进 4，天然被排除在两边之外。
+    _cases = [n for n, s in _assert_lines if len(s) - len(s.lstrip()) == 8]
+    _nested = [n for n, s in _assert_lines if len(s) - len(s.lstrip()) > 8]
+    assert not _nested, (
+        f"有用例被挪进循环或分支（行 {_nested}），静态计数会少报；"
+        "请把它们提到顶层，或改用可执行计数"
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
@@ -347,6 +474,82 @@ def self_test() -> None:
 
         assert not check_repo(repo), f"干净仓库应全绿：{check_repo(repo)}"
 
+        # ── CHANGELOG 只查最新版本段（2026-10-01 加）─────────────────────────
+        # 放在这里而不是末尾：后面几步会故意把 CI 测试名 / ROADMAP 路径弄脏且**不还原**，
+        # 断言写在它们后面就只能写成「过滤出 CHANGELOG 相关问题」，那会顺带把
+        # 本组用例降级成弱断言。放在干净基线上，整组断言可以用全量强度。
+        changelog_single = read_doc(repo, "CHANGELOG.md")
+        changelog_en_single = read_doc(repo, "CHANGELOG.en.md")
+
+        # 1) 历史段写旧数字、最新段写当前数字 → 必须全绿。
+        #    这就是加第 85 个迁移时 v2.1.0 的「迁移总数达到 **84**」把门禁弄红的场景。
+        write_doc(repo, "CHANGELOG.md",
+            "## v2.3.0\n\n`TOOL_SPECS` 达到 **2**\n数据库迁移总数达到 **1**\n\n"
+            "## v2.1.0\n\n数据库迁移总数达到 **99**\n`TOOL_SPECS` 达到 **77**\n"
+        )
+        write_doc(repo, "CHANGELOG.en.md",
+            "## v2.3.0\n\nmigration count reaches **1**; `TOOL_SPECS` to **2**.\n\n"
+            "## v2.1.0\n\nmigration count reaches **99**; `TOOL_SPECS` to **77**.\n"
+        )
+        assert not check_repo(repo), f"CHANGELOG 历史段的旧数字被误判为漂移：{check_repo(repo)}"
+
+        # 2) 最新版本段本身写错 → 必须检出（切段不能把检查一并切没了）
+        write_doc(repo, "CHANGELOG.md",
+            "## v2.3.0\n\n`TOOL_SPECS` 达到 **2**\n数据库迁移总数达到 **99**\n\n"
+            "## v2.1.0\n\n数据库迁移总数达到 **1**\n"
+        )
+        assert any("迁移数" in p and "CHANGELOG.md" in p for p in check_repo(repo)), \
+            "最新版本段的迁移数漂移未被检出"
+
+        # 3) 只有最新段有声明、更早的段完全没有 → 仍必须报红：
+        #    「最新段没写当前规模」是真缺口，不能因为后面某段碰巧有数字就放行
+        write_doc(repo, "CHANGELOG.md",
+            "## v2.3.0\n\n本次没有改动规模。\n\n## v2.1.0\n\n数据库迁移总数达到 **1**\n"
+        )
+        assert any("未找到模式" in p and "CHANGELOG.md" in p for p in check_repo(repo)), \
+            "最新版本段缺声明时未报红（等于把门禁切没了）"
+
+        write_doc(repo, "CHANGELOG.md", changelog_single)
+        write_doc(repo, "CHANGELOG.en.md", changelog_en_single)
+        assert not check_repo(repo), "CHANGELOG 恢复后应重新全绿"
+
+        # ── 空章节：标题下面只剩标题（2026-10-08 加）─────────────────────────
+        # 用例 1 **照抄真源里真实出现过的写法**（docs/TECH_DEBT.md 的两个 ### P-6）。
+        # 合成用例若与真源写法不同，这条判据就等于只测了假想情形。
+        write_doc(repo, "docs/TECH_DEBT.md",
+            "## 三、产品判断\n\n"
+            "### P-6 语义检索要不要版本感知（第二十三批提出，**数据已备好，等拍板**）\n\n"
+            "### P-6 语义检索要不要版本感知（第二十三批提出 → 第二十四批撤回重开）\n\n"
+            "> **原拍板已作废，不要按它实现。**\n\n正文。\n"
+        )
+        assert any("空章节" in p and "TECH_DEBT.md" in p for p in check_repo(repo)), \
+            "标题下只剩标题（空章节）未被检出"
+        write_doc(repo, "docs/TECH_DEBT.md", "")
+
+        # 用例 2：`####` 子标题**不算**「无正文」。判据若写成「下一行是不是标题」，
+        #         会把这种合法结构全判成空——那是误报，必须保持全绿。
+        write_doc(repo, "docs/TECH_DEBT.md",
+            "### T-1 某某问题\n\n#### 已普查：某方向\n\n正文段落。\n"
+        )
+        assert not any("空章节" in p for p in check_repo(repo)), \
+            "`####` 子标题被误判为空章节"
+        write_doc(repo, "docs/TECH_DEBT.md", "")
+
+        # 用例 3：代码围栏里的 `## foo` / `# bar` 不是标题，是命令
+        write_doc(repo, "docs/TECH_DEBT.md",
+            "### T-2 某某问题\n\n```bash\n## 这不是章节，是命令\n# 也不是\n```\n"
+        )
+        assert not any("空章节" in p for p in check_repo(repo)), \
+            "代码围栏内的 # 被误判为标题"
+        write_doc(repo, "docs/TECH_DEBT.md", "")
+
+        # 用例 4：H1 后面紧跟 `##` 是正常结构（CHANGELOG 就是「# 标题」+「## Unreleased」），
+        #         把 H1 判进去全是误报
+        write_doc(repo, "docs/TECH_DEBT.md", "# 台账\n\n## 一、技术债\n\n正文。\n")
+        assert not any("空章节" in p for p in check_repo(repo)), \
+            "H1 紧跟 ## 被误判为空章节"
+        write_doc(repo, "docs/TECH_DEBT.md", "")
+
         # 篡改工具数 → 必须检出
         write_doc(repo, "README.md",
             read_doc(repo, "README.md").replace("**2 个 Agent 工具**", "**3 个 Agent 工具**")
@@ -393,7 +596,10 @@ def self_test() -> None:
             "- [x] 实现为 `src-tauri/src/agent/missing.rs`。\n"
         )
         assert any("引用路径不存在" in p for p in check_repo(repo)), "路径引用漂移未被检出"
-    print("self-test: 全部通过")
+    # 用例数从**实际执行到的 assert 语句**里数，不手写常量：
+    # 手写的数字会随自测增删用例而静默过期，而过期数字比没有数字更糟——
+    # 文档里写着「docs 自测 13 条」，实际是 12 条时，没有任何一处会报红
+    print(f"self-test: 全部通过（{len(_cases)} 个用例，含 CHANGELOG 最新版本段 3 个用例）")
 
 
 def main() -> int:
@@ -417,7 +623,7 @@ def main() -> int:
         for problem in problems:
             print(f"- {problem}")
         return 1
-    print("文档漂移校验通过：数量、路径、接口与代码真源一致")
+    print("文档漂移校验通过：数量、路径、接口、章节结构与代码真源一致")
     return 0
 
 

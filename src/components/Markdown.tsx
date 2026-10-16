@@ -623,14 +623,14 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
         <span className="tabular-nums min-w-[3ch] text-center" onDoubleClick={resetZoom}>{Math.round(scale * 100)}%</span>
         <button type="button" onClick={() => setScale((s) => Math.min(5, s + 0.25))} className="hover:opacity-70 px-1" title="放大 (+)">+</button>
         {scale !== 1 && (
-          <button type="button" onClick={resetZoom} className="hover:opacity-70 px-1 ml-1 text-[10px] opacity-70" title="重置 (0)">1:1</button>
+          <button type="button" onClick={resetZoom} className="hover:opacity-70 px-1 ml-1 text-[length:var(--app-text-2xs)] opacity-70" title="重置 (0)">1:1</button>
         )}
         <span className="w-px h-3 bg-white/20 mx-0.5" />
-        <button type="button" onClick={doDownload} className="hover:opacity-70 px-1" title={t('md.downloadImage')}>
+        <button type="button" onClick={doDownload} className="hover:opacity-70 px-1" title={t('md.downloadImage')} aria-label={t('md.downloadImage')}>
           <Icon name="download" size={12} />
         </button>
       </div>
-      <button type="button" className="md-lightbox-close" onClick={onClose} title="关闭 (Esc)" aria-label="关闭 (Esc)">
+      <button type="button" className="md-lightbox-close" onClick={onClose} title={`${t('common.close')} (Esc)`} aria-label={`${t('common.close')} (Esc)`}>
         <Icon name="close" size={18} />
       </button>
     </div>

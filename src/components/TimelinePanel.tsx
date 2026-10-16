@@ -279,7 +279,7 @@ export default function TimelinePanel({
       {/* 工具栏：说明文字与操作按钮分两行（窄栏下一行过长，按钮被挤出可视区） */}
       <div className="px-3 py-2 border-b border-[var(--border)] shrink-0">
         <div
-          className="text-[11px] leading-4 text-[var(--text-muted)]"
+          className="text-[length:var(--app-text-xs)] leading-4 text-[var(--text-muted)]"
           title={t('home.timelineTip')}
         >
           {t('home.timelineTip')}
@@ -290,13 +290,13 @@ export default function TimelinePanel({
           <div className="flex items-center rounded-lg bg-[var(--bg-hover)] p-0.5">
             <button
               onClick={() => setView('list')}
-              className={`px-2 py-0.5 rounded text-[11px] transition-colors ${view === 'list' ? 'tab-soft' : 'tab-inactive'}`}
+              className={`px-2 py-0.5 rounded text-[length:var(--app-text-xs)] transition-colors ${view === 'list' ? 'tab-soft' : 'tab-inactive'}`}
             >
               {t('home.timelineListView')}
             </button>
             <button
               onClick={() => setView('dag')}
-              className={`px-2 py-0.5 rounded text-[11px] transition-colors ${view === 'dag' ? 'tab-soft' : 'tab-inactive'}`}
+              className={`px-2 py-0.5 rounded text-[length:var(--app-text-xs)] transition-colors ${view === 'dag' ? 'tab-soft' : 'tab-inactive'}`}
             >
               {t('home.timelineDagView')}
             </button>
@@ -304,13 +304,13 @@ export default function TimelinePanel({
           <div className="flex items-center gap-1 flex-wrap w-full">
             <button
               onClick={() => setAllCollapsed(false)}
-              className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="px-2 py-0.5 rounded text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               {t('home.timelineExpandAll')}
             </button>
             <button
               onClick={() => setAllCollapsed(true)}
-              className="px-2 py-0.5 rounded text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="px-2 py-0.5 rounded text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               {t('home.timelineCollapseAll')}
             </button>
@@ -320,10 +320,10 @@ export default function TimelinePanel({
 
       <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
         {!events && !loading && (
-          <div className="px-3 py-8 text-center text-[12.5px] text-[var(--text-muted)]">{t('home.timelineEmpty')}</div>
+          <div className="px-3 py-8 text-center text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.timelineEmpty')}</div>
         )}
         {loading && (
-          <div className="px-3 py-8 text-center text-[12.5px] text-[var(--text-muted)]">…</div>
+          <div className="px-3 py-8 text-center text-[length:var(--app-text-sm)] text-[var(--text-muted)]">…</div>
         )}
         {groups.map((g) => {
           const isOpen = !collapsed.has(g.key)
@@ -347,24 +347,24 @@ export default function TimelinePanel({
                 >
                   <path d="M2 1l6 4-6 4V1z" fill="currentColor" />
                 </svg>
-                <span className="shrink-0 font-mono text-[10.5px] text-[var(--accent)]">
+                <span className="shrink-0 font-mono text-[length:var(--app-text-xs)] text-[var(--accent)]">
                   {g.trace ? `trace:${g.trace.slice(0, 8)}` : t('home.timelineOther')}
                 </span>
-                <span className="shrink-0 text-[10.5px] text-[var(--text-muted)] tabular-nums">
+                <span className="shrink-0 text-[length:var(--app-text-xs)] text-[var(--text-muted)] tabular-nums">
                   {t('home.timelineEvents', { count: String(g.events.length) })}
                 </span>
                 {toolCalls > 0 && (
-                  <span className="shrink-0 text-[10.5px] text-[var(--text-muted)] tabular-nums">
+                  <span className="shrink-0 text-[length:var(--app-text-xs)] text-[var(--text-muted)] tabular-nums">
                     · {t('home.timelineCalls', { count: String(toolCalls) })}
                   </span>
                 )}
                 {fails > 0 && (
-                  <span className="shrink-0 text-[10.5px] text-[var(--danger)] font-medium tabular-nums">
+                  <span className="shrink-0 text-[length:var(--app-text-xs)] text-[var(--danger)] font-medium tabular-nums">
                     · {t('home.timelineFails', { count: String(fails) })}
                   </span>
                 )}
                 {dur && (
-                  <span className="ml-auto shrink-0 text-[10.5px] text-[var(--text-muted)] tabular-nums">{dur}</span>
+                  <span className="ml-auto shrink-0 text-[length:var(--app-text-xs)] text-[var(--text-muted)] tabular-nums">{dur}</span>
                 )}
                 {g.trace && (
                   <span
@@ -400,20 +400,20 @@ export default function TimelinePanel({
                               className="w-full flex items-start gap-1.5 px-2.5 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors"
                             >
                               {/* 时间戳：固定宽度，避免被徽章/内容挤压覆盖 */}
-                              <span className="shrink-0 font-mono text-[10px] text-[var(--text-muted)] leading-5 w-[58px] tabular-nums">
+                              <span className="shrink-0 font-mono text-[length:var(--app-text-2xs)] text-[var(--text-muted)] leading-5 w-[58px] tabular-nums">
                                 {fmtTime(e.created_at)}
                               </span>
                               {/* 类型徽章：固定 2 字宽度（用户/助手/工具等），避免被内容撑长 */}
-                              <span className={`shrink-0 inline-flex items-center justify-center text-[10px] px-1.5 py-0.5 rounded font-medium leading-4 min-w-[28px] ${badgeOf(e.event_type)}`}>
+                              <span className={`shrink-0 inline-flex items-center justify-center text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded font-medium leading-4 min-w-[28px] ${badgeOf(e.event_type)}`}>
                                 {typeLabel(e.event_type, t)}
                               </span>
                               {/* 摘要：唯一可压缩元素，长内容省略号 */}
-                              <span className="min-w-0 flex-1 text-[11.5px] text-[var(--text-secondary)] truncate leading-5">
+                              <span className="min-w-0 flex-1 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] truncate leading-5">
                                 {eventSummary(e, t)}
                               </span>
                             </button>
                             {expanded && (
-                              <pre className="mx-3 mb-2 px-2.5 py-1.5 rounded bg-[var(--bg-window)] text-[10.5px] leading-4 text-[var(--text-secondary)] overflow-x-auto whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
+                              <pre className="mx-3 mb-2 px-2.5 py-1.5 rounded bg-[var(--bg-window)] text-[length:var(--app-text-xs)] leading-4 text-[var(--text-secondary)] overflow-x-auto whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
                                 {JSON.stringify(e.payload, null, 2)}
                               </pre>
                             )}
@@ -440,7 +440,7 @@ function ChainView({ nodes }: { nodes: ChainNode[] }) {
   const { t } = useTranslation()
   const [expandedIdx, setExpandedIdx] = useState<Set<number>>(() => new Set())
   if (nodes.length === 0) {
-    return <div className="px-3 py-4 text-center text-[11px] text-[var(--text-muted)]">{t('home.timelineChainEmpty')}</div>
+    return <div className="px-3 py-4 text-center text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.timelineChainEmpty')}</div>
   }
   return (
     <div className="px-3 py-2.5 space-y-0">
@@ -469,20 +469,20 @@ function ChainView({ nodes }: { nodes: ChainNode[] }) {
               className={`flex-1 min-w-0 mb-1.5 rounded-lg border bg-[var(--bg-primary)] px-2.5 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${tone.border}`}
             >
               <div className="flex items-center gap-2">
-                <span className="font-mono text-[11.5px] font-medium truncate">{n.name}</span>
+                <span className="font-mono text-[length:var(--app-text-xs)] font-medium truncate">{n.name}</span>
                 {isRetry && (
-                  <span className="shrink-0 text-[9.5px] px-1 py-px rounded bg-[var(--warning)]/15 text-[var(--warning)]">
+                  <span className="shrink-0 text-[length:var(--app-text-micro)] px-1 py-px rounded bg-[var(--warning)]/15 text-[var(--warning)]">
                     ↻ {t('home.timelineRetry')}
                   </span>
                 )}
-                <span className={`ml-auto shrink-0 text-[10px] tabular-nums ${tone.label}`}>
+                <span className={`ml-auto shrink-0 text-[length:var(--app-text-2xs)] tabular-nums ${tone.label}`}>
                   {n.ok === true ? '✓' : n.ok === false ? '✗' : '…'}
                   {n.durationMs != null && ` ${(n.durationMs / 1000).toFixed(1)}s`}
                 </span>
               </div>
-              {n.args && <div className="mt-0.5 font-mono text-[10px] text-[var(--text-muted)] truncate">{n.args.length > 100 ? `${n.args.slice(0, 100)}…` : n.args}</div>}
+              {n.args && <div className="mt-0.5 font-mono text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate">{n.args.length > 100 ? `${n.args.slice(0, 100)}…` : n.args}</div>}
               {expanded && n.output && (
-                <pre className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-window)] text-[10px] leading-4 text-[var(--text-secondary)] whitespace-pre-wrap break-all max-h-40 overflow-y-auto">
+                <pre className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-window)] text-[length:var(--app-text-2xs)] leading-4 text-[var(--text-secondary)] whitespace-pre-wrap break-all max-h-40 overflow-y-auto">
                   {n.output}
                 </pre>
               )}

@@ -98,7 +98,7 @@ export default function SdkApiBrowser() {
 
   if (error) {
     return (
-      <div className="rounded-lg border border-[var(--warning)]/30 bg-[var(--warning)]/8 px-3 py-2 text-[12px] text-[var(--warning)]">
+      <div className="rounded-lg border border-[var(--warning)]/30 bg-[var(--warning)]/8 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--warning)]">
         {error}
       </div>
     )
@@ -111,12 +111,12 @@ export default function SdkApiBrowser() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder={t('health.apiSearchPlaceholder')}
-          className="flex-1 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 text-[12px] outline-none focus:border-[var(--accent)]"
+          className="flex-1 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)]"
         />
         <button
           onClick={loadIndex}
           disabled={loading}
-          className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+          className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
         >
           {loading ? '…' : t('health.apiRefresh')}
         </button>
@@ -128,7 +128,7 @@ export default function SdkApiBrowser() {
             <div className="flex flex-wrap gap-1 p-2 border-b border-[var(--border)] max-h-24 overflow-auto">
               <button
                 onClick={() => setActiveKit(null)}
-                className={`px-2 h-6 rounded-md text-[11px] transition-colors ${activeKit === null ? 'tab-active' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
+                className={`px-2 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors ${activeKit === null ? 'tab-active' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
               >
                 {t('health.apiAllKits')}
               </button>
@@ -136,7 +136,7 @@ export default function SdkApiBrowser() {
                 <button
                   key={k}
                   onClick={() => setActiveKit(k === activeKit ? null : k)}
-                  className={`px-2 h-6 rounded-md text-[11px] transition-colors ${k === activeKit ? 'tab-active' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
+                  className={`px-2 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors ${k === activeKit ? 'tab-active' : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}`}
                   title={k}
                 >
                   {k}
@@ -145,9 +145,9 @@ export default function SdkApiBrowser() {
             </div>
           )}
           <div className="flex-1 overflow-auto">
-            {searching && <div className="text-[11px] text-[var(--text-muted)] p-3">{t('health.apiSearching')}</div>}
+            {searching && <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] p-3">{t('health.apiSearching')}</div>}
             {!searching && shown.length === 0 && (
-              <div className="text-[11px] text-[var(--text-muted)] p-3">
+              <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] p-3">
                 {query.trim() ? t('health.apiNoMatch') : index ? t('health.apiModuleCount', { count: index.modules.length }) : t('health.apiLoading')}
               </div>
             )}
@@ -155,10 +155,10 @@ export default function SdkApiBrowser() {
               <button
                 key={m.module}
                 onClick={() => selectModule(m)}
-                className={`w-full text-left px-3 py-1.5 text-[11px] border-l-2 transition-colors ${selected?.module === m.module ? 'border-[var(--accent)] bg-[var(--accent)]/8' : 'border-transparent hover:bg-[var(--bg-hover)]'}`}
+                className={`w-full text-left px-3 py-1.5 text-[length:var(--app-text-xs)] border-l-2 transition-colors ${selected?.module === m.module ? 'border-[var(--accent)] bg-[var(--accent)]/8' : 'border-transparent hover:bg-[var(--bg-hover)]'}`}
               >
                 <div className="font-mono text-[var(--text-primary)] truncate">{m.module}</div>
-                <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)] mt-0.5">
+                <div className="flex items-center gap-1.5 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-0.5">
                   {m.kit && <span className="text-[var(--accent)]">{m.kit}</span>}
                   {m.since_min != null && <span>{t('health.apiSince', { version: m.since_min })}</span>}
                   {m.deprecated && <span className="text-[var(--warning)]">{t('health.apiDeprecated')}</span>}
@@ -170,7 +170,7 @@ export default function SdkApiBrowser() {
 
         <div className="flex-1 min-w-0 overflow-auto bg-[var(--bg-primary)]">
           {!selected ? (
-            <div className="text-[12px] text-[var(--text-muted)] p-4">
+            <div className="text-[length:var(--app-text-sm)] text-[var(--text-muted)] p-4">
               {index
                 ? t('health.apiSelectHint', { count: index.modules.length, dir: index.api_dir })
                 : t('health.apiLoadingIndex')}
@@ -178,17 +178,17 @@ export default function SdkApiBrowser() {
           ) : (
             <div>
               <div className="sticky top-0 z-10 bg-[var(--bg-secondary)] border-b border-[var(--border)] px-3 py-2 flex items-center gap-2 flex-wrap">
-                <span className="font-mono text-[12px] text-[var(--accent)]">{selected.module}</span>
-                {selected.kit && <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)]">{selected.kit}</span>}
-                {selected.syscap && <span className="text-[10px] text-[var(--text-muted)] font-mono truncate">{selected.syscap}</span>}
+                <span className="font-mono text-[length:var(--app-text-sm)] text-[var(--accent)]">{selected.module}</span>
+                {selected.kit && <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)]">{selected.kit}</span>}
+                {selected.syscap && <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] font-mono truncate">{selected.syscap}</span>}
                 {selected.since_min != null && (
-                  <span className="text-[10px] text-[var(--text-muted)]">{t('health.apiSinceRange', { min: selected.since_min, max: selected.since_max && selected.since_max !== selected.since_min ? `–${selected.since_max}` : '' })}</span>
+                  <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('health.apiSinceRange', { min: selected.since_min, max: selected.since_max && selected.since_max !== selected.since_min ? `–${selected.since_max}` : '' })}</span>
                 )}
               </div>
               {contentLoading ? (
-                <div className="text-[11px] text-[var(--text-muted)] p-4">{t('health.apiReading')}</div>
+                <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] p-4">{t('health.apiReading')}</div>
               ) : content ? (
-                <div className="text-[11px]">
+                <div className="text-[length:var(--app-text-xs)]">
                   <Markdown>{content}</Markdown>
                 </div>
               ) : null}

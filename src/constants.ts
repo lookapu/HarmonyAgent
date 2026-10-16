@@ -11,9 +11,20 @@ export const STORAGE_KEYS = {
   // 国际化
   LANG: 'deveco-switch-lang',
 
+  // 首启引导：置 '1' 后不再自动弹出；设置页可清除以重看
+  FIRST_RUN_SEEN: 'deveco-switch:first-run-seen',
+
   // 主题
   THEME: 'deveco-switch-theme',
   THEME_LAST: 'deveco-switch-theme-last',
+
+  // 界面字号：存档位名（sm/md/lg），不存倍率——倍率是实现细节，改了不该让用户已存的值失效
+  FONT_SCALE: 'deveco-switch:font-scale',
+
+  // 本地使用统计开关：'1' = 开启，缺省 = 关闭。
+  // 后端在 settings 表的 telemetry_enabled 存一份权威值，本键是前端侧的同步副本
+  // （供埋点同步判断，省掉每次的 IPC 往返）。两者必须一起写，见 utils/telemetry.ts
+  TELEMETRY_ENABLED: 'telemetry:enabled',
 
   // 项目 / 会话记忆
   LAST_PROJECT: 'deveco-switch:last-project-id',

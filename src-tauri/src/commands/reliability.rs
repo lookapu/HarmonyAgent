@@ -26,7 +26,14 @@ pub struct QualityRunRow {
 pub struct ReliabilityDashboard {
     pub total_runs: i64,
     pub acceptance_rate: f64,
+    /// **仅对受裁决的运行求均值**。`scored_runs == 0` 时本值无意义（前端应显示 `—`）。
+    /// 混入未受裁决的运行会让「从没被检查过」显示成「完美通过」，见
+    /// [`crate::agent::governance::UNSCORED_QUALITY_SCORE`]。
     pub average_quality_score: f64,
+    /// 有可验证判据、真正参与打分的运行数。
+    pub scored_runs: i64,
+    /// 契约无判据、完成声明**未被裁决**的运行数。不计入 `scored_runs`。
+    pub unscored_runs: i64,
     pub remediation_success_rate: f64,
     pub recovery_success_rate: f64,
     pub false_completion_count: i64,
@@ -89,6 +96,7 @@ pub fn get_reliability_dashboard(
     let mut recovered = 0i64;
     let mut recovered_success = 0i64;
     let mut false_completion_count = 0i64;
+    let mut unscored_runs = 0i64;
     let mut recent_runs = Vec::new();
     for (
         run_id,
@@ -120,10 +128,24 @@ pub fn get_reliability_dashboard(
             .as_ref()
             .and_then(|value| value["score"].as_u64())
             .map(|value| value as u8);
+        // 「未被裁决」必须靠显式标志位读，不能靠 `evidence_criteria == 0` 推断——
+        // 真实失败的运行也是 0 条通过，两者只有这个标志能分开。
+        //
+        // 历史行没有这个键（schema_version=1 时代），按「受裁决」处理：
+        // 不追溯改写历史统计，这些行会随 30 天窗口自然退出。
+        // 若按「未受裁决」处理，等于用今天的口径重判昨天的运行。
+        let unscored = quality
+            .as_ref()
+            .and_then(|value| value["unscored"].as_bool())
+            .unwrap_or(false);
         if passed == Some(true) {
             accepted += 1;
         }
-        if let Some(score) = score {
+        if unscored {
+            // 未受裁决的运行没有分数可言：**排除在均值之外**而不是折算成 0 拉低整体，
+            // 否则「质量分」会同时被两种错误污染（空判据满分 / 纯问答拖低）。
+            unscored_runs += 1;
+        } else if let Some(score) = score {
             quality_total += i64::from(score);
             quality_count += 1;
         }
@@ -149,7 +171,9 @@ pub fn get_reliability_dashboard(
                 conversation_id,
                 goal,
                 state,
-                score,
+                // 未受裁决的运行不展示分数：展示那个被归零的占位值，
+                // 会让人以为「这一轮质量极差」，而事实是「这一轮没人评过」。
+                score: if unscored { None } else { score },
                 acceptance_passed: passed,
                 remediation_count,
                 recovered: was_recovered,
@@ -193,6 +217,8 @@ pub fn get_reliability_dashboard(
         } else {
             quality_total as f64 / quality_count as f64
         },
+        scored_runs: quality_count,
+        unscored_runs,
         remediation_success_rate: ratio(remediated_success, remediated),
         recovery_success_rate: ratio(recovered_success, recovered),
         false_completion_count,

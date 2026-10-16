@@ -138,7 +138,7 @@ export default function LanTokenPanel() {
         <button
           onClick={() => setShowCreate((v) => !v)}
           disabled={busy}
-          className="px-3 py-1 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-muted)] disabled:opacity-50"
+          className="px-3 py-1 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-hover)] disabled:opacity-50"
         >
           {t('config.lanTokenCreate')}
         </button>
@@ -206,13 +206,13 @@ export default function LanTokenPanel() {
             </code>
             <button
               onClick={handleCopyToken}
-              className="px-3 py-1.5 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-muted)]"
+              className="px-3 py-1.5 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-hover)]"
             >
               {t('config.lanTokenCopy')}
             </button>
             <button
               onClick={() => setToken(null)}
-              className="px-3 py-1.5 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-muted)]"
+              className="px-3 py-1.5 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-hover)]"
             >
               {t('config.lanTokenHide')}
             </button>
@@ -256,7 +256,7 @@ export default function LanTokenPanel() {
                       <span
                         className={`text-xs px-1.5 py-0.5 rounded-full ${
                           active
-                            ? 'bg-[var(--bg-muted)] text-[var(--text-secondary)]'
+                            ? 'bg-[var(--bg-card)] text-[var(--text-secondary)]'
                             : 'bg-[var(--danger)]/15 text-[var(--danger)]'
                         }`}
                       >

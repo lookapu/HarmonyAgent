@@ -74,7 +74,7 @@ export default function DesktopNotifyToast() {
             {iconFor(t.kind)}
           </div>
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-semibold text-[var(--text-primary)] truncate">{t.title}</div>
+            <div className="text-[length:var(--app-text-md)] font-semibold text-[var(--text-primary)] truncate">{t.title}</div>
             {t.body && (
               <div className="text-xs text-[var(--text-secondary)] mt-0.5 line-clamp-2 break-words whitespace-pre-wrap">
                 {t.body}

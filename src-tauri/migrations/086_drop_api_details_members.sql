@@ -1,0 +1,61 @@
+-- Migration 086: 删掉 `api_details.members`（只写不读的 JSON 副本）
+--
+-- ## 这一列是什么、为什么它死得这么彻底
+--
+-- 029 建表时给了 `members`（子项 JSON 数组），抓取流程每次都写一份
+-- （`harmony_api_ref::store_detail`）。但**所有读路径都不经过它**：
+--
+-- | 读的地方 | 实际读的是 |
+-- |---|---|
+-- | 知识库列表的「成员数」列 `api_knowledge.rs:420` | `SELECT COUNT(*) FROM api_members` |
+-- | 详情页的成员列表 `api_knowledge.rs:528` | `FROM api_members WHERE detail_slug=?1` |
+-- | Agent 检索命中的子项 `harmony_api_ref.rs:1285→fetch_members` | `FROM api_members` |
+-- | 前端 `ApiKnowledgePage.tsx` 渲染 | 上面那三条的后端返回 |
+-- | 诊断包导出 | **根本不含 `api_details` 这张表** |
+--
+-- 手动新建详情那条路径（`api_knowledge.rs:690`）更彻底：它给 `members`
+-- 写的是字面量 `'[]'`——**连数据都没写**。
+--
+-- ## 那它凭什么还在？以及它贵多少
+--
+-- 台账 T-12 把它记成「9 行与 `api_members` 不一致，缺最多 49 个成员」，
+-- 并据此推断「不能删，删了那些页面会少成员」。**这个推断的前提是错的**：
+-- 页面显示的成员数**本来就来自 `api_members`**，删列不会让任何页面少一个成员。
+--
+-- 实测（复制种子库 → DROP COLUMN → VACUUM → 比 `PRAGMA page_count`）：
+--
+-- | 项 | 值 |
+-- |---|---:|
+-- | `api_details` 行数 / 其中 `members` 非 `'[]'` | 681 / **681（全部）** |
+-- | `SUM(LENGTH(members))` 净数据 | 15.2 MB |
+-- | **实际磁盘占用（删列前后差分）** | **21.9 MB** |
+-- | 同一次 VACUUM 在「不删列」对照组上的回收 | 2.1 MB |
+-- | ⇒ **净收益** | **19.7 MB** |
+--
+-- > 又是同一个教训：**净数据不是磁盘占用**。15.2MB 的 blob 经 SQLite
+-- > 溢出页/碎片膨胀到 21.9MB。上一批（P-7）已经被 `SUM(LENGTH())`
+-- > 骗过一次（91.9MB 净 vs 178.9MB 实际），这里不重复踩。
+--
+-- 对种子库而言这是 272.6MB 里的 7.2%；**在剥离向量之后（93.7MB）占 21%**。
+--
+-- ## 为什么那 9 行不一致一直没人发现
+--
+-- 因为**没人读这一列**。两个写入源口径不同（JSON 存抽取到的全部子项，
+-- 表里存 `INSERT OR IGNORE` 去重后的），差异本该是信号，实际是无声的：
+-- 类型检查、lint、测试、构建、体积门禁**全部绿灯**。
+--
+-- ## 兼容性：老种子库怎么办
+--
+-- `services/seed.rs` 原来用 `INSERT OR IGNORE INTO main.t SELECT * FROM seed.t`
+-- ——**按位置**插入，两边列数/列序必须完全一致。老种子库还带 `members` 而
+-- 主库没有了 ⇒ 首次启动导入**整批回滚** ⇒ 新装用户的知识库直接空掉。
+--
+-- 本迁移因此**必须与 seed.rs 那处改动同批上线**（已改成运行时求交集的
+-- 显式列清单）。有交集就插交集，任一侧 schema 变动都不会再炸。
+-- 这条顺序不是风格问题：只上迁移不上那处改动 = 发行事故。
+
+-- DROP COLUMN 需要 SQLite ≥ 3.35（2021-03）。rusqlite 自带的 SQLite 远高于此。
+-- 它是**元数据操作**，不重写表体；释放的页进入 freelist，后续写入会复用
+-- ⇒ 文件不会变大，但也不会自动变小（要缩得 VACUUM，而启动时 VACUUM 几百 MB
+-- 是不该付的代价）。用户库体积因此「不再增长」，而不是「立刻变小」。
+ALTER TABLE api_details DROP COLUMN members;

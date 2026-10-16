@@ -131,14 +131,14 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
 │  React 19 + TypeScript + Tailwind 4 + Vite 8        │
 │  - i18next (EN/zh/auto) + react-markdown + katex    │
 │  - Zustand store: project / theme / chat / memory   │
-│  - 14 pages (Home workspace + 13 admin pages)       │
+│  - 19 pages (Home workspace + 18 admin pages)       │
 └─────────────────────────────────────────────────────┘
                         │ Tauri IPC
 ┌─────────────────────────────────────────────────────┐
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
-│  - 305 Tauri IPC entry points · 62 service modules  │
+│  - 321 Tauri IPC entry points · 64 service modules  │
 │  - agent/ 58 top-level modules · tools/ 35 files    │
-│  - SQLite + 84 migrations · full event sourcing for │
+│  - SQLite + 86 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
 │  - Bundled runtimes: Node + JDK + Git (runtime/)    │
 └─────────────────────────────────────────────────────┘
@@ -207,9 +207,11 @@ src-tauri/src/
 │       ├── quality_runtime.rs   #   Runtime quality (6 tools)
 │       ├── quality_media.rs     #   Media quality (2 tools)
 │       └── schedule_tools.rs    # Scheduled reminders (schedule_create/list/delete)
-├── commands/               # 38 command modules (299 IPC registration entry points total)
-├── services/               # Business services (62)
+├── commands/               # 41 command modules (321 IPC registration entry points total)
+├── services/               # Business services (64)
 │   ├── proxy_service.rs    #   - Local proxy
+│   ├── diagnostic_bundle.rs #  - Diagnostic bundle (P2-3: version + env + recent errors, redacted)
+│   ├── licensing.rs        #   - License tiers (P2-2: entitlement matrix + quota gateway)
 │   ├── circuit_breaker.rs  #   - Circuit breaker
 │   ├── model_router.rs     #   - Model routing
 │   ├── embedding.rs        #   - Vector embedding (GPU-first auto fallback)
@@ -221,7 +223,7 @@ src-tauri/src/
 │   ├── reminders.rs        #   - Scheduled reminder dispatch (30s polling)
 │   ├── harmony_*.rs        #   - HarmonyOS integration (6 files)
 │   └── ...
-├── db/                     # SQLite + 68 sequential migrations
+├── db/                     # SQLite + 85 sequential migrations
 ├── utils/                  # Utilities (13 files, incl. task watchdog)
 ├── tray/                   # System tray
 └── runtime/                # Bundled Node + JDK + Git (~700MB, not committed — see below)
@@ -310,7 +312,7 @@ npm run clean:generated
 - Frontend entry: `src/App.tsx` + `src/pages/Home.tsx` (Agent Workspace main UI)
 - Backend entry: `src-tauri/src/lib.rs` + `src-tauri/src/main.rs`
 - Agent tool registration: the `TOOL_SPECS` array in `src-tauri/src/agent/tools/mod.rs`
-- Database migrations: `src-tauri/migrations/` (68 at the time of writing; executed migrations must never be modified — add new ones with incremented numbers)
+- Database migrations: `src-tauri/migrations/` (85 at the time of writing; executed migrations must never be modified — add new ones with incremented numbers)
 - Legacy debug scripts: `scripts/legacy/` (archived only, do not reference)
 
 ## Support

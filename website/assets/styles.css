@@ -1,0 +1,418 @@
+/* ============================================================================
+   P2-5 官网样式
+   ----------------------------------------------------------------------------
+   刻意不复用 app 的 --app-* token：官网是独立静态站，不参与桌面端构建，
+   也不该被 app 的主题改动带着变。变量名加 --site- 前缀以示隔离。
+
+   全部尺寸走 clamp()/rem，没有裸 px 字号——用户改浏览器字号时布局不会塌。
+   ========================================================================== */
+
+:root {
+  --site-bg: #0d1117;
+  --site-bg-alt: #131a23;
+  --site-fg: #e6edf3;
+  --site-fg-muted: #9aa7b4;
+  --site-line: #263140;
+  --site-accent: #2f81f7;
+  --site-accent-fg: #ffffff;
+  /* 承载白字的**面**（按钮、skip-link）与画在底上的**字**（链接、焦点环）
+     是两种角色，不能共用一个值：#2f81f7 对白字只有 3.75:1（AA 要 4.5:1），
+     但压到能配白字时它对深底又掉到 4.06:1，链接就不达标了。
+     所以拆成两个 token，各自满足各自的对比度下限。 */
+  --site-accent-solid: #2972d9;
+  --site-radius: 10px;
+  --site-wrap: 1120px;
+  --site-gap: 24px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --site-bg: #ffffff;
+    --site-bg-alt: #f6f8fa;
+    --site-fg: #1f2328;
+    --site-fg-muted: #59636e;
+    --site-line: #d8dee4;
+    --site-accent: #0969da;
+    --site-accent-fg: #ffffff;
+    --site-accent-solid: #0969da;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* 动效降级：与桌面端 P1-5 同一口径，跟随系统设置 */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--site-bg);
+  color: var(--site-fg);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 1rem;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+a {
+  color: var(--site-accent);
+}
+
+.wrap {
+  width: 100%;
+  max-width: var(--site-wrap);
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+.wrap-narrow {
+  max-width: 760px;
+}
+
+/* 键盘用户跳过导航：没有它，Tab 第一下会掉进页头一长串链接 */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  padding: 10px 16px;
+  background: var(--site-accent-solid);
+  color: var(--site-accent-fg);
+  z-index: 10;
+}
+
+.skip-link:focus {
+  left: 8px;
+  top: 8px;
+}
+
+/* ------------------------------- 页头 ---------------------------------- */
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: color-mix(in srgb, var(--site-bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--site-line);
+}
+
+.header-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--site-gap);
+  min-height: 60px;
+  flex-wrap: wrap;
+}
+
+.brand {
+  font-weight: 650;
+  font-size: 1.0625rem;
+  color: var(--site-fg);
+  text-decoration: none;
+}
+
+.site-nav {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.site-nav a {
+  color: var(--site-fg-muted);
+  text-decoration: none;
+  font-size: 0.9375rem;
+}
+
+.site-nav a:hover,
+.site-nav a:focus-visible {
+  color: var(--site-fg);
+}
+
+/* ------------------------------- Hero ---------------------------------- */
+
+.hero {
+  padding: clamp(48px, 8vw, 96px) 0;
+}
+
+.hero-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: clamp(28px, 5vw, 56px);
+  align-items: center;
+}
+
+@media (max-width: 860px) {
+  .hero-inner {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.hero h1 {
+  margin: 0 0 16px;
+  font-size: clamp(1.875rem, 4.5vw, 2.75rem);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+.lede {
+  margin: 0 0 24px;
+  font-size: 1.0625rem;
+  color: var(--site-fg-muted);
+  max-width: 46ch;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.btn {
+  display: inline-block;
+  padding: 10px 20px;
+  border-radius: var(--site-radius);
+  font-size: 0.9375rem;
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+
+.btn-primary {
+  background: var(--site-accent-solid);
+  color: var(--site-accent-fg);
+}
+
+.btn-ghost {
+  border-color: var(--site-line);
+  color: var(--site-fg);
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+}
+
+.hero-note {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--site-fg-muted);
+}
+
+.hero-shot img,
+.shot img {
+  width: 100%;
+  border: 1px solid var(--site-line);
+  border-radius: var(--site-radius);
+  background: var(--site-bg-alt);
+}
+
+/* ------------------------------ 通用区块 -------------------------------- */
+
+.section {
+  padding: clamp(40px, 6vw, 72px) 0;
+}
+
+.section-alt {
+  background: var(--site-bg-alt);
+  border-top: 1px solid var(--site-line);
+  border-bottom: 1px solid var(--site-line);
+}
+
+.section h2 {
+  margin: 0 0 8px;
+  font-size: clamp(1.375rem, 3vw, 1.875rem);
+  line-height: 1.3;
+}
+
+.section-lede,
+.section-note {
+  color: var(--site-fg-muted);
+  margin: 0 0 28px;
+  max-width: 62ch;
+}
+
+.section-note {
+  margin: 20px 0 0;
+  font-size: 0.875rem;
+}
+
+/* ------------------------------- 特性卡 --------------------------------- */
+
+.cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--site-gap);
+}
+
+.card {
+  border: 1px solid var(--site-line);
+  border-radius: var(--site-radius);
+  padding: 20px;
+  background: var(--site-bg);
+}
+
+.section-alt .card {
+  background: var(--site-bg);
+}
+
+.card h3 {
+  margin: 0 0 8px;
+  font-size: 1.0625rem;
+}
+
+.card p {
+  margin: 0;
+  color: var(--site-fg-muted);
+  font-size: 0.9375rem;
+}
+
+/* ------------------------------- 截图 ----------------------------------- */
+
+.shots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--site-gap);
+}
+
+.shot {
+  margin: 0;
+}
+
+.shot figcaption {
+  margin-top: 10px;
+  font-size: 0.875rem;
+  color: var(--site-fg-muted);
+}
+
+/* ------------------------------- 下载 ----------------------------------- */
+
+.downloads {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.dl {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 18px 20px;
+  border: 1px solid var(--site-line);
+  border-radius: var(--site-radius);
+  text-decoration: none;
+  color: var(--site-fg);
+  background: var(--site-bg);
+}
+
+.dl:hover {
+  border-color: var(--site-accent);
+}
+
+.dl span {
+  font-size: 0.875rem;
+  color: var(--site-fg-muted);
+}
+
+.dl-muted {
+  opacity: 0.75;
+}
+
+/* -------------------------------- FAQ ----------------------------------- */
+
+.faq-item {
+  border-bottom: 1px solid var(--site-line);
+  padding: 4px 0;
+}
+
+.faq-item summary {
+  cursor: pointer;
+  padding: 12px 0;
+  font-weight: 600;
+}
+
+.faq-item p {
+  margin: 0 0 16px;
+  color: var(--site-fg-muted);
+}
+
+/* summary 的默认三角在深色下几乎看不见，换成一个自绘指示器 */
+summary {
+  list-style: none;
+  position: relative;
+  padding-left: 28px;
+}
+
+summary::-webkit-details-marker {
+  display: none;
+}
+
+summary::before {
+  content: "+";
+  position: absolute;
+  left: 0;
+  color: var(--site-accent);
+}
+
+details[open] summary::before {
+  content: "\2212";
+}
+
+/* ------------------------------ 页脚 ------------------------------------ */
+
+.site-footer {
+  border-top: 1px solid var(--site-line);
+  padding: 28px 0;
+}
+
+.footer-inner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 0.875rem;
+  color: var(--site-fg-muted);
+}
+
+.footer-inner p {
+  margin: 0;
+}
+
+.footer-nav {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+:focus-visible {
+  outline: 2px solid var(--site-accent);
+  outline-offset: 2px;
+}

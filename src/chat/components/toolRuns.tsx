@@ -66,11 +66,11 @@ export const ToolRunGroup = memo(function ToolRunGroup({ runs, onRetry, onCancel
           size={11}
           className={running ? 'text-[var(--warning)]' : errCount > 0 ? 'text-[var(--danger)]' : 'text-[var(--success)]'}
         />
-        <span className="text-[12px] text-[var(--text-secondary)] truncate">
+        <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)] truncate">
           {t('home.toolCalls', { count: runs.length })}
           {last && <span className="text-[var(--text-muted)]"> · {last.tool}</span>}
         </span>
-        <span className="text-[11px] shrink-0 tabular-nums ml-auto">
+        <span className="text-[length:var(--app-text-xs)] shrink-0 tabular-nums ml-auto">
           {errCount > 0 ? (
             <span className="text-[var(--danger)]">{t('home.toolFailed')} ×{errCount}</span>
           ) : running ? (
@@ -220,10 +220,10 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
         />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 min-w-0">
-            <div className="text-[12px] truncate text-[var(--text-secondary)]">{run.tool}</div>
+            <div className="text-[length:var(--app-text-sm)] truncate text-[var(--text-secondary)]">{run.tool}</div>
             {run.level && (
               <span
-                className={`text-[9px] font-semibold shrink-0 ${levelColor}`}
+                className={`text-[length:var(--app-text-micro)] font-semibold shrink-0 ${levelColor}`}
                 title={run.level === 'L2' ? t('home.toolLevelL2') : run.level === 'L1' ? t('home.toolLevelL1') : t('home.toolLevelL0')}
               >
                 {run.level}
@@ -231,12 +231,12 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
             )}
           </div>
           {run.args && (
-            <div className="text-[10px] text-[var(--text-muted)] truncate font-mono mt-px" title={run.desc || run.args}>
+            <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate font-mono mt-px" title={run.desc || run.args}>
               {run.args}
             </div>
           )}
         </div>
-        <span className={`text-[11px] shrink-0 tabular-nums ${statusColor}`}>
+        <span className={`text-[length:var(--app-text-xs)] shrink-0 tabular-nums ${statusColor}`}>
           {running && (
             <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
           )}
@@ -261,11 +261,11 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
             <span className="w-2 h-2 rounded-full bg-[#ff5f56] shrink-0" />
             <span className="w-2 h-2 rounded-full bg-[#ffbd2e] shrink-0" />
             <span className="w-2 h-2 rounded-full bg-[#27c93f] shrink-0" />
-            <span className="ml-1.5 text-[10px] font-mono text-[#8b949e] truncate">{run.tool}</span>
+            <span className="ml-1.5 text-[length:var(--app-text-2xs)] font-mono text-[#8b949e] truncate">{run.tool}</span>
             {run.level && (
-              <span className={`text-[9px] px-1 py-px rounded shrink-0 font-semibold ${levelColor}`}>{run.level}</span>
+              <span className={`text-[length:var(--app-text-micro)] px-1 py-px rounded shrink-0 font-semibold ${levelColor}`}>{run.level}</span>
             )}
-            <span className={`ml-auto text-[10px] shrink-0 ${statusColor}`}>{durationLabel}</span>
+            <span className={`ml-auto text-[length:var(--app-text-2xs)] shrink-0 ${statusColor}`}>{durationLabel}</span>
             <button
               type="button"
               onClick={copyOutput}
@@ -281,7 +281,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
                 type="button"
                 onClick={() => onCancel(run)}
                 title={t('home.stopTool')}
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#8b949e] hover:text-[#f85149] hover:bg-white/10 transition-colors text-[10px] shrink-0"
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#8b949e] hover:text-[#f85149] hover:bg-white/10 transition-colors text-[length:var(--app-text-2xs)] shrink-0"
               >
                 <Icon name="close" size={10} />
                 {t('home.stopTool')}
@@ -293,7 +293,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
                 type="button"
                 onClick={() => onRetry(run)}
                 title={t('home.toolRetryHint')}
-                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#8b949e] hover:text-[#e6edf3] hover:bg-white/10 transition-colors text-[10px] shrink-0"
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[#8b949e] hover:text-[#e6edf3] hover:bg-white/10 transition-colors text-[length:var(--app-text-2xs)] shrink-0"
               >
                 <Icon name="refresh" size={10} />
                 {t('home.retry')}
@@ -301,7 +301,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
             )}
           </div>
           {guardKind && (
-            <div className="mx-3 mt-2 rounded-md border border-[var(--warning)]/35 bg-[var(--warning)]/10 px-2.5 py-2 text-[11px] leading-relaxed">
+            <div className="mx-3 mt-2 rounded-md border border-[var(--warning)]/35 bg-[var(--warning)]/10 px-2.5 py-2 text-[length:var(--app-text-xs)] leading-relaxed">
               <div className="flex items-center gap-1.5 font-semibold text-[var(--warning)]">
                 <Icon name="info" size={11} />
                 {t(`home.mutationGuard.${guardKind}.title`)}
@@ -310,7 +310,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
             </div>
           )}
           {relocated && (
-            <div className="mx-3 mt-2 rounded-md border border-[var(--success)]/35 bg-[var(--success)]/10 px-2.5 py-2 text-[11px] leading-relaxed">
+            <div className="mx-3 mt-2 rounded-md border border-[var(--success)]/35 bg-[var(--success)]/10 px-2.5 py-2 text-[length:var(--app-text-xs)] leading-relaxed">
               <div className="flex items-center gap-1.5 font-semibold text-[var(--success)]">
                 <Icon name="info" size={11} />
                 {t('home.mutationGuard.relocated.title')}
@@ -320,7 +320,7 @@ export const ToolRunRow = memo(function ToolRunRow({ run, onRetry, onCancel }: {
           )}
           <pre
             ref={liveRef}
-            className="px-3.5 py-2 text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed text-[#c9d1d9] max-h-64 overflow-y-auto"
+            className="px-3.5 py-2 text-[length:var(--app-text-xs)] font-mono whitespace-pre-wrap break-all leading-relaxed text-[#c9d1d9] max-h-64 overflow-y-auto"
           >
             {displayOutput ? (
               hasAnsi(displayOutput) ? (
@@ -362,9 +362,9 @@ export const AgentRunCard = memo(function AgentRunCard({ run }: { run: AgentRun 
           className={isErr ? 'text-[var(--danger)]' : run.status === 'done' ? 'text-[var(--success)]' : 'text-[var(--warning)]'}
         />
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] truncate text-[var(--text-secondary)]">{run.name}</div>
+          <div className="text-[length:var(--app-text-sm)] truncate text-[var(--text-secondary)]">{run.name}</div>
         </div>
-        <span className={`text-[11px] shrink-0 tabular-nums ${statusColor}`}>
+        <span className={`text-[length:var(--app-text-xs)] shrink-0 tabular-nums ${statusColor}`}>
           {run.status === 'running' && (
             <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--accent)] border-t-transparent animate-spin align-middle mr-1" />
           )}
@@ -373,7 +373,7 @@ export const AgentRunCard = memo(function AgentRunCard({ run }: { run: AgentRun 
         {done && <Icon name="chevron-right" size={11} className={`text-[var(--text-muted)] transition-transform ${open ? 'rotate-90' : ''}`} />}
       </button>
       {done && open && (
-        <pre className="text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed text-[var(--text-muted)] max-h-64 overflow-y-auto pb-2 animate-fade-in-up">
+        <pre className="text-[length:var(--app-text-xs)] font-mono whitespace-pre-wrap break-all leading-relaxed text-[var(--text-muted)] max-h-64 overflow-y-auto pb-2 animate-fade-in-up">
           {run.output}
         </pre>
       )}

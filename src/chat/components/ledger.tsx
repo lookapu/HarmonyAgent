@@ -27,18 +27,18 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
           className={running ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'}
         />
         <div className="flex-1 min-w-0">
-          <span className="text-[12px] text-[var(--text-secondary)]">{t('home.ledgerTitle')}</span>
+          <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">{t('home.ledgerTitle')}</span>
           {!open && ledger.goal && (
-            <span className="text-[11px] text-[var(--text-muted)] ml-2 truncate">{ledger.goal}</span>
+            <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] ml-2 truncate">{ledger.goal}</span>
           )}
         </div>
         {totalGoals > 0 && (
-          <span className="text-[10px] text-[var(--text-muted)] tabular-nums shrink-0">
+          <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] tabular-nums shrink-0">
             {ledger.verified.length}/{totalGoals}
           </span>
         )}
         <span
-          className={`text-[11px] shrink-0 flex items-center gap-1 ${
+          className={`text-[length:var(--app-text-xs)] shrink-0 flex items-center gap-1 ${
             running ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'
           }`}
         >
@@ -54,13 +54,13 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
       </button>
       {open && (
         <div className="border-t border-[var(--border)]/60 py-1.5 space-y-1">
-          <div className="text-[11px] text-[var(--text-muted)] truncate mb-1" title={ledger.goal}>
+          <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] truncate mb-1" title={ledger.goal}>
             {ledger.goal}
           </div>
           {ledger.verified.length > 0 && (
             <div className="space-y-0.5">
               {ledger.verified.map((e) => (
-                  <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                  <div key={e.n} className="flex items-start gap-2 text-[length:var(--app-text-xs)] leading-relaxed">
                     <Icon name="check" size={11} className="shrink-0 mt-0.5 text-[var(--success)]" />
                     <span className="min-w-0 flex-1">
                       <span className="text-[var(--text-muted)]">
@@ -75,7 +75,7 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
           {ledger.open.length > 0 && (
             <div className="space-y-0.5">
               {ledger.open.map((e) => (
-                  <div key={e.n} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                  <div key={e.n} className="flex items-start gap-2 text-[length:var(--app-text-xs)] leading-relaxed">
                     <Icon name="close" size={11} className="shrink-0 mt-0.5 text-[var(--danger)]" />
                     <span className="min-w-0 flex-1">
                       <span className="text-[var(--text-muted)]">
@@ -88,7 +88,7 @@ export const LedgerCard = memo(function LedgerCard({ state }: { state: TaskLedge
             </div>
           )}
           {ledger.next && (
-            <div className="flex items-start gap-2 text-[11.5px] leading-relaxed pt-1.5 border-t border-[var(--border)]/60">
+            <div className="flex items-start gap-2 text-[length:var(--app-text-xs)] leading-relaxed pt-1.5 border-t border-[var(--border)]/60">
               <Icon name="bolt" size={11} className="text-[var(--accent)] shrink-0 mt-0.5" />
               <span className="min-w-0 flex-1 text-[var(--text-secondary)]">{ledger.next}</span>
             </div>

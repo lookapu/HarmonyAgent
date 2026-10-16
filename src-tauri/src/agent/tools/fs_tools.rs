@@ -613,7 +613,7 @@ pub(super) async fn undo_edit(args: &Value, roots: &[String], conversation_id: &
     for (idx, s) in pending.iter().enumerate() {
         if let Some(parent) = s.path.parent() {
             // 父目录建不出来时不吞错误——否则后面的写盘会报一个
-            // 「写入失败」���这种把人带偏的错因（真实原因是目录建不出来）
+            // 「写入失败」，这种把人带偏的错因（真实原因是目录建不出来）
             if let Err(e) = std::fs::create_dir_all(parent) {
                 let msg = format!("撤销中止：无法为 {} 创建父目录：{e}", s.path.display());
                 crate::agent::undo::restore_undo(conversation_id, pending[idx..].to_vec());

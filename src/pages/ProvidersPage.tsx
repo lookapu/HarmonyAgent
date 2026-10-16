@@ -30,6 +30,8 @@ import {
   type ProviderTemplate,
 } from '../data/providerTemplates'
 import Icon from '../icons/Icon'
+import { EmptyState } from '../components/ui/EmptyState'
+import { Button } from '../components/ui/Button'
 
 /** 模态类型：与后端 input_modalities/output_modalities JSON 数组对应 */
 const MODALITY_OPTIONS = ['text', 'image', 'audio', 'video'] as const
@@ -106,11 +108,11 @@ function ModalityPicker({
   const { t } = useTranslation()
   const row = (side: 'in' | 'out', mods: Modality[]) => (
     <>
-      <span className="text-[10px] text-[var(--text-muted)]">
+      <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
         {side === 'in' ? t('provider.modInput') : t('provider.modOutput')}
       </span>
       {MODALITY_OPTIONS.map((mo) => (
-        <label key={mo} className="flex items-center gap-1 text-[10px] text-[var(--text-secondary)] cursor-pointer select-none">
+        <label key={mo} className="flex items-center gap-1 text-[length:var(--app-text-2xs)] text-[var(--text-secondary)] cursor-pointer select-none">
           <input
             type="checkbox"
             checked={mods.includes(mo)}
@@ -129,7 +131,7 @@ function ModalityPicker({
           <button
             key={p.key}
             onClick={() => onPreset(p.key)}
-            className={`px-2 py-0.5 text-[10px] rounded-md border transition-colors ${
+            className={`px-2 py-0.5 text-[length:var(--app-text-2xs)] rounded-md border transition-colors ${
               preset === p.key
                 ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]'
                 : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
@@ -166,14 +168,14 @@ function EndpointEditor({
   }
   return (
     <div className="space-y-1.5">
-      <label className="text-[11px] text-[var(--text-muted)]">{t('provider.endpoints')}</label>
+      <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.endpoints')}</label>
       <div className="space-y-1.5">
         {endpoints.map((ep, i) => (
           <div key={i} className="flex items-center gap-2">
-            <span className="w-20 h-8 px-2 rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-mono flex items-center justify-center shrink-0">
+            <span className="w-20 h-8 px-2 rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] text-[length:var(--app-text-xs)] font-mono flex items-center justify-center shrink-0">
               {ep.protocol}
             </span>
-            <span className="flex-1 min-w-0 h-8 px-3 modern-card rounded-lg text-[12px] font-mono text-[var(--text-primary)] flex items-center truncate">
+            <span className="flex-1 min-w-0 h-8 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] font-mono text-[var(--text-primary)] flex items-center truncate">
               {ep.base_url}
             </span>
             <button
@@ -191,7 +193,7 @@ function EndpointEditor({
         <select
           value={proto}
           onChange={(e) => setProto(e.target.value)}
-          className="w-24 h-8 px-2 rounded-lg modern-card border-[var(--border)] text-[11px] font-mono text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
+          className="w-24 h-8 px-2 rounded-lg modern-card border-[var(--border)] text-[length:var(--app-text-xs)] font-mono text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
         >
           <option value="openai">{t('provider.protoOpenai')}</option>
           <option value="anthropic">{t('provider.protoAnthropic')}</option>
@@ -207,16 +209,16 @@ function EndpointEditor({
             }
           }}
           placeholder="https://api.example.com/anthropic"
-          className="flex-1 min-w-0 h-8 px-3 modern-card rounded-lg text-[12px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+          className="flex-1 min-w-0 h-8 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
         />
         <button
           onClick={add}
-          className="h-8 px-3 text-[11px] border border-[var(--accent)] text-[var(--accent)] rounded-lg hover:bg-[var(--accent-soft)] transition-colors shrink-0"
+          className="h-8 px-3 text-[length:var(--app-text-xs)] border border-[var(--accent)] text-[var(--accent)] rounded-lg hover:bg-[var(--accent-soft)] transition-colors shrink-0"
         >
           {t('provider.endpointAdd')}
         </button>
       </div>
-      <p className="text-[10px] text-[var(--text-muted)]">{t('provider.endpointsHint')}</p>
+      <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.endpointsHint')}</p>
     </div>
   )
 }
@@ -836,20 +838,20 @@ export default function ProvidersPage() {
         <div>
           <h2 className="text-xl font-semibold">{t('provider.title')}</h2>
           <p className="text-xs text-[var(--text-secondary)] mt-1">{t('provider.subtitle')}</p>
-          {importNote && <p className="text-[11px] text-[var(--accent)] mt-1">{importNote}</p>}
+          {importNote && <p className="text-[length:var(--app-text-xs)] text-[var(--accent)] mt-1">{importNote}</p>}
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={handleImportFromConfig}
             disabled={importing}
             title={t('provider.importHint')}
-            className="h-9 px-4 rounded-[10px] border border-[var(--border)] text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+            className="h-9 px-4 rounded-[10px] border border-[var(--border)] text-[length:var(--app-text-md)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
           >
             {importing ? t('provider.importing') : t('provider.importFromConfig')}
           </button>
           <button
             onClick={() => setShowForm(!showForm)}
-            className="h-9 px-4 rounded-[10px] btn-primary text-[13px] font-medium transition-colors"
+            className="h-9 px-4 rounded-[10px] btn-primary text-[length:var(--app-text-md)] font-medium transition-colors"
           >
             <span className="flex items-center gap-1.5">
               <Icon name={showForm ? 'close' : 'plus'} size={14} white />
@@ -863,14 +865,14 @@ export default function ProvidersPage() {
         <div ref={formRef} className="modern-card rounded-2xl p-4 mb-6 space-y-4 animate-fade-in-up">
           {/* 模板选择（按分类分组） */}
           <div>
-            <div className="text-[11px] font-medium text-[var(--text-muted)] mb-2">{t('provider.templates')}</div>
+            <div className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)] mb-2">{t('provider.templates')}</div>
             <div className="space-y-3">
               {templateCategories.map((cat) => {
                 const list = providerTemplates.filter((tpl) => tpl.category === cat.key)
                 if (list.length === 0) return null
                 return (
                   <div key={cat.key}>
-                    <div className="text-[10px] text-[var(--text-muted)] mb-1.5">{t(cat.labelKey)}</div>
+                    <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mb-1.5">{t(cat.labelKey)}</div>
                     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
                       {list.map((tpl) => (
                         <button
@@ -883,17 +885,17 @@ export default function ProvidersPage() {
                           }`}
                         >
                           <span
-                            className="w-6 h-6 rounded-full flex items-center justify-center shrink-0 text-[10px] font-bold text-white"
+                            className="w-6 h-6 rounded-full flex items-center justify-center shrink-0 text-[length:var(--app-text-2xs)] font-bold text-white"
                             style={{ backgroundColor: tpl.color }}
                           >
                             {t(`provider.tpl.${tpl.key}`).charAt(0)}
                           </span>
                           <span className="min-w-0 flex-1">
-                            <span className="block text-[12px] truncate text-[var(--text-primary)]">
+                            <span className="block text-[length:var(--app-text-sm)] truncate text-[var(--text-primary)]">
                               {t(`provider.tpl.${tpl.key}`)}
                             </span>
                             {tpl.free && (
-                              <span className="block text-[10px] text-[var(--success)]">{t('provider.freeMark')}</span>
+                              <span className="block text-[length:var(--app-text-2xs)] text-[var(--success)]">{t('provider.freeMark')}</span>
                             )}
                           </span>
                           {selectedTpl === tpl.key && (
@@ -911,32 +913,32 @@ export default function ProvidersPage() {
           {/* 表单字段 */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('provider.name')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.name')}</label>
               <input
                 placeholder={t('provider.namePlaceholder')}
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
-                className="w-full h-9 px-3 modern-card rounded-lg text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('provider.baseUrl')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.baseUrl')}</label>
               <input
                 placeholder="https://api.example.com/v1"
                 value={form.base_url}
                 onChange={(e) => setForm({ ...form, base_url: e.target.value })}
                 onBlur={handleUrlBlur}
-                className="w-full h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             <div className="space-y-1.5 sm:col-span-2">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('provider.apiKey')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.apiKey')}</label>
               <input
                 placeholder={keyHint || t('provider.apiKeyPlaceholder')}
                 type="password"
                 value={form.api_key || ''}
                 onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-                className="w-full h-9 px-3 modern-card rounded-lg text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
           </div>
@@ -949,12 +951,12 @@ export default function ProvidersPage() {
 
           {/* 默认模型 */}
           <div className="space-y-1.5">
-            <label className="text-[11px] text-[var(--text-muted)]">{t('provider.models')}</label>
+            <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.models')}</label>
             <div className="flex gap-2 flex-wrap items-center">
               {models.map((m) => (
                 <span
                   key={m}
-                  className="group flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[var(--accent-soft)] border border-[var(--accent)]/20 text-[12px] font-mono text-[var(--text-primary)]"
+                  className="group flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[var(--accent-soft)] border border-[var(--accent)]/20 text-[length:var(--app-text-sm)] font-mono text-[var(--text-primary)]"
                 >
                   {m}
                   <button
@@ -978,19 +980,19 @@ export default function ProvidersPage() {
                   }
                 }}
                 onBlur={addFormModel}
-                className="h-8 px-3 flex-1 min-w-40 modern-card border-dashed border-[var(--border)] rounded-lg text-[12px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="h-8 px-3 flex-1 min-w-40 modern-card border-dashed border-[var(--border)] rounded-lg text-[length:var(--app-text-sm)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             {/* 新建模型的默认上下文窗口 / 输出上限（应用到本次添加的全部模型；创建后可在编辑面板逐模型调整） */}
             <div className="flex items-center gap-3 flex-wrap">
-              <label className="text-[10px] text-[var(--text-muted)]">{t('provider.modelDefaults')}</label>
+              <label className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelDefaults')}</label>
               <input
                 type="text"
                 inputMode="numeric"
                 placeholder={t('provider.modelCtxPh')}
                 value={formCtx}
                 onChange={(e) => setFormCtx(e.target.value)}
-                className="w-32 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-32 h-7 px-2 modern-card rounded-lg text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
               <input
                 type="text"
@@ -998,18 +1000,18 @@ export default function ProvidersPage() {
                 placeholder={t('provider.modelOutPh')}
                 value={formOut}
                 onChange={(e) => setFormOut(e.target.value)}
-                className="w-32 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-32 h-7 px-2 modern-card rounded-lg text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
-            <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelHint')}</p>
-            <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelHint')}</p>
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
           </div>
 
           <div className="flex items-center gap-3">
             {error && <span className="text-xs text-[var(--danger)]">{error}</span>}
             <button
               onClick={handleCreate}
-              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[13px] font-medium hover:opacity-90 transition-opacity"
+              className="h-9 px-5 rounded-[10px] bg-[var(--success)] text-white text-[length:var(--app-text-md)] font-medium hover:opacity-90 transition-opacity"
             >
               {t('provider.save')}
             </button>
@@ -1020,29 +1022,26 @@ export default function ProvidersPage() {
       {/* Provider 列表 */}
       <div className="flex-1 overflow-y-auto space-y-2.5 pb-4">
         {providers.length === 0 && !showForm && (
-          <div className="flex flex-col items-center gap-3 py-16 text-center">
-            <div className="w-14 h-14 rounded-2xl bg-[var(--accent-soft)] flex items-center justify-center">
-              <Icon name="bolt" size={24} className="opacity-60" />
-            </div>
-            <p className="text-[var(--text-secondary)] text-sm">{t('provider.empty')}</p>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowForm(true)}
-                className="h-9 px-4 rounded-lg btn-primary text-[13px] font-medium transition-colors"
-              >
-                {t('provider.add')}
-              </button>
-              <button
-                onClick={handleImportFromConfig}
-                disabled={importing}
-                title={t('provider.importHint')}
-                className="h-9 px-4 rounded-lg border border-[var(--border)] text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
-              >
-                {importing ? t('provider.importing') : t('provider.importFromConfig')}
-              </button>
-            </div>
-            <p className="text-[10px] text-[var(--text-muted)] max-w-[380px]">{t('provider.importHint')}</p>
-          </div>
+          <EmptyState
+            icon="bolt"
+            title={t('provider.empty')}
+            description={t('provider.importHint')}
+            action={
+              <>
+                <Button variant="primary" onClick={() => setShowForm(true)}>
+                  {t('provider.add')}
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={handleImportFromConfig}
+                  loading={importing}
+                  title={t('provider.importHint')}
+                >
+                  {importing ? t('provider.importing') : t('provider.importFromConfig')}
+                </Button>
+              </>
+            }
+          />
         )}
         {providers.map((p, pIdx) => (
           <div
@@ -1054,17 +1053,17 @@ export default function ProvidersPage() {
             <div className="flex items-start justify-between gap-3">
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-medium text-[13.5px]">{p.name}</span>
+                  <span className="font-medium text-[length:var(--app-text-md)]">{p.name}</span>
                   {p.is_active && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--success)]/15 text-[var(--success)] font-medium">
+                    <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--success)]/15 text-[var(--success)] font-medium">
                       {t('provider.active')}
                     </span>
                   )}
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--bg-card)] text-[var(--text-muted)] font-mono">
+                  <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--bg-card)] text-[var(--text-muted)] font-mono">
                     {p.provider_type}
                   </span>
                   {p.protocol !== 'openai' && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono">
+                    <span className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono">
                       {p.protocol}
                     </span>
                   )}
@@ -1072,7 +1071,7 @@ export default function ProvidersPage() {
                 <p className="text-xs font-mono text-[var(--text-secondary)] mt-1 break-all">{p.base_url}</p>
                 {/* Auto 池三态：不参与 / 仅主对话 / 主对话+杂活 */}
                 <div className="flex items-center gap-1.5 mt-1.5">
-                  <span className="text-[10px] text-[var(--text-muted)]">{t('provider.autoPool')}</span>
+                  <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.autoPool')}</span>
                   <div className="flex rounded-md border border-[var(--border)] overflow-hidden">
                     {(
                       [
@@ -1084,7 +1083,7 @@ export default function ProvidersPage() {
                       <button
                         key={mode}
                         onClick={() => void updateProvider(p.id, { auto_pool_mode: mode }).then(load).catch((e) => console.error(e))}
-                        className={`px-2 py-0.5 text-[10px] transition-colors ${
+                        className={`px-2 py-0.5 text-[length:var(--app-text-2xs)] transition-colors ${
                           p.auto_pool_mode === mode
                             ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                             : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -1100,7 +1099,7 @@ export default function ProvidersPage() {
                     {p.endpoints.map((ep) => (
                       <span
                         key={`${ep.protocol}-${ep.base_url}`}
-                        className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)]/60 text-[var(--text-secondary)] font-mono"
+                        className="text-[length:var(--app-text-2xs)] px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)]/60 text-[var(--text-secondary)] font-mono"
                       >
                         {ep.protocol}: {ep.base_url}
                       </span>
@@ -1114,7 +1113,7 @@ export default function ProvidersPage() {
                       <span
                         key={m.id}
                         title={`${m.model_id}${m.enabled ? '' : `（${t('provider.modelDisabled')}）`}`}
-                        className={`group/model flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-md font-mono transition-colors ${
+                        className={`group/model flex items-center gap-1 text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded-md font-mono transition-colors ${
                           m.is_default
                             ? 'bg-[var(--accent-soft)] text-[var(--accent)] border border-[var(--accent)]/20'
                             : 'bg-[var(--bg-card)] text-[var(--text-muted)]'
@@ -1128,10 +1127,10 @@ export default function ProvidersPage() {
                           ★
                         </button>
                         <span className={!m.enabled ? 'line-through decoration-1' : ''}>{m.model_id}</span>
-                        <span className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80">{modalityShort(m.input_modalities, t)}</span>
+                        <span className="text-[length:var(--app-text-micro)] px-1 rounded bg-[var(--bg-primary)]/80">{modalityShort(m.input_modalities, t)}</span>
                         {m.context_limit > 0 && (
                           <span
-                            className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80 tnum"
+                            className="text-[length:var(--app-text-micro)] px-1 rounded bg-[var(--bg-primary)]/80 tnum"
                             title={`${t('provider.modelCtx')}: ${m.context_limit}`}
                           >
                             {fmtCtx(m.context_limit)}
@@ -1142,7 +1141,7 @@ export default function ProvidersPage() {
                             onClick={() => moveMainModel(p, m, -1)}
                             disabled={m.is_default || idx === 0}
                             title={t('provider.modelUp')}
-                            className="text-[8px] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
+                            className="text-[length:var(--app-text-micro)] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
                           >
                             ▲
                           </button>
@@ -1150,7 +1149,7 @@ export default function ProvidersPage() {
                             onClick={() => moveMainModel(p, m, 1)}
                             disabled={m.is_default || idx === arr.length - 1}
                             title={t('provider.modelDown')}
-                            className="text-[8px] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
+                            className="text-[length:var(--app-text-micro)] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
                           >
                             ▼
                           </button>
@@ -1166,7 +1165,7 @@ export default function ProvidersPage() {
                 {syncResults[p.id] && (
                   <div className="mt-2.5 rounded-xl border border-[var(--border)] bg-[var(--bg-card)]/60 px-3 py-2.5 space-y-2 animate-fade-in-up">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-[11px] font-medium text-[var(--text-secondary)]">
+                      <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)]">
                         {syncResults[p.id].error
                           ? t('provider.syncFailed')
                           : t('provider.syncDone')}
@@ -1175,19 +1174,19 @@ export default function ProvidersPage() {
                         <button
                           onClick={() => handleSync(p)}
                           disabled={syncingId !== null}
-                          className="text-[10px] px-2 py-0.5 border border-[var(--border)] rounded-md text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
+                          className="text-[length:var(--app-text-2xs)] px-2 py-0.5 border border-[var(--border)] rounded-md text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
                         >
                           {t('provider.syncRetry')}
                         </button>
                       )}
                     </div>
                     {syncResults[p.id].error ? (
-                      <p className="text-[10.5px] text-[var(--danger)] font-mono break-all">
+                      <p className="text-[length:var(--app-text-xs)] text-[var(--danger)] font-mono break-all">
                         {t('provider.syncError', { error: syncResults[p.id].error })}
                       </p>
                     ) : (
                       <>
-                        <p className="text-[10.5px] text-[var(--text-muted)]">
+                        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
                           {t('provider.syncSummary', {
                             remote: syncResults[p.id].remote_models.length,
                             local: modelsMap[p.id]?.length ?? 0,
@@ -1195,7 +1194,7 @@ export default function ProvidersPage() {
                         </p>
                         {/* 排序/筛选：免费优先（默认）/ 价格升序 / 平台顺序；可只看免费 */}
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-[10px] text-[var(--text-muted)]">{t('provider.syncSort')}</span>
+                          <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.syncSort')}</span>
                           <div className="flex rounded-md border border-[var(--border)] overflow-hidden">
                             {(
                               [
@@ -1207,7 +1206,7 @@ export default function ProvidersPage() {
                               <button
                                 key={key}
                                 onClick={() => setSyncSort(key)}
-                                className={`px-2 py-0.5 text-[10px] transition-colors ${
+                                className={`px-2 py-0.5 text-[length:var(--app-text-2xs)] transition-colors ${
                                   syncSort === key
                                     ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                                     : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -1217,7 +1216,7 @@ export default function ProvidersPage() {
                               </button>
                             ))}
                           </div>
-                          <label className="flex items-center gap-1 text-[10px] text-[var(--text-muted)] cursor-pointer select-none">
+                          <label className="flex items-center gap-1 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] cursor-pointer select-none">
                             <input
                               type="checkbox"
                               checked={syncFreeOnly}
@@ -1230,27 +1229,27 @@ export default function ProvidersPage() {
                         {/* 失效模型：默认模型等旧配置，可移除 */}
                         <div className="space-y-1">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-[10.5px] text-[var(--warning)]">
+                            <span className="text-[length:var(--app-text-xs)] text-[var(--warning)]">
                               {t('provider.syncMissing')}（{syncResults[p.id].missing.length}）
                             </span>
                             {syncResults[p.id].missing.length > 0 && (
                               <button
                                 onClick={() => removeAllMissing(p)}
                                 disabled={syncBusy['__all_' + p.id] === 'remove'}
-                                className="text-[10px] px-2 py-0.5 border border-[var(--danger)]/30 text-[var(--danger)] rounded-md hover:bg-[var(--danger)] hover:text-white transition-colors disabled:opacity-50"
+                                className="text-[length:var(--app-text-2xs)] px-2 py-0.5 border border-[var(--danger)]/30 text-[var(--danger)] rounded-md hover:bg-[var(--danger)] hover:text-white transition-colors disabled:opacity-50"
                               >
                                 {syncBusy['__all_' + p.id] === 'remove' ? t('provider.syncBusy') : t('provider.syncRemoveAll')}
                               </button>
                             )}
                           </div>
                           {syncResults[p.id].missing.length === 0 ? (
-                            <p className="text-[10.5px] text-[var(--text-muted)] italic">{t('provider.syncMissingEmpty')}</p>
+                            <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] italic">{t('provider.syncMissingEmpty')}</p>
                           ) : (
                             <div className="flex gap-1.5 flex-wrap">
                               {syncResults[p.id].missing.map((modelId) => (
                                 <span
                                   key={modelId}
-                                  className="group flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[var(--danger)]/10 border border-[var(--danger)]/20 text-[10.5px] font-mono text-[var(--danger)]"
+                                  className="group flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[var(--danger)]/10 border border-[var(--danger)]/20 text-[length:var(--app-text-xs)] font-mono text-[var(--danger)]"
                                 >
                                   <span className="line-through decoration-1">{modelId}</span>
                                   <button
@@ -1270,7 +1269,7 @@ export default function ProvidersPage() {
                         {/* 新增模型：平台有、本地未配置 */}
                         <div className="space-y-1">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-[10.5px] text-[var(--success)]">
+                            <span className="text-[length:var(--app-text-xs)] text-[var(--success)]">
                               {t('provider.syncNew')}（
                               {sortRemote(syncResults[p.id].new_models, syncSort).filter((m) => !syncFreeOnly || m.free).length}
                               ）
@@ -1279,14 +1278,14 @@ export default function ProvidersPage() {
                               <button
                                 onClick={() => addAllNew(p)}
                                 disabled={syncBusy['__all_' + p.id] === 'add'}
-                                className="text-[10px] px-2 py-0.5 border border-[var(--success)]/30 text-[var(--success)] rounded-md hover:bg-[var(--success)] hover:text-white transition-colors disabled:opacity-50"
+                                className="text-[length:var(--app-text-2xs)] px-2 py-0.5 border border-[var(--success)]/30 text-[var(--success)] rounded-md hover:bg-[var(--success)] hover:text-white transition-colors disabled:opacity-50"
                               >
                                 {syncBusy['__all_' + p.id] === 'add' ? t('provider.syncBusy') : t('provider.syncAddAll')}
                               </button>
                             )}
                           </div>
                           {sortRemote(syncResults[p.id].new_models, syncSort).filter((m) => !syncFreeOnly || m.free).length === 0 ? (
-                            <p className="text-[10.5px] text-[var(--text-muted)] italic">{t('provider.syncNewEmpty')}</p>
+                            <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] italic">{t('provider.syncNewEmpty')}</p>
                           ) : (
                             <div className="flex gap-1.5 flex-wrap max-h-24 overflow-y-auto">
                               {sortRemote(syncResults[p.id].new_models, syncSort)
@@ -1295,15 +1294,15 @@ export default function ProvidersPage() {
                                   <span
                                     key={m.id}
                                     title={`${m.id} · ${t('provider.modelCtx')} ${fmtCtx(m.context_length)} · ${fmtPrice(m.input_price)}/in · ${fmtPrice(m.output_price)}/out`}
-                                    className="group flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[var(--success)]/10 border border-[var(--success)]/20 text-[10.5px] font-mono text-[var(--success)]"
+                                    className="group flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[var(--success)]/10 border border-[var(--success)]/20 text-[length:var(--app-text-xs)] font-mono text-[var(--success)]"
                                   >
                                     {m.id}
                                     {m.free && (
-                                      <span className="text-[8px] px-1 py-px rounded bg-[var(--success)] text-white font-bold leading-none">
+                                      <span className="text-[length:var(--app-text-micro)] px-1 py-px rounded bg-[var(--success)] text-white font-bold leading-none">
                                         FREE
                                       </span>
                                     )}
-                                    <span className="text-[9px] text-[var(--text-muted)]/70">{fmtCtx(m.context_length)}</span>
+                                    <span className="text-[length:var(--app-text-micro)] text-[var(--text-muted)]/70">{fmtCtx(m.context_length)}</span>
                                     <button
                                       onClick={() => addSyncModel(p, m)}
                                       disabled={syncBusy[m.id] === 'add'}
@@ -1325,22 +1324,22 @@ export default function ProvidersPage() {
                 {/* 编辑面板 */}
                 {editingId === p.id && (
                   <div className="mt-3 pt-3 border-t border-[var(--border)] space-y-3 animate-fade-in-up">
-                    <p className="text-[11px] text-[var(--text-muted)]">{t('provider.editHint')}</p>
+                    <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.editHint')}</p>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-[var(--text-muted)]">{t('provider.name')}</label>
+                        <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.name')}</label>
                         <input
                           value={editForm.name}
                           onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
-                          className="w-full h-8 px-3 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                          className="w-full h-8 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
                         />
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-[var(--text-muted)]">{t('provider.protocol')}</label>
+                        <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.protocol')}</label>
                         <select
                           value={editForm.protocol}
                           onChange={(e) => setEditForm({ ...editForm, protocol: e.target.value })}
-                          className="w-full h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                          className="w-full h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
                         >
                           <option value="openai">{t('provider.protoOpenai')}</option>
                           <option value="anthropic">{t('provider.protoAnthropic')}</option>
@@ -1348,22 +1347,22 @@ export default function ProvidersPage() {
                         </select>
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-[var(--text-muted)]">{t('provider.baseUrl')}</label>
+                        <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.baseUrl')}</label>
                         <input
                           value={editForm.base_url}
                           onChange={(e) => setEditForm({ ...editForm, base_url: e.target.value })}
                           placeholder="https://api.example.com/v1"
-                          className="w-full h-8 px-3 modern-card rounded-lg text-[12px] font-mono text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                          className="w-full h-8 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] font-mono text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
                         />
                       </div>
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-[var(--text-muted)]">{t('provider.apiKey')}</label>
+                        <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.apiKey')}</label>
                         <input
                           type="password"
                           value={editForm.api_key}
                           onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
                           placeholder={t('provider.apiKeyPlaceholder')}
-                          className="w-full h-8 px-3 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                          className="w-full h-8 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
                         />
                       </div>
                     </div>
@@ -1374,12 +1373,12 @@ export default function ProvidersPage() {
                     />
                     {/* 模型管理：chip 含启用开关与类型徽标 */}
                     <div className="space-y-1.5">
-                      <label className="text-[11px] text-[var(--text-muted)]">{t('provider.models')}</label>
+                      <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('provider.models')}</label>
                       <div className="flex gap-1.5 flex-wrap items-center">
                         {sortModels(editModels).map((m, idx, arr) => (
                           <span
                             key={m.id}
-                            className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition-colors ${
+                            className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[length:var(--app-text-xs)] font-mono transition-colors ${
                               m.enabled
                                 ? 'bg-[var(--accent-soft)] border-[var(--accent)]/20 text-[var(--text-primary)]'
                                 : 'modern-card-[var(--border)] text-[var(--text-muted)] opacity-60'
@@ -1389,7 +1388,7 @@ export default function ProvidersPage() {
                             <button
                               onClick={() => toggleEditModel(m)}
                               title={m.enabled ? t('provider.modelDisable') : t('provider.modelEnable')}
-                              className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center text-[8px] transition-colors ${
+                              className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center text-[length:var(--app-text-micro)] transition-colors ${
                                 m.enabled
                                   ? 'border-[var(--success)] text-[var(--success)]'
                                   : 'border-[var(--text-muted)] text-[var(--text-muted)]'
@@ -1398,12 +1397,12 @@ export default function ProvidersPage() {
                               {m.enabled ? '●' : '○'}
                             </button>
                             <span className={m.enabled ? '' : 'line-through decoration-1'}>{m.model_id}</span>
-                            <span className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80">
+                            <span className="text-[length:var(--app-text-micro)] px-1 rounded bg-[var(--bg-primary)]/80">
                               {modalityShort(m.input_modalities, t)}
                             </span>
                             {m.context_limit > 0 && (
                               <span
-                                className="text-[9px] px-1 rounded bg-[var(--bg-primary)]/80 tnum"
+                                className="text-[length:var(--app-text-micro)] px-1 rounded bg-[var(--bg-primary)]/80 tnum"
                                 title={`${t('provider.modelCtx')}: ${m.context_limit}`}
                               >
                                 {fmtCtx(m.context_limit)}
@@ -1422,7 +1421,7 @@ export default function ProvidersPage() {
                                 onClick={() => moveEditModel(m, -1)}
                                 disabled={m.is_default || idx === 0}
                                 title={t('provider.modelUp')}
-                                className="text-[9px] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
+                                className="text-[length:var(--app-text-micro)] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
                               >
                                 ▲
                               </button>
@@ -1430,7 +1429,7 @@ export default function ProvidersPage() {
                                 onClick={() => moveEditModel(m, 1)}
                                 disabled={m.is_default || idx === arr.length - 1}
                                 title={t('provider.modelDown')}
-                                className="text-[9px] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
+                                className="text-[length:var(--app-text-micro)] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
                               >
                                 ▼
                               </button>
@@ -1455,7 +1454,7 @@ export default function ProvidersPage() {
                               addEditModel()
                             }
                           }}
-                          className="h-7 px-3 flex-1 min-w-40 modern-card border-dashed border-[var(--border)] rounded-lg text-[11px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                          className="h-7 px-3 flex-1 min-w-40 modern-card border-dashed border-[var(--border)] rounded-lg text-[length:var(--app-text-xs)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                         />
                       </div>
                       {/* 类型选择：预设单选 + 输入/输出模态多选（仅作用于「即将添加的新模型」，先选类型再按 Enter 添加） */}
@@ -1468,14 +1467,14 @@ export default function ProvidersPage() {
                       />
                       {/* 新建模型的上下文窗口 / 输出上限（与模态选择器同样只作用于「即将添加的新模型」） */}
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelDefaults')}</span>
+                        <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelDefaults')}</span>
                         <input
                           type="text"
                           inputMode="numeric"
                           placeholder={t('provider.modelCtxPh')}
                           value={editCtx}
                           onChange={(e) => setEditCtx(e.target.value)}
-                          className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                          className="w-28 h-7 px-2 modern-card rounded-lg text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                         />
                         <input
                           type="text"
@@ -1483,14 +1482,14 @@ export default function ProvidersPage() {
                           placeholder={t('provider.modelOutPh')}
                           value={editOut}
                           onChange={(e) => setEditOut(e.target.value)}
-                          className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                          className="w-28 h-7 px-2 modern-card rounded-lg text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                         />
                       </div>
-                      <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
+                      <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
                       {/* 已有模型的类型编辑：点击 chip 上的 ✎ 打开 */}
                       {editTypeModel && (
                         <div className="rounded-xl border border-[var(--accent)]/30 bg-[var(--bg-card)]/60 px-3 py-2.5 space-y-2 animate-fade-in-up">
-                          <div className="text-[10.5px] font-medium text-[var(--accent)]">
+                          <div className="text-[length:var(--app-text-xs)] font-medium text-[var(--accent)]">
                             {t('provider.modelEditType')}: {editTypeModel.model_id}
                           </div>
                           <ModalityPicker
@@ -1502,36 +1501,36 @@ export default function ProvidersPage() {
                           />
                           {/* 已有模型的上下文窗口 / 输出上限（随类型一起保存） */}
                           <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelCtx')}</span>
+                            <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelCtx')}</span>
                             <input
                               type="text"
                               inputMode="numeric"
                               placeholder={t('provider.modelCtxPh')}
                               value={editTypeCtx}
                               onChange={(e) => setEditTypeCtx(e.target.value)}
-                              className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                              className="w-28 h-7 px-2 modern-card rounded-lg text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                             />
-                            <span className="text-[10px] text-[var(--text-muted)]">{t('provider.modelOut')}</span>
+                            <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelOut')}</span>
                             <input
                               type="text"
                               inputMode="numeric"
                               placeholder={t('provider.modelOutPh')}
                               value={editTypeOutLimit}
                               onChange={(e) => setEditTypeOutLimit(e.target.value)}
-                              className="w-28 h-7 px-2 modern-card rounded-lg text-[11px] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                              className="w-28 h-7 px-2 modern-card rounded-lg text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
                             />
                           </div>
-                          <p className="text-[10px] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
+                          <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('provider.modelTokenHint')}</p>
                           <div className="flex items-center gap-2">
                             <button
                               onClick={saveEditType}
-                              className="h-7 px-3 text-[11px] bg-[var(--accent)] text-white rounded-lg hover:opacity-90 transition-opacity"
+                              className="h-7 px-3 text-[length:var(--app-text-xs)] bg-[var(--accent)] text-white rounded-lg hover:opacity-90 transition-opacity"
                             >
                               {t('provider.typeSave')}
                             </button>
                             <button
                               onClick={() => setEditTypeModel(null)}
-                              className="h-7 px-3 text-[11px] border border-[var(--border)] rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                              className="h-7 px-3 text-[length:var(--app-text-xs)] border border-[var(--border)] rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                             >
                               {t('provider.cancel')}
                             </button>
@@ -1544,13 +1543,13 @@ export default function ProvidersPage() {
                       <button
                         onClick={() => saveEdit(p.id)}
                         disabled={editSaving}
-                        className="h-8 px-4 text-[12px] bg-[var(--success)] text-white rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50"
+                        className="h-8 px-4 text-[length:var(--app-text-sm)] bg-[var(--success)] text-white rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50"
                       >
                         {editSaving ? t('provider.saving') : t('provider.saveEdit')}
                       </button>
                       <button
                         onClick={() => setEditingId(null)}
-                        className="h-8 px-3 text-[12px] border border-[var(--border)] rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                        className="h-8 px-3 text-[length:var(--app-text-sm)] border border-[var(--border)] rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         {t('provider.cancel')}
                       </button>
@@ -1565,7 +1564,7 @@ export default function ProvidersPage() {
                     onClick={() => moveProvider(p, -1)}
                     disabled={p.is_active || pIdx === 0}
                     title={t('provider.providerUp')}
-                    className="text-[9px] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
+                    className="text-[length:var(--app-text-micro)] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
                   >
                     ▲
                   </button>
@@ -1573,7 +1572,7 @@ export default function ProvidersPage() {
                     onClick={() => moveProvider(p, 1)}
                     disabled={p.is_active || pIdx === providers.length - 1}
                     title={t('provider.providerDown')}
-                    className="text-[9px] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
+                    className="text-[length:var(--app-text-micro)] leading-none text-[var(--text-muted)] hover:text-[var(--accent)] disabled:opacity-20 disabled:hover:text-[var(--text-muted)] transition-colors"
                   >
                     ▼
                   </button>
@@ -1582,7 +1581,7 @@ export default function ProvidersPage() {
                   onClick={() => handleSync(p)}
                   disabled={syncingId !== null}
                   title={t('provider.sync')}
-                  className={`h-7 px-2.5 text-[11px] border rounded-lg transition-colors ${
+                  className={`h-7 px-2.5 text-[length:var(--app-text-xs)] border rounded-lg transition-colors ${
                     syncingId === p.id
                       ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)] animate-pulse'
                       : 'border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -1602,13 +1601,13 @@ export default function ProvidersPage() {
                 </button>
                 <button
                   onClick={() => handleTest(p.id)}
-                  className="h-7 px-2.5 text-[11px] border border-[var(--border)] rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
+                  className="h-7 px-2.5 text-[length:var(--app-text-xs)] border border-[var(--border)] rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
                 >
                   {t('provider.test')}
                 </button>
                 <button
                   onClick={() => (editingId === p.id ? setEditingId(null) : startEdit(p))}
-                  className={`h-7 px-2.5 text-[11px] border rounded-lg transition-colors ${
+                  className={`h-7 px-2.5 text-[length:var(--app-text-xs)] border rounded-lg transition-colors ${
                     editingId === p.id
                       ? 'border-[var(--accent)] text-[var(--accent)]'
                       : 'border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -1619,14 +1618,14 @@ export default function ProvidersPage() {
                 {!p.is_active && (
                   <button
                     onClick={() => handleSwitch(p.id)}
-                    className="h-7 px-2.5 text-[11px] btn-primary rounded-lg transition-colors"
+                    className="h-7 px-2.5 text-[length:var(--app-text-xs)] btn-primary rounded-lg transition-colors"
                   >
                     {t('provider.switch')}
                   </button>
                 )}
                 <button
                   onClick={() => handleDelete(p.id)}
-                  className="h-7 px-2.5 text-[11px] border border-[var(--danger)]/30 text-[var(--danger)] rounded-lg hover:bg-[var(--danger)] hover:text-white transition-colors"
+                  className="h-7 px-2.5 text-[length:var(--app-text-xs)] border border-[var(--danger)]/30 text-[var(--danger)] rounded-lg hover:bg-[var(--danger)] hover:text-white transition-colors"
                 >
                   {t('provider.delete')}
                 </button>

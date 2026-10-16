@@ -315,7 +315,7 @@ export default function OhpmPage() {
       <div className="modern-card rounded-lg p-4 mb-3">
         <div className="flex items-center gap-3 flex-wrap">
           <div
-            className={`w-3 h-3 rounded-full ${status && status.total > 0 ? 'bg-[var(--success)]' : 'bg-[var(--muted)]'} shrink-0`}
+            className={`w-3 h-3 rounded-full ${status && status.total > 0 ? 'bg-[var(--success)]' : 'bg-[var(--text-muted)]'} shrink-0`}
           />
           <span className="text-xs text-[var(--text-secondary)]">
             {status && status.total > 0
@@ -351,7 +351,7 @@ export default function OhpmPage() {
             <div className="flex items-center gap-2 mb-2">
               <span className="text-xs font-medium text-[var(--text-secondary)]">{t('ohpm.catTitle')}</span>
               {cat && subCats.length > 0 && (
-                <span className="text-[10px] text-[var(--text-muted)]">{t('ohpm.catHint')}</span>
+                <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('ohpm.catHint')}</span>
               )}
             </div>
             <div className="flex flex-wrap gap-1.5">
@@ -384,7 +384,7 @@ export default function OhpmPage() {
               <div className="flex flex-wrap gap-1.5 mt-2.5 pt-2.5 border-t border-[var(--border)]">
                 <button
                   onClick={() => pickSub(null)}
-                  className={`h-6 px-2 rounded-full text-[11px] transition-colors border ${
+                  className={`h-6 px-2 rounded-full text-[length:var(--app-text-xs)] transition-colors border ${
                     sub === null
                       ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]'
                       : 'border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--accent)]/50'
@@ -397,7 +397,7 @@ export default function OhpmPage() {
                     key={c.name_cn}
                     onClick={() => pickSub(c.name_cn)}
                     title={c.name_en || c.name_cn}
-                    className={`h-6 px-2 rounded-full text-[11px] transition-colors border ${
+                    className={`h-6 px-2 rounded-full text-[length:var(--app-text-xs)] transition-colors border ${
                       sub === c.name_cn
                         ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]'
                         : 'border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--accent)]/50'
@@ -439,7 +439,7 @@ export default function OhpmPage() {
                 </button>
               )}
             </div>
-            <p className="text-[10px] text-[var(--text-muted)] mt-2">{t('ohpm.openHint')}</p>
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-2">{t('ohpm.openHint')}</p>
           </div>
 
           {/* 结果列表 */}
@@ -447,7 +447,7 @@ export default function OhpmPage() {
             <div className="flex items-center gap-2 mb-2 flex-wrap">
               <span className="text-xs font-medium text-[var(--text-secondary)]">{scopeTitle}</span>
               {pkgs && pkgs.length > 0 && (
-                <span className="text-[10px] text-[var(--text-muted)]">
+                <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                   {mode === 'pages' && total != null
                     ? `(${total})`
                     : `(${pkgs.length}${total != null ? ` / ${total}` : ''})`}
@@ -459,25 +459,25 @@ export default function OhpmPage() {
                   <button
                     onClick={() => pickSort('down')}
                     title={t('ohpm.sortHint')}
-                    className={`h-6 px-2.5 text-[11px] transition-colors ${sort === 'down' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                    className={`h-6 px-2.5 text-[length:var(--app-text-xs)] transition-colors ${sort === 'down' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                   >
                     {t('ohpm.sortDown')}
                   </button>
                   <button
                     onClick={() => pickSort('likes')}
-                    className={`h-6 px-2.5 text-[11px] transition-colors border-l border-[var(--border)] ${sort === 'likes' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                    className={`h-6 px-2.5 text-[length:var(--app-text-xs)] transition-colors border-l border-[var(--border)] ${sort === 'likes' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                   >
                     {t('ohpm.sortLikes')}
                   </button>
                   <button
                     onClick={() => pickSort('popularity')}
-                    className={`h-6 px-2.5 text-[11px] transition-colors border-l border-[var(--border)] ${sort === 'popularity' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                    className={`h-6 px-2.5 text-[length:var(--app-text-xs)] transition-colors border-l border-[var(--border)] ${sort === 'popularity' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                   >
                     {t('ohpm.sortPopularity')}
                   </button>
                   <button
                     onClick={() => pickSort('latest')}
-                    className={`h-6 px-2.5 text-[11px] transition-colors border-l border-[var(--border)] ${sort === 'latest' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                    className={`h-6 px-2.5 text-[length:var(--app-text-xs)] transition-colors border-l border-[var(--border)] ${sort === 'latest' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                   >
                     {t('ohpm.sortLatest')}
                   </button>
@@ -485,7 +485,7 @@ export default function OhpmPage() {
                 <div className="flex rounded-lg border border-[var(--border)] overflow-hidden shrink-0">
                 <button
                   onClick={() => switchMode('more')}
-                  className={`h-6 px-2.5 text-[11px] transition-colors ${
+                  className={`h-6 px-2.5 text-[length:var(--app-text-xs)] transition-colors ${
                     mode === 'more'
                       ? 'bg-[var(--accent-soft)] text-[var(--accent)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
@@ -495,7 +495,7 @@ export default function OhpmPage() {
                 </button>
                 <button
                   onClick={() => switchMode('pages')}
-                  className={`h-6 px-2.5 text-[11px] transition-colors border-l border-[var(--border)] ${
+                  className={`h-6 px-2.5 text-[length:var(--app-text-xs)] transition-colors border-l border-[var(--border)] ${
                     mode === 'pages'
                       ? 'bg-[var(--accent-soft)] text-[var(--accent)]'
                       : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
@@ -531,29 +531,29 @@ export default function OhpmPage() {
                             <span className="flex-1 min-w-0 text-xs font-medium text-[var(--text-primary)] truncate" title={p.package_name}>
                               {highlight(p.package_name, qTrim)}
                             </span>
-                            <span className="shrink-0 text-[10px] text-[var(--text-muted)] font-mono">v{p.version}</span>
+                            <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] font-mono">v{p.version}</span>
                             {p.down_count_60d > 0 && (
-                              <span className="shrink-0 text-[10px] text-[var(--accent)]">⬇ {fmtDownloads(p.down_count_60d)}/60天</span>
+                              <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--accent)]">⬇ {fmtDownloads(p.down_count_60d)}/60天</span>
                             )}
                             {p.likes > 0 && (
-                              <span className="shrink-0 text-[10px] text-[var(--text-muted)]">❤ {p.likes}</span>
+                              <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">❤ {p.likes}</span>
                             )}
                             {p.author_name && (
-                              <span className="shrink-0 max-w-[90px] text-[10px] text-[var(--text-muted)] truncate">· {p.author_name}</span>
+                              <span className="shrink-0 max-w-[90px] text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate">· {p.author_name}</span>
                             )}
                             {p.license && (
                               <span
-                                className="shrink-0 max-w-[140px] truncate rounded px-1 py-0.5 text-[9px] font-mono bg-[var(--bg-hover)] text-[var(--text-secondary)]"
+                                className="shrink-0 max-w-[140px] truncate rounded px-1 py-0.5 text-[length:var(--app-text-micro)] font-mono bg-[var(--bg-hover)] text-[var(--text-secondary)]"
                                 title={`License: ${p.license}`}
                               >
                                 {p.license}
                               </span>
                             )}
                             {opening === p.package_name && (
-                              <span className="shrink-0 text-[10px] text-[var(--accent)]">{t('ohpm.opening')}</span>
+                              <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--accent)]">{t('ohpm.opening')}</span>
                             )}
                           </div>
-                          <div className="text-[10px] text-[var(--text-muted)] break-words whitespace-pre-line mt-0.5">
+                          <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] break-words whitespace-pre-line mt-0.5">
                             {catPath}
                             {p.description ? <> · {highlight(p.description, qTrim)}</> : ' · —'}
                           </div>
@@ -596,7 +596,7 @@ export default function OhpmPage() {
                           : t('ohpm.loadMore')}
                     </button>
                   ) : total != null ? (
-                    <p className="mt-3 text-center text-[10px] text-[var(--text-muted)]">
+                    <p className="mt-3 text-center text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                       {t('ohpm.allLoaded', { total })}
                     </p>
                   ) : null}

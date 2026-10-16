@@ -1,5 +1,26 @@
 @import "tailwindcss";
 
+/* 扫描范围收窄：排除 scripts/ 与 website/。
+   Tailwind v4 的自动 source 检测**按「文件」而非「扩展名」扫**——.gitignore 里的
+   __pycache__ 会被跳过，但 .py / .md 会被扫进去。而 scripts/check-font-sizes.py 的
+   docstring 与自测样例里写着 `text-[9px]`、`text-[12.5px]` 之类的字面量，
+   于是每次构建都会把 4 条**永远不会用到的**字号规则打进产物（实测 .text-\[9px\] /
+   \[11px\] / \[12\.5px\] / \[13px\]，约 90 字节）。
+
+   只排 scripts/ 不排 docs/：误包含的代价是多几十字节无用规则，
+   误排除的代价是界面上真的缺样式。后者严重得多，所以只排「绝不可能被渲染」的那一处。
+   （顺带一提：docs/ 里同类字面量仍会进产物，属已知且可接受的噪音。）
+
+   website/ 同理，但性质不同：那是**独立静态站**，有自己的 class 与 CSS，
+   根本不经过 Vite 打包。这一行是**预防性护栏**，不是当前在省字节——
+   官网现在用的全是自定义类名（wrap / card / shots…），Tailwind 本来就不会为它们生成规则，
+   所以加上这行时产物体积**一模一样**。
+   实测：往 website/index.html 里塞一个真正的 utility 类（`tracking-tight`），
+   去掉这行后产物多出 **114 字节 / 1 条规则**。数量随网站用到的 utility 类增长。
+   「实测无差异」不等于「这行没用」——护栏没被触发和护栏失效是两件事。 */
+@source not "../scripts";
+@source not "../website";
+
 /* ============ Tailwind 主题桥接 ============
    项目自有 token 一律用 --app- 前缀，再通过 @theme inline 映射回 Tailwind 命名空间，
    这样 rounded-lg / ease-out 等 utility 才会引用项目值而非 Tailwind 默认值。
@@ -73,15 +94,15 @@
   --danger: #f87171;
 
   /* 语义色阶：同 accent 一致，状态色也分多档 */
+  /* 注意这里**不再有** --success-500 / --warning-500 / --danger-500：
+     三者与 --success / --warning / --danger 逐字同值（暗色与亮色皆然），
+     属于「同一事实两个名字」，删掉（第十二批，由 check-css-vars.py 反向检查发现）。 */
   --success-50: rgba(52, 211, 153, 0.10);
   --success-100: rgba(52, 211, 153, 0.18);
-  --success-500: #34d399;
   --warning-50: rgba(251, 191, 36, 0.12);
   --warning-100: rgba(251, 191, 36, 0.22);
-  --warning-500: #fbbf24;
   --warning-600: #d97706;
   --danger-50: rgba(248, 113, 113, 0.10);
-  --danger-500: #f87171;
 
   /* 消息角色专用色（user / agent / system / tool） */
   --role-user: #5b8cff;
@@ -128,21 +149,65 @@
   --app-radius-xl: 10px;
   --app-radius-2xl: 12px;
 
-  /* 字号阶梯：用于收敛全库 9 / 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 13.5 / 14px
-     这些任意值。仅供 src/components/ui/ 消费，**不要**映射进 @theme 的 --text-*——
-     那会改掉全库 245 处裸 text-xs 与 111 处 text-sm 的含义。 */
-  --app-text-2xs: 10px;
-  --app-lh-2xs: 14px;
-  --app-text-xs: 11px;
-  --app-lh-xs: 16px;
-  --app-text-sm: 12px;
-  --app-lh-sm: 18px;
-  --app-text-md: 13px;
-  --app-lh-md: 20px;
-  --app-text-base: 14px;
-  --app-lh-base: 22px;
-  --app-text-lg: 16px;
-  --app-lh-lg: 24px;
+  /* 字号阶梯：全库字号的**唯一真源**。7 档，覆盖原先散落的
+     9 / 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 13.5 / 14 / 15 / 18px 共 12 种任意值。
+     （10.5→11、11.5→11、12.5→12、13.5→13、15→14、18→16、8→9，最大位移 0.5px。）
+
+     micro(9px) 是为设备诊断面板那批微型标签保留的——schema 版本号、能力标记、
+     影响面徽标这类内容在 9px 下仍可读，收到 10px 会开始换行并撑高密集表格。
+
+     **不要**映射进 @theme 的 --text-*——那是 Tailwind 的字号命名空间，
+     映射会改掉全库 265 处裸 text-xs 与 113 处 text-sm 的含义。
+
+     ## 为什么全部包在 calc() 里
+
+     每档乘上 --ui-font-scale，是为了让「设置 → 界面字号」这一个开关真的能改到全库。
+     在 2026-10-01 之前，这里是一堆裸 px，而全库 1238 处字号写的是
+     `text-[Npx]` 这样的字面量——**阶梯是装饰品**，改它没有任何界面反应。
+     那批字面量已全部改为 `text-[length:var(--app-text-xs)]` 形式，
+     改完之后本段才成为真正的单一真源。
+
+     行高同样跟随缩放：字号变大而行高不变，密集面板会立刻挤成一团。
+     --ui-font-scale 由 utils/fontScale.ts 写到 <html> 的行内样式上，
+     行内优先级高于本处的 :root 声明，所以改一处即全库生效。 */
+  --ui-font-scale: 1;
+  --app-text-micro: calc(9px * var(--ui-font-scale));
+  --app-lh-micro: calc(13px * var(--ui-font-scale));
+  --app-text-2xs: calc(10px * var(--ui-font-scale));
+  --app-lh-2xs: calc(14px * var(--ui-font-scale));
+  --app-text-xs: calc(11px * var(--ui-font-scale));
+  --app-lh-xs: calc(16px * var(--ui-font-scale));
+  --app-text-sm: calc(12px * var(--ui-font-scale));
+  --app-lh-sm: calc(18px * var(--ui-font-scale));
+  --app-text-md: calc(13px * var(--ui-font-scale));
+  --app-lh-md: calc(20px * var(--ui-font-scale));
+  --app-text-base: calc(14px * var(--ui-font-scale));
+  --app-lh-base: calc(22px * var(--ui-font-scale));
+  --app-text-lg: calc(16px * var(--ui-font-scale));
+  --app-lh-lg: calc(24px * var(--ui-font-scale));
+
+  /* Tailwind 命名字号档（--text-xs 等）也必须跟随缩放。
+     不做这一步的话，全库 377 处 text-xs/sm/lg/xl 在用户调大「界面字号」时纹丝不动，
+     而 1297 处 token 档全变了——同一个控件里两半文字不同步，等于只工作一半。
+
+     用**同样的字面值**重声明，而不是映射到上面的 --app-text-*：
+     --ui-font-scale=1 时逐档与 Tailwind 默认值完全相同 → 零观感变化；
+     而映射会把 247 处 text-xs 从 12px 拽到别的档，那是一次未预期的全库改动。
+
+     放在普通 :root 而非 @theme 块：unlayered 规则优先级高于 @import 生成的
+     @layer theme，不必赌 Tailwind 的输出顺序。字面值取自 Tailwind v4 默认主题。 */
+  --text-xs: calc(0.75rem * var(--ui-font-scale));
+  --text-xs--line-height: calc(1rem * var(--ui-font-scale));
+  --text-sm: calc(0.875rem * var(--ui-font-scale));
+  --text-sm--line-height: calc(1.25rem * var(--ui-font-scale));
+  --text-base: calc(1rem * var(--ui-font-scale));
+  --text-base--line-height: calc(1.5rem * var(--ui-font-scale));
+  --text-lg: calc(1.125rem * var(--ui-font-scale));
+  --text-lg--line-height: calc(1.75rem * var(--ui-font-scale));
+  --text-xl: calc(1.25rem * var(--ui-font-scale));
+  --text-xl--line-height: calc(1.75rem * var(--ui-font-scale));
+  --text-2xl: calc(1.5rem * var(--ui-font-scale));
+  --text-2xl--line-height: calc(2rem * var(--ui-font-scale));
 
   /* z-index 层级表。z-index 不是 Tailwind 命名空间，放进 @theme 会被 tree-shake，
      故留在 :root；组件消费方式：z-[var(--app-z-modal)]。
@@ -164,9 +229,13 @@
   --app-z-tooltip: 95;
   --app-z-devtools: 900;
 
-  /* 等宽数字：用于 token/时长/计数 */
+  /* 等宽字体：token 即可，不进 Tailwind 主题命名空间（避免注册出无用的 font-family utility） */
   --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
-  --tabular-nums: font-variant-numeric: tabular-nums;
+  /* 原先这里还有一行 `--tabular-nums: font-variant-numeric: tabular-nums;`，
+     它是**非法 CSS**：自定义属性的值里带了冒号加属性名，浏览器把整串当成值
+     （产物里原样出现 `--tabular-nums:font-variant-numeric: tabular-nums`）。
+     而且该 token 零消费——真正生效的是 .msg-timestamp / .tnum 上的
+     `font-variant-numeric: tabular-nums` 直接声明。第十二批删除。 */
 }
 
 [data-theme="light"] {
@@ -199,16 +268,13 @@
   --warning: #d97706;
   --danger: #dc2626;
 
-  /* 语义色阶（亮色） */
+  /* 语义色阶（亮色）—— 同暗色：-500 三档已删，理由见上方暗色块的注释 */
   --success-50: rgba(22, 163, 74, 0.08);
   --success-100: rgba(22, 163, 74, 0.14);
-  --success-500: #16a34a;
   --warning-50: rgba(217, 119, 6, 0.10);
   --warning-100: rgba(217, 119, 6, 0.18);
-  --warning-500: #d97706;
   --warning-600: #b45309;
   --danger-50: rgba(220, 38, 38, 0.08);
-  --danger-500: #dc2626;
 
   /* 消息角色专用色（亮色） */
   --role-user: #3b6ff5;
@@ -457,8 +523,74 @@ textarea,
   transition-timing-function: var(--app-ease-out);
 }
 
+/* ============ 动效降级：prefers-reduced-motion ============
+   前庭功能障碍用户开启系统「减少动态效果」后，平移/缩放/循环位移类动画会引发
+   恶心与眩晕。这不是可选项——商业软件的基本可访问性，也是 WCAG 2.3.3 的建议做法。
+
+   降级策略分三档，**不是**简单地 animation: none：
+   1. 位移/缩放类（淡入上移、弹窗入场、按钮按压、点状跳动、骨屏扫光）→ 去掉 transform，
+      保留淡入。元素仍然出现，只是不再从画外飞入——信息不丢。
+   2. 循环闪烁（流式光标、代码行高亮脉冲、任务完成脉冲）→ 停在静止帧。
+      光标改成常亮：它承载「正在流式输出」这个状态，不能直接消失。
+   3. 加载指示（.animate-spin）→ **保留**。它是进行中状态的唯一视觉证据，
+      去掉会让「还在跑」和「卡死了」无法区分。取而代之把它放慢到 1.6s，
+      降低闪烁频率。
+
+   放最后：这条规则的优先级要压得住前面所有动画声明，故不写进 @layer。 */
+@media (prefers-reduced-motion: reduce) {
+  /* 1. 位移与缩放：保留淡入，去掉 transform */
+  .animate-fade-in-up,
+  .animate-modal-in {
+    animation-name: fade-only;
+    animation-duration: 0.12s;
+  }
+  button:active:not(:disabled) {
+    transform: none;
+  }
+  .dot-bounce {
+    animation: none;
+    opacity: 1;
+  }
+  .shimmer::after {
+    animation: none;
+    opacity: 0;
+  }
+
+  /* 2. 循环闪烁：停在静止帧 */
+  .typing-cursor {
+    animation: none;
+    opacity: 1;
+  }
+  .msg-highlight,
+  .code-line-flash {
+    animation: none;
+  }
+  .code-line-flash {
+    background-color: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+
+  /* 3. 加载指示：保留但放慢 */
+  .animate-spin {
+    animation-duration: 1.6s;
+  }
+
+  /* 滚动容器：平滑滚动本身也是运动，改为瞬时到位 */
+  .chat-scroll,
+  .right-tabbar {
+    scroll-behavior: auto;
+  }
+}
+
+@keyframes fade-only {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* 按压反馈。0.97 → 0.98：0.97 在 24~28px 的密集工具栏上会造成近 1px 的跳动，
+   连续点按多个小按钮时整排控件像在抖。0.98 仍可感知「按下去了」，但位移减半。
+   尺寸大（≥32px）的主按钮不受影响，那里的弹性是有意为之。 */
 button:active:not(:disabled) {
-  transform: scale(0.97);
+  transform: scale(0.98);
 }
 
 /* 键盘焦点兜底。必须整段替换而不是追加：下面这些规则要保持「无层」，
@@ -888,8 +1020,6 @@ select:focus-visible {
   --hljs-attr: #ffa657;
   --hljs-builtin: #ffa657;
   --hljs-tag: #7ee787;
-  --hljs-meta: #79c0ff;
-  --hljs-var: #ffa657;
 }
 [data-theme='light'] {
   --code-bg: #f6f8fa;
@@ -904,9 +1034,10 @@ select:focus-visible {
   --hljs-attr: #953800;
   --hljs-builtin: #953800;
   --hljs-tag: #116329;
-  --hljs-meta: #0550ae;
-  --hljs-var: #953800;
 }
+/* --hljs-meta / --hljs-var 已在暗色块处一并删掉：
+   .hljs-meta 实际用的是 var(--hljs-builtin)，.hljs-variable 实际用的是
+   var(--hljs-attr) —— 这两个 token 从来没有规则消费过。 */
 /* 亮色主题代码块字号略大（白底阅读密度低），保持可读性 */
 [data-theme='light'] .md-codeblock-pre {
   font-size: 0.86em;
@@ -1105,7 +1236,7 @@ select:focus-visible {
   margin-left: -0.5em;
   border-radius: 6px;
   color: var(--text-secondary);
-  transition: background 0.12s, color 0.12s;
+  transition: background var(--app-motion-fast), color var(--app-motion-fast);
 }
 .md-codeblock-file-btn:hover {
   background: var(--bg-hover);
@@ -1135,7 +1266,7 @@ select:focus-visible {
   border-radius: 5px;
   white-space: pre;
   color: var(--text-secondary);
-  transition: background 0.12s;
+  transition: background var(--app-motion-fast);
 }
 .md-tree-line:hover {
   background: var(--accent-soft);
@@ -1196,7 +1327,7 @@ select:focus-visible {
   font: inherit;
   line-height: inherit;
   box-sizing: border-box;
-  transition: color 0.12s, opacity 0.12s;
+  transition: color var(--app-motion-fast), opacity var(--app-motion-fast);
 }
 .md-code-line-no-btn:hover {
   color: var(--accent);
@@ -1343,7 +1474,7 @@ select:focus-visible {
   border: 1px solid var(--border);
   color: var(--text-secondary);
   cursor: pointer;
-  transition: all 0.12s;
+  transition: all var(--app-motion-fast);
 }
 .md-mermaid-toolbar button:hover {
   color: var(--accent);
@@ -1528,7 +1659,7 @@ select:focus-visible {
 
 /* ============ 代码块增强：diff 增改行 / shell 错误告警 / 行 hover ============ */
 .md-code-line {
-  transition: background-color 0.12s ease;
+  transition: background-color var(--app-motion-fast) ease;
 }
 .md-code-line:hover {
   background: color-mix(in srgb, #ffffff 4%, transparent);

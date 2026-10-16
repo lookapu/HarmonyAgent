@@ -1,0 +1,83 @@
+{
+  "_comment": [
+    "「定义了但没有任何消费点」的自定义属性豁免表。",
+    "由 scripts/check-css-vars.py 的反向检查读取（对应 docs/UI_REFINEMENT_PLAN.md §6.21）。",
+    "",
+    "每条必须有 reason，且 **豁免受审**：token 一旦被接上，条目即过期并报红——",
+    "否则这张表会慢慢变成垃圾场，而没人知道哪一条早已名存实亡。",
+    "",
+    "什么样的 token 该进这张表：",
+    "  - 它属于一份**有文档的登记表/色阶**，删掉会让阶梯出现空洞（z-index、色阶）",
+    "  - 它在等一个**尚未做出的决策**（--app-lh-* 等待独立排版决策）",
+    "不该进表的：与其它 token 逐字同值的重复名、没有规则的残留——那些应当删掉。",
+    "本表建立时已删掉 6 个（3 个重复名 × 2 主题 + 2 个无规则 hljs × 2 主题 + 1 个值非法的）。"
+  ],
+
+  "--app-z-sticky": {
+    "reason": "z-index 不变量登记表。index.css 该块的注释已写明：z-* 不进 Tailwind 命名空间（会被 tree-shake），且刻意保留未使用的档位（如 --app-z-popover:80），避免将来新增层级时整条链要重新审计。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-z-panel": {
+    "reason": "同上：z-index 不变量登记表，11 档里刻意保留的未使用档位。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-z-dropdown": {
+    "reason": "同上：z-index 不变量登记表，刻意保留的未使用档位。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-z-drawer": {
+    "reason": "同上：z-index 不变量登记表，刻意保留的未使用档位。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-z-tooltip": {
+    "reason": "同上：z-index 不变量登记表，刻意保留的未使用档位。",
+    "lastReviewed": "2026-10-01"
+  },
+
+  "--app-lh-micro": {
+    "reason": "行高阶梯在等一次独立排版决策。**已实测否决「按字面接上」**：当前全站 line-height 是 normal（实测 13px→19.5px、11px→16.5px，即 1.5），而阶梯给 md 的是 1.538、base 1.571 —— 最常用的两档会比现状更松，与 P1-4 相反。详见 §6.20.1。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-lh-xs": {
+    "reason": "同上（阶梯值 1.455）。等排版决策，不接线。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-lh-md": {
+    "reason": "同上（阶梯值 1.538，高于现状 1.5 —— 接上会让正文变松）。等排版决策，不接线。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-lh-base": {
+    "reason": "同上（阶梯值 1.571，高于现状 1.5 —— 接上会让正文变松）。等排版决策，不接线。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-lh-lg": {
+    "reason": "同上（阶梯值 1.50）。等排版决策，不接线。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--app-lh-2xs": {
+    "reason": "同上（阶梯值 1.40）。等排版决策，不接线。",
+    "lastReviewed": "2026-10-01"
+  },
+
+  "--app-motion-slow": {
+    "reason": "动效阶梯完整性：fast / base 在用，slow 未用。三档一组，删掉 slow 会让阶梯出现空洞，日后想用「更慢」一档时又得重新定值。",
+    "lastReviewed": "2026-10-01"
+  },
+
+  "--accent-strong": {
+    "reason": "accent 变体族（hover / soft / glow / strong）的一员，前三者都在用。与 --accent-hover 在亮色下同值、暗色下不同，属刻意留的明度档。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--accent-50": {
+    "reason": "Accent 色阶的一档（50/100/500/600/700/900），index.css 该块有注释「状态用不同明度」。删掉会让色阶断档。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--warning-100": {
+    "reason": "语义色阶的一档（warning-50/100/600）。同 --accent-50 的理由。",
+    "lastReviewed": "2026-10-01"
+  },
+  "--role-agent-soft": {
+    "reason": "消息角色色四件套（user/agent/system/tool 的 -soft）之一，另外三个都在用。删掉会让角色色家族不完整。",
+    "lastReviewed": "2026-10-01"
+  }
+}

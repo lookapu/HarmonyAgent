@@ -49,17 +49,17 @@ export class ErrorBoundary extends Component<Props, State> {
           <div className="w-[560px] max-w-[92vw] rounded-2xl glass-card p-5 animate-modal-in">
             <div className="flex items-start gap-3 mb-3">
               <div className="w-9 h-9 rounded-lg bg-[var(--danger)]/15 text-[var(--danger)] flex items-center justify-center shrink-0">
-                <span className="text-[18px]">⚠️</span>
+                <span className="text-[length:var(--app-text-lg)]">⚠️</span>
               </div>
               <div className="flex-1 min-w-0">
-                <h2 className="text-[15px] font-semibold leading-tight">页面出现错误</h2>
-                <p className="text-[12px] text-[var(--text-muted)] mt-1 leading-relaxed">
+                <h2 className="text-[length:var(--app-text-base)] font-semibold leading-tight">页面出现错误</h2>
+                <p className="text-[length:var(--app-text-sm)] text-[var(--text-muted)] mt-1 leading-relaxed">
                   请复制下方错误信息并反馈。点击"重试"通常能恢复。
                 </p>
               </div>
             </div>
             <div className="rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] p-3 mb-3 max-h-[260px] overflow-y-auto">
-              <p className="text-[12.5px] font-mono text-[var(--danger)] break-all whitespace-pre-wrap leading-relaxed">
+              <p className="text-[length:var(--app-text-sm)] font-mono text-[var(--danger)] break-all whitespace-pre-wrap leading-relaxed">
                 {error.name}: {error.message}
               </p>
             </div>
@@ -73,13 +73,13 @@ export class ErrorBoundary extends Component<Props, State> {
                     // 剪贴板不可用 → 静默
                   }
                 }}
-                className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] hover:bg-[var(--bg-hover)] transition-colors"
+                className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 复制错误
               </button>
               <button
                 onClick={this.reset}
-                className="h-8 px-4 rounded-lg btn-primary text-[12px] font-medium transition-[color,background-color,border-color,opacity]"
+                className="h-8 px-4 rounded-lg btn-primary text-[length:var(--app-text-sm)] font-medium transition-[color,background-color,border-color,opacity]"
               >
                 重试
               </button>

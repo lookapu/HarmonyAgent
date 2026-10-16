@@ -84,7 +84,7 @@ export default function LanPanel() {
           className={`text-xs px-2 py-0.5 rounded-full ${
             status?.running
               ? 'bg-[var(--success)]/15 text-[var(--success)]'
-              : 'bg-[var(--bg-muted)] text-[var(--text-secondary)]'
+              : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'
           }`}
         >
           {status?.running ? t('config.lanRunning') : t('config.lanStopped')}
@@ -118,7 +118,7 @@ export default function LanPanel() {
         <button
           onClick={handleSavePort}
           disabled={status?.running || busy}
-          className="px-3 py-1.5 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-muted)] disabled:opacity-50"
+          className="px-3 py-1.5 border border-[var(--border)] rounded-lg text-xs hover:bg-[var(--bg-hover)] disabled:opacity-50"
         >
           {t('config.save')}
         </button>

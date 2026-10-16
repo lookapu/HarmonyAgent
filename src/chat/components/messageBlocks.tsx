@@ -103,9 +103,9 @@ export const ThinkingBlock = memo(function ThinkingBlock({ content, active }: { 
         <span className="thinking-block-icon">
           <Icon name="spark" size={11} />
         </span>
-        <span className="text-[11px] font-medium">{t('home.thinking')}</span>
+        <span className="text-[length:var(--app-text-xs)] font-medium">{t('home.thinking')}</span>
         {active && thinkElapsed > 0 && (
-          <span className="text-[10px] text-[var(--text-muted)] tabular-nums ml-1">{fmtElapsed(thinkElapsed)}</span>
+          <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] tabular-nums ml-1">{fmtElapsed(thinkElapsed)}</span>
         )}
         {!open && preview && <span className="thinking-block-preview">{preview}…</span>}
         <Icon name="chevron-right" size={12} className={`thinking-block-caret ${open ? 'rotate-90' : ''}`} />
@@ -282,17 +282,17 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
         title={t('home.modifiedFiles', { n: files.length })}
       >
         <Icon name="file" size={12} className="shrink-0 text-[var(--text-secondary)]" />
-        <span className="text-[11px] text-[var(--text-secondary)] font-medium">
+        <span className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)] font-medium">
           {t('home.modifiedFiles', { n: files.length })}
         </span>
         {stat && (stat.insertions > 0 || stat.deletions > 0) && (
-          <span className="text-[10px] tabular-nums shrink-0">
+          <span className="text-[length:var(--app-text-2xs)] tabular-nums shrink-0">
             <span className="text-[var(--success)]">+{stat.insertions}</span>
             <span className="text-[var(--danger)]"> −{stat.deletions}</span>
           </span>
         )}
         {canReview && accepted.size > 0 && (
-          <span className="text-[10px] px-1.5 py-px rounded bg-[var(--success)]/10 text-[var(--success)]">
+          <span className="text-[length:var(--app-text-2xs)] px-1.5 py-px rounded bg-[var(--success)]/10 text-[var(--success)]">
             {t('home.changesAccepted', { n: accepted.size })}
           </span>
         )}
@@ -305,7 +305,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
               setReviewOpen(true)
             }}
             title={t('home.reviewChanges')}
-            className="shrink-0 h-5 px-1.5 rounded-md text-[10px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
+            className="shrink-0 h-5 px-1.5 rounded-md text-[length:var(--app-text-2xs)] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1"
           >
             <Icon name="git-branch" size={10} />
             {t('home.reviewChanges')}
@@ -326,12 +326,12 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
                 placeholder={t('home.filterFiles')}
-                className="w-full h-6 px-2 rounded-md border border-[var(--border)] bg-[var(--bg-primary)] text-[10.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)]/50 transition-colors"
+                className="w-full h-6 px-2 rounded-md border border-[var(--border)] bg-[var(--bg-primary)] text-[length:var(--app-text-xs)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)]/50 transition-colors"
               />
             </div>
           )}
           {filteredFiles.length === 0 && filter && (
-            <div className="px-3 py-2 text-[10.5px] text-[var(--text-muted)] text-center">{t('home.noMatchFiles')}</div>
+            <div className="px-3 py-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] text-center">{t('home.noMatchFiles')}</div>
           )}
           {filteredFiles.map((p) => {
             const isAccepted = accepted.has(p)
@@ -347,7 +347,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                     title={copied === p ? t('home.copied') : `${t('home.copyPath')}：${p}`}
                   >
                     <Icon name="file" size={10} className="shrink-0 opacity-40" />
-                    <span className="flex-1 min-w-0 truncate text-[10.5px] font-mono text-[var(--text-secondary)]">{p}</span>
+                    <span className="flex-1 min-w-0 truncate text-[length:var(--app-text-xs)] font-mono text-[var(--text-secondary)]">{p}</span>
                     <Icon
                       name="copy"
                       size={10}
@@ -399,23 +399,23 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                     </span>
                   )}
                 </div>
-                {isReverted && <div className="text-[10px] text-[var(--danger)] mt-0.5 pl-4">{t('home.changeReverted')}</div>}
+                {isReverted && <div className="text-[length:var(--app-text-2xs)] text-[var(--danger)] mt-0.5 pl-4">{t('home.changeReverted')}</div>}
                 {diff && !isReverted && openDiffs.has(p) && (
-                  <pre className="mt-1 ml-4 mr-1 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] p-2 text-[10.5px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-40 overflow-y-auto">
+                  <pre className="mt-1 ml-4 mr-1 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] p-2 text-[length:var(--app-text-xs)] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-40 overflow-y-auto">
                     <DiffText text={diff} />
                   </pre>
                 )}
               </div>
             )
           })}
-          {errorMsg && <div className="px-3 py-1.5 text-[10.5px] text-[var(--danger)]">{errorMsg}</div>}
+          {errorMsg && <div className="px-3 py-1.5 text-[length:var(--app-text-xs)] text-[var(--danger)]">{errorMsg}</div>}
           {canReview && files.length > 1 && (
             <div className="flex items-center justify-end px-3 py-1.5 border-t border-[var(--border)]">
               <button
                 type="button"
                 onClick={acceptAll}
                 disabled={busy !== null}
-                className="h-6 px-2.5 rounded-md bg-[var(--success)]/12 text-[var(--success)] text-[10.5px] font-medium hover:bg-[var(--success)]/20 disabled:opacity-40 transition-colors"
+                className="h-6 px-2.5 rounded-md bg-[var(--success)]/12 text-[var(--success)] text-[length:var(--app-text-xs)] font-medium hover:bg-[var(--success)]/20 disabled:opacity-40 transition-colors"
               >
                 {busy === '__all__' ? t('home.changesAccepting') : t('home.acceptAllChanges')}
               </button>
@@ -440,10 +440,10 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                   <Icon name="git-branch" size={13} />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="text-[13px] font-medium truncate leading-tight">{t('home.reviewChanges')}</div>
-                  <div className="text-[10px] text-[var(--text-muted)] truncate">{t('home.reviewDesc')}</div>
+                  <div className="text-[length:var(--app-text-md)] font-medium truncate leading-tight">{t('home.reviewChanges')}</div>
+                  <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate">{t('home.reviewDesc')}</div>
                 </div>
-                <span className="shrink-0 text-[10px] text-[var(--text-muted)] tabular-nums bg-[var(--bg-card)] rounded-md px-2 py-1">
+                <span className="shrink-0 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] tabular-nums bg-[var(--bg-card)] rounded-md px-2 py-1">
                   {t('home.changesAccepted', { n: accepted.size })} / {files.length}
                 </span>
                 <button
@@ -472,7 +472,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                           title={t('home.viewDiff')}
                         >
                           <Icon name="file" size={11} className="shrink-0 opacity-40" />
-                          <span className="flex-1 min-w-0 truncate text-[11px] font-mono text-[var(--text-secondary)]">{p}</span>
+                          <span className="flex-1 min-w-0 truncate text-[length:var(--app-text-xs)] font-mono text-[var(--text-secondary)]">{p}</span>
                           <Icon
                             name="chevron-right"
                             size={10}
@@ -480,12 +480,12 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                           />
                         </button>
                         {isAccepted && (
-                          <span className="shrink-0 text-[9.5px] px-1.5 py-px rounded bg-[var(--success)]/10 text-[var(--success)]">
+                          <span className="shrink-0 text-[length:var(--app-text-micro)] px-1.5 py-px rounded bg-[var(--success)]/10 text-[var(--success)]">
                             {t('home.changeAccepted')}
                           </span>
                         )}
                         {isReverted && (
-                          <span className="shrink-0 text-[9.5px] px-1.5 py-px rounded bg-[var(--danger)]/10 text-[var(--danger)]">
+                          <span className="shrink-0 text-[length:var(--app-text-micro)] px-1.5 py-px rounded bg-[var(--danger)]/10 text-[var(--danger)]">
                             {t('home.changeReverted')}
                           </span>
                         )}
@@ -522,12 +522,12 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                       {diffOpen && !isReverted && (
                         <div className="px-3 pb-2">
                           {diffLoading === p ? (
-                            <div className="flex items-center gap-2 text-[10.5px] text-[var(--text-muted)] py-2">
+                            <div className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] py-2">
                               <span className="inline-block w-2.5 h-2.5 rounded-full border border-[var(--text-muted)] border-t-transparent animate-spin" />
                               {t('common.loading')}
                             </div>
                           ) : diff ? (
-                            <pre className="rounded-lg bg-[var(--bg-window)] border border-[var(--border)] p-2 text-[10.5px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-72 overflow-y-auto">
+                            <pre className="rounded-lg bg-[var(--bg-window)] border border-[var(--border)] p-2 text-[length:var(--app-text-xs)] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-72 overflow-y-auto">
                               <DiffText text={diff} />
                             </pre>
                           ) : null}
@@ -536,7 +536,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                     </div>
                   )
                 })}
-                {errorMsg && <div className="px-3 py-1.5 text-[10.5px] text-[var(--danger)]">{errorMsg}</div>}
+                {errorMsg && <div className="px-3 py-1.5 text-[length:var(--app-text-xs)] text-[var(--danger)]">{errorMsg}</div>}
               </div>
               {/* 底部：全部接受 */}
               {files.length > 1 && (
@@ -545,7 +545,7 @@ export const ModifiedFilesCard = memo(function ModifiedFilesCard({ files, projec
                     type="button"
                     onClick={acceptAll}
                     disabled={busy !== null}
-                    className="h-7 px-3.5 rounded-lg bg-[var(--success)]/12 text-[var(--success)] text-[11px] font-medium hover:bg-[var(--success)]/20 disabled:opacity-40 transition-colors"
+                    className="h-7 px-3.5 rounded-lg bg-[var(--success)]/12 text-[var(--success)] text-[length:var(--app-text-xs)] font-medium hover:bg-[var(--success)]/20 disabled:opacity-40 transition-colors"
                   >
                     {busy === '__all__' ? t('home.changesAccepting') : t('home.acceptAllChanges')}
                   </button>
@@ -629,7 +629,7 @@ export const StreamingMessage = memo(function StreamingMessage({
         <div className="flex items-center gap-2 mb-1.5">
           <span className="role-tag role-tag-agent">{t('home.agent')}</span>
           {active && (
-            <span className="text-[10px] text-[var(--text-muted)] flex items-center gap-1 tnum">
+            <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] flex items-center gap-1 tnum">
               <span className="inline-flex gap-0.5">
                 <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '0ms' }} />
                 <span className="w-1 h-1 rounded-full bg-[var(--role-agent)] animate-bounce" style={{ animationDelay: '150ms' }} />
@@ -725,22 +725,22 @@ export const ErrorCard = memo(function ErrorCard({
           <div className="flex items-center gap-2 flex-wrap">
             {kindLabel && (
               <span
-                className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md leading-none ${badgeClass}`}
+                className={`text-[length:var(--app-text-2xs)] font-medium px-1.5 py-0.5 rounded-md leading-none ${badgeClass}`}
               >
                 {kindLabel}
               </span>
             )}
             {detail?.statusCode && (
-              <span className="text-[10px] text-[var(--text-muted)] font-mono">
+              <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] font-mono">
                 HTTP {detail.statusCode}
               </span>
             )}
           </div>
-          <p className="text-[12px] font-semibold leading-snug mt-1" style={{ color }}>
+          <p className="text-[length:var(--app-text-sm)] font-semibold leading-snug mt-1" style={{ color }}>
             {detail ? detail.title : error.slice(0, 120)}
           </p>
           {hasDetail && !expanded && (
-            <p className="text-[11.5px] leading-snug text-[var(--text-muted)] mt-0.5 truncate">
+            <p className="text-[length:var(--app-text-xs)] leading-snug text-[var(--text-muted)] mt-0.5 truncate">
               {detail!.reason}
             </p>
           )}
@@ -750,9 +750,9 @@ export const ErrorCard = memo(function ErrorCard({
       {/* 可折叠详情区 */}
       {hasDetail && expanded && (
         <div className="px-3 pb-2 space-y-1 border-t border-[var(--border)]/40 pt-2">
-          <p className="text-[11.5px] break-all leading-relaxed text-[var(--text-secondary)]">{detail!.reason}</p>
+          <p className="text-[length:var(--app-text-xs)] break-all leading-relaxed text-[var(--text-secondary)]">{detail!.reason}</p>
           {detail!.suggestion && (
-            <p className="text-[11.5px] leading-relaxed text-[var(--text-muted)]">
+            <p className="text-[length:var(--app-text-xs)] leading-relaxed text-[var(--text-muted)]">
               {t('home.suggestion', { text: detail!.suggestion })}
             </p>
           )}
@@ -765,7 +765,7 @@ export const ErrorCard = memo(function ErrorCard({
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             <Icon name="chevron-right" size={10} className={`transition-transform ${expanded ? 'rotate-90' : ''}`} />
             {expanded ? t('home.errorCollapse') : t('home.errorExpand')}
@@ -774,7 +774,7 @@ export const ErrorCard = memo(function ErrorCard({
         <button
           type="button"
           onClick={handleCopy}
-          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
         >
           <Icon name={copied ? 'check' : 'copy'} size={11} />
           {copied ? t('home.errorCopied') : t('home.errorCopy')}
@@ -783,7 +783,7 @@ export const ErrorCard = memo(function ErrorCard({
           <button
             type="button"
             onClick={onViewLogs}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             <Icon name="health" size={11} />
             {t('home.errorViewLogs')}
@@ -792,7 +792,7 @@ export const ErrorCard = memo(function ErrorCard({
         {showRetry && (
           <button
             onClick={onRetry}
-            className="ml-auto flex items-center gap-1 h-7 px-3 rounded-lg text-white text-[11px] font-medium hover:opacity-90 active:scale-95 transition-[opacity,transform]"
+            className="ml-auto flex items-center gap-1 h-7 px-3 rounded-lg text-white text-[length:var(--app-text-xs)] font-medium hover:opacity-90 active:scale-95 transition-[opacity,transform]"
             style={{ backgroundColor: color }}
           >
             <Icon name="refresh" size={11} />
@@ -833,7 +833,7 @@ export const EmptyState = memo(function EmptyState({
         </div>
       </div>
       <h2 className="text-lg font-semibold">{t('home.welcome')}</h2>
-      <p className="text-[13px] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.welcomeDesc')}</p>
+      <p className="text-[length:var(--app-text-md)] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.welcomeDesc')}</p>
       {/* Button 基类的 shrink-0 在这里是承重墙：外层容器矮视口下会溢出，删了它 CTA 会被压到 21.5px（比一行文字还矮） */}
       <Button variant="primary" size="md" icon="plus" className="mt-7" onClick={onAdd}>
         {t('home.addProject')}
@@ -850,8 +850,8 @@ export const EmptyState = memo(function EmptyState({
               <div className="w-7 h-7 rounded-md bg-[var(--accent-soft)] flex items-center justify-center mb-1.5 group-hover:bg-[var(--accent)] transition-colors">
                 <Icon name={a.icon} size={13} className="group-hover:[filter:brightness(0)_invert(1)]!" />
               </div>
-              <div className="text-[12px] font-medium text-[var(--text-primary)]">{a.title}</div>
-              <div className="text-[10px] text-[var(--text-muted)] mt-0.5 leading-snug line-clamp-2">{a.desc}</div>
+              <div className="text-[length:var(--app-text-sm)] font-medium text-[var(--text-primary)]">{a.title}</div>
+              <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-0.5 leading-snug line-clamp-2">{a.desc}</div>
             </button>
           ))}
         </div>
@@ -913,7 +913,7 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
         </div>
       </div>
       <h2 className="text-lg font-semibold">{t('home.startNewChat')}</h2>
-      <p className="text-[13px] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.chatHint')}</p>
+      <p className="text-[length:var(--app-text-md)] text-[var(--text-secondary)] mt-1.5 max-w-sm leading-relaxed">{t('home.chatHint')}</p>
 
       {/* 快捷操作 */}
       <div className="grid grid-cols-3 gap-3 mt-8 w-full max-w-xl animate-fade-in-up">
@@ -927,24 +927,24 @@ export const ChatEmptyState = memo(function ChatEmptyState({ onQuick }: { onQuic
             <div className="w-9 h-9 rounded-[10px] bg-[var(--accent-soft)] flex items-center justify-center mb-2.5 group-hover:bg-[var(--accent)] group-hover:shadow-md group-hover:shadow-[var(--accent)]/25 transition-[color,background-color,border-color,box-shadow]">
               <Icon name={a.icon} size={17} className="transition-[filter] group-hover:[filter:brightness(0)_invert(1)]!" />
             </div>
-            <div className="text-[13px] font-medium text-[var(--text-primary)]">{a.title}</div>
-            <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-relaxed">{a.desc}</div>
+            <div className="text-[length:var(--app-text-md)] font-medium text-[var(--text-primary)]">{a.title}</div>
+            <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5 leading-relaxed">{a.desc}</div>
           </button>
         ))}
       </div>
 
       {/* 示例提示词 */}
       <div className="mt-8 flex items-center gap-2 flex-wrap justify-center">
-        <span className="text-[11px] text-[var(--text-muted)]">{t('home.tryExamples')}</span>
+        <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.tryExamples')}</span>
         <button
           onClick={() => onQuick(t('home.example1'))}
-          className="px-3 py-1.5 rounded-full text-[11px] text-[var(--text-secondary)] modern-card border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+          className="px-3 py-1.5 rounded-full text-[length:var(--app-text-xs)] text-[var(--text-secondary)] modern-card border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
         >
           {t('home.example1')}
         </button>
         <button
           onClick={() => onQuick(t('home.example2'))}
-          className="px-3 py-1.5 rounded-full text-[11px] text-[var(--text-secondary)] modern-card border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+          className="px-3 py-1.5 rounded-full text-[length:var(--app-text-xs)] text-[var(--text-secondary)] modern-card border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
         >
           {t('home.example2')}
         </button>
@@ -987,7 +987,7 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
           })}
         </span>
         {expanded && (
-          <div className="mt-2 pt-2 border-t border-[var(--border)]/50 grid grid-cols-2 gap-x-4 gap-y-1 text-[10.5px]">
+          <div className="mt-2 pt-2 border-t border-[var(--border)]/50 grid grid-cols-2 gap-x-4 gap-y-1 text-[length:var(--app-text-xs)]">
             <div className="flex justify-between">
               <span className="text-[var(--text-muted)]">{t('home.tokensIn')}</span>
               <span className="text-[var(--text-secondary)] tabular-nums">{summary.tokensIn.toLocaleString()}</span>

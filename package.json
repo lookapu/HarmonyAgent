@@ -3,6 +3,14 @@
   "private": true,
   "version": "2.3.0",
   "type": "module",
+  "description": "HarmonyOS Agent IDE — 本地优先的智能体开发环境",
+  "license": "MIT",
+  "author": "lookapu <lookapu@live.cn>",
+  "homepage": "https://github.com/lookapu/HarmonyAgent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lookapu/HarmonyAgent.git"
+  },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
   },
@@ -14,6 +22,7 @@
     "build": "tsc -b && vite build",
     "postbuild": "node scripts/check-bundle-size.mjs",
     "check:bundle": "node scripts/check-bundle-size.mjs",
+    "gen:licenses": "python scripts/gen-license-manifest.py",
     "clean:generated": "node scripts/clean-generated.mjs",
     "clean:generated:dry-run": "node scripts/clean-generated.mjs --dry-run",
     "tauri": "tauri",

@@ -55,6 +55,69 @@ pub fn seed_api_knowledge(db_path: &Path, resource_dir: Option<PathBuf>) {
 /// 条件 2 的必要性：同一版本的数据会被重新抓取刷新（如 26.0.0 先有 Beta 后有
 /// Release，两者 version_label 相同但条目更多）。只按版本集合判断会让老用户
 /// 永远拿不到同版本的新增条目。
+/// 取出 `main` 与 `seed` **两边都存在**的列名，顺序按 `main`。
+/// 没有交集返回 `None`（该表跳过）。
+///
+/// ## 为什么不能写 `SELECT *`（第二十四批修，改之前埋了多久的雷）
+///
+/// 原来是 `INSERT OR IGNORE INTO main.<t> SELECT * FROM seed.<t>`。
+/// `SELECT *` 在 **seed 侧**展开列，而插入是**按位置**写进 main 的——
+/// 所以它要求两边**列数和列序完全一致**。任何一次「给这几张表加/删列」的迁移，
+/// 只要用户手上的种子库是旧版，就会在**首次启动**报
+/// `table main.api_details has N columns but M values were supplied`。
+///
+/// 那个错误抛在事务里 ⇒ **整批导入回滚**，连已经成功的
+/// `api_docs` / `api_members` 都留不下来 ⇒ **新装用户开箱即用的知识库变成空的**。
+///
+/// 同一个坑其实**已经在这个文件里被撞过一次**：`api_docs_embeddings` 被单独
+/// 拿出来手工重映射（见下），注释里也写明了原因。但**修的是那一张表的症状，
+/// 没修掉 `SELECT *` 这个成因**——所以它随时会从下一张表冒出来。
+///
+/// ## 这里怎么让它「不可能犯」
+///
+/// 不写死列清单（那会随迁移一起过期），而是**运行时求交集**：
+/// 新种子库少一列 ⇒ 少插一列；旧种子库没有新加的列 ⇒ 跳过那一列，
+/// 让它取默认值。**任一侧 schema 变动都不会再炸。**
+fn shared_columns(tx: &rusqlite::Transaction, table: &str) -> Result<Option<Vec<String>>, String> {
+    fn cols_of(
+        tx: &rusqlite::Transaction,
+        schema: &str,
+        table: &str,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        // PRAGMA 不接受绑定参数，schema/table 只能插值；
+        // 这里的两个值都来自上面那个硬编码数组，不含外部输入。
+        let mut stmt = tx
+            .prepare(&format!("PRAGMA {schema}.table_info({table})"))
+            .map_err(|e| e.to_string())?;
+        let set = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(set)
+    }
+
+    let main_cols = cols_of(tx, "main", table)?;
+    let seed_cols = cols_of(tx, "seed", table)?;
+    if main_cols.is_empty() || seed_cols.is_empty() {
+        return Ok(None);
+    }
+    let shared: Vec<String> = tx
+        .prepare(&format!("PRAGMA main.table_info({table})"))
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|c| seed_cols.contains(c))
+        .collect();
+    if shared.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(shared))
+}
+
 fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
     let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
     // 显式打开外键：宁可让「向量挂到不存在的文档」这类错误在这里失败，也不要静默写进孤儿行
@@ -97,9 +160,13 @@ fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
     let mut total = 0usize;
     if missing > 0 || revision_changed {
         // api_docs_embeddings 不在这一批：它按「种子自己的 doc_id」存，而主库 api_docs 的
-        // id 可能与种子不一致（先做过在线抓取时 id 由主库自增分配），直接 `SELECT *` 会撞
+        // id 可能与种子不一致（先做过在线抓取时 id 由主库自增分配），**按位置插入**会撞
         // `doc_id REFERENCES api_docs(id)` 的外键，**并把整批导入一起回滚**（连已成功的
         // api_details/api_members 都留不下来）。它按自然键重映射，见下方单独处理。
+        //
+        // ⚠️ 这条特殊处理当年是**逐症状**修的（只救了这张表），没动下面那句
+        // `SELECT *` 的成因——所以它随时会从**下一张表**冒出来。
+        // 现在四张表都走 `shared_columns` 显式列清单，任一侧 schema 变动都自动适配。
         let tables = ["api_docs", "api_details", "api_members", "api_docs_meta"];
         for t in tables {
             // 种子库可能缺表（旧种子/精简种子），逐表容错：表不存在则跳过
@@ -113,9 +180,15 @@ fn import_into(db_path: &Path, seed: &Path) -> Result<usize, String> {
             if seed_has == 0 {
                 continue;
             }
+            let Some(cols) = shared_columns(&tx, t)? else {
+                continue;
+            };
+            let list = cols.join(",");
             let n = tx
                 .execute(
-                    &format!("INSERT OR IGNORE INTO main.{t} SELECT * FROM seed.{t}"),
+                    &format!(
+                        "INSERT OR IGNORE INTO main.{t} ({list}) SELECT {list} FROM seed.{t}"
+                    ),
                     [],
                 )
                 .map_err(|e| format!("导入 {t} 失败: {e}"))?;

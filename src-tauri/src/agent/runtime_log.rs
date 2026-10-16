@@ -149,6 +149,39 @@ pub fn recent(project_path: &str, max: usize) -> String {
         .join("\n")
 }
 
+/// 跨项目聚合的最近日志（P2-3 诊断包用）。
+///
+/// 诊断包是**应用级**的——它回答「这台机器上最近有没有异常」，
+/// 而 `recent()` 要项目路径。所以这里把所有项目的环形缓冲按时间合并取尾部。
+///
+/// 环形缓冲里存的是纯字符串、没有时间戳，因此**无法按时间归并**，
+/// 只能按项目名字典序拼接后取尾部。这是有意的取舍：诊断包要的是
+/// 「最近发生过什么」的样本，不是精确时间线；真要精确时间线得上日志文件，
+/// 而当前实现刻意不落盘（见文件头注释）。
+///
+/// 拼接时**不带项目路径前缀**——那会把用户目录结构泄进诊断包。
+/// 来源区分靠 `runtime-log.txt` 里的分隔标记。
+pub fn recent_all(max: usize) -> String {
+    let s = store();
+    let mut blocks: Vec<String> = Vec::new();
+    let mut keys: Vec<&String> = s.keys().collect();
+    keys.sort();
+    for key in keys {
+        let Some(ring) = s.get(key) else { continue };
+        if ring.lines.is_empty() {
+            continue;
+        }
+        blocks.push(format!(
+            "--- device log stream ---\n{}",
+            ring.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+        ));
+    }
+    let joined = blocks.join("\n\n");
+    let lines: Vec<&str> = joined.lines().collect();
+    let start = lines.len().saturating_sub(max);
+    lines[start..].join("\n")
+}
+
 /// 日志查询 DSL：在环形缓存上按关键字/正则过滤（grep on the fly）。
 /// `filter` 为大小写不敏感子串；`regex` 为正则（filter 优先）；`context` 为命中行前后附加行数。
 /// 两者都空时退化为 recent()。

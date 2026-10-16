@@ -1,4 +1,4 @@
-import { Routes, Route, NavLink, useNavigate } from 'react-router-dom'
+import { Routes, Route, NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
 import { getVersion } from '@tauri-apps/api/app'
 import { useTranslation } from 'react-i18next'
@@ -15,6 +15,7 @@ import { detectSystemLocale } from './api/desktop'
 import { LANG_STORAGE_KEY } from './i18n'
 import { detectGpu, getTierClass } from './utils/gpuDetect'
 import { getItem } from './utils/storage'
+import { trackPageView } from './utils/telemetry'
 
 // 页面级拆包：避免 Recharts、Markdown/KaTeX、设备诊断等全部阻塞首个可交互帧。
 // Tauri 资源来自本地，懒加载没有网络不确定性，只把 JS 解析/执行摊到实际进入页面时。
@@ -34,6 +35,12 @@ const OhpmPage = lazy(() => import('./pages/OhpmPage'))
 const TeamSharingPage = lazy(() => import('./pages/TeamSharingPage'))
 const ReproductionBundlesPage = lazy(() => import('./pages/ReproductionBundlesPage'))
 const ProxyPage = lazy(() => import('./pages/ProxyPage'))
+const UsagePage = lazy(() => import('./pages/UsagePage'))
+const LicensePage = lazy(() => import('./pages/LicensePage'))
+const AboutPage = lazy(() => import('./pages/AboutPage'))
+
+// StrictMode 下 effect 会跑两遍，用它保证同一次路由变化只记一条 page_view
+let lastPageView: string | null = null
 
 const navItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/lan', labelKey: 'nav.lan', icon: 'devices' },
@@ -42,6 +49,8 @@ const navItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/config', labelKey: 'nav.config', icon: 'settings' },
   { path: '/limits', labelKey: 'nav.limits', icon: 'tune' },
   { path: '/cost', labelKey: 'nav.cost', icon: 'payments' },
+  { path: '/usage', labelKey: 'nav.usage', icon: 'receipt' },
+  { path: '/license', labelKey: 'nav.license', icon: 'spark' },
   { path: '/proxy', labelKey: 'nav.proxy', icon: 'proxy' },
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
   { path: '/skills', labelKey: 'nav.skill', icon: 'skill' },
@@ -51,10 +60,12 @@ const navItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'terminal' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
   { path: '/ohpm', labelKey: 'nav.ohpm', icon: 'apps' },
+  { path: '/about', labelKey: 'nav.about', icon: 'info' },
 ]
 
 export default function App() {
   const { i18n } = useTranslation()
+  const { pathname } = useLocation()
   const [, setSysTick] = useState(0)
 
   // GPU 能力检测：应用启动时 useLayoutEffect 同步执行（canvas 不需要挂载到 DOM），
@@ -103,6 +114,18 @@ export default function App() {
       })
     })
   }, [])
+
+  // page_view 埋点：挂在 App 而非各个 Page 上，才能覆盖 16 个管理页 + 工作区
+  // （逐页埋点漏一页就是一个静默的口子），且加新页面不用记得补。
+  //
+  // lastPageView 用模块级变量去重，**不是为了省 IPC**，是为了防 StrictMode：
+  // 开发模式会把 effect 跑两遍（挂载→卸载→挂载），不去重的话开发者面板里
+  // 每次访问都是 2 次，与「不显示」同属指标失真。生产构建不双跑，故无副作用。
+  useEffect(() => {
+    if (pathname === lastPageView) return
+    lastPageView = pathname
+    trackPageView(pathname)
+  }, [pathname])
 
   return (
     <div className="flex h-screen w-screen">
@@ -239,6 +262,8 @@ function AdminLayout() {
             <Route path="/config" element={<ConfigPage />} />
             <Route path="/limits" element={<LimitsPage />} />
             <Route path="/cost" element={<CostPage />} />
+            <Route path="/usage" element={<UsagePage />} />
+            <Route path="/license" element={<LicensePage />} />
             <Route path="/proxy" element={<ProxyPage />} />
             <Route path="/mcp" element={<McpPage />} />
             <Route path="/skills" element={<SkillsPage />} />
@@ -248,6 +273,7 @@ function AdminLayout() {
             <Route path="/api-knowledge" element={<ApiKnowledgePage />} />
             <Route path="/health" element={<HealthPage />} />
             <Route path="/ohpm" element={<OhpmPage />} />
+            <Route path="/about" element={<AboutPage />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </Suspense>

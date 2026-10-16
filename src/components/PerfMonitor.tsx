@@ -10,6 +10,8 @@ import {
   type PerfRecordKind,
 } from '../utils/perfTrace'
 import Icon from '../icons/Icon'
+import { useTranslation } from 'react-i18next'
+import { EmptyState } from './ui/EmptyState'
 import { getItem, setItem } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
 
@@ -29,6 +31,7 @@ const KIND_META: Record<PerfRecordKind, { badge: string; badgeColor: string; bar
 }
 
 export default function PerfMonitor() {
+  const { t } = useTranslation()
   const [records, setRecords] = useState<PerfRecord[]>([])
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -181,10 +184,10 @@ export default function PerfMonitor() {
           {/* 头部 */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)]">
             <Icon name="spark" size={13} className="text-[var(--accent)]" />
-            <span className="text-[12px] font-medium">性能监控</span>
-            <span className="text-[10px] text-[var(--text-muted)] ml-1">{records.length} 条</span>
-            {badCount > 0 && <span className="text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-[#ef4444]/15 text-[#ef4444]">{badCount} 卡</span>}
-            {warnCount > 0 && <span className="text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-[#f59e0b]/15 text-[#f59e0b]">{warnCount} 慢</span>}
+            <span className="text-[length:var(--app-text-sm)] font-medium">性能监控</span>
+            <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] ml-1">{records.length} 条</span>
+            {badCount > 0 && <span className="text-[length:var(--app-text-micro)] font-mono px-1.5 py-0.5 rounded bg-[#ef4444]/15 text-[#ef4444]">{badCount} 卡</span>}
+            {warnCount > 0 && <span className="text-[length:var(--app-text-micro)] font-mono px-1.5 py-0.5 rounded bg-[#f59e0b]/15 text-[#f59e0b]">{warnCount} 慢</span>}
             <div className="ml-auto flex items-center gap-1">
               <button
                 onClick={handleCopy}
@@ -219,7 +222,7 @@ export default function PerfMonitor() {
           </div>
 
           {/* 类型过滤说明 */}
-          <div className="px-3 py-1 border-b border-[var(--border)]/50 flex items-center gap-2 text-[9px] text-[var(--text-muted)]">
+          <div className="px-3 py-1 border-b border-[var(--border)]/50 flex items-center gap-2 text-[length:var(--app-text-micro)] text-[var(--text-muted)]">
             <KindDot kind="trace" label="手动埋点" />
             <KindDot kind="bootstrap" label="启动" />
             <KindDot kind="longtask" label="长任务(jank)" />
@@ -230,10 +233,12 @@ export default function PerfMonitor() {
           {/* 记录列表 */}
           <div className="flex-1 overflow-y-auto overscroll-contain">
             {records.length === 0 ? (
-              <div className="p-6 text-center text-[11px] text-[var(--text-muted)]">
-                <p>暂无性能记录</p>
-                <p className="mt-1 opacity-70">切换项目/会话/发消息后自动记录</p>
-              </div>
+              <EmptyState
+                compact
+                icon="tune"
+                title={t('perf.empty')}
+                description={t('perf.emptyHint')}
+              />
             ) : (
               <div className="p-2 space-y-1.5">
                 {records.map((r) => (
@@ -244,7 +249,7 @@ export default function PerfMonitor() {
           </div>
 
           {/* 底部 */}
-          <div className="px-3 py-1.5 border-t border-[var(--border)] text-[9.5px] text-[var(--text-muted)] flex items-center gap-2">
+          <div className="px-3 py-1.5 border-t border-[var(--border)] text-[length:var(--app-text-micro)] text-[var(--text-muted)] flex items-center gap-2">
             <span className="inline-flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-[#22c55e]" />快</span>
             <span className="inline-flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-[#f59e0b]" />慢</span>
             <span className="inline-flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-[#ef4444]" />卡</span>
@@ -290,18 +295,18 @@ function RecordItem({ record }: { record: PerfRecord }) {
       onClick={() => setExpanded((v) => !v)}
     >
       <div className="flex items-center gap-2 px-2 py-1.5">
-        <span className="shrink-0 text-[8.5px] font-mono font-semibold px-1 py-px rounded" style={{ color: meta.badgeColor, backgroundColor: `${meta.badgeColor}18` }}>
+        <span className="shrink-0 text-[length:var(--app-text-micro)] font-mono font-semibold px-1 py-px rounded" style={{ color: meta.badgeColor, backgroundColor: `${meta.badgeColor}18` }}>
           {meta.badge}
         </span>
-        <span className="text-[11px] font-medium truncate flex-1">{record.label}</span>
-        {metaStr && <span className="shrink-0 text-[9px] font-mono text-[var(--text-muted)]/70 max-w-[120px] truncate">{metaStr}</span>}
+        <span className="text-[length:var(--app-text-xs)] font-medium truncate flex-1">{record.label}</span>
+        {metaStr && <span className="shrink-0 text-[length:var(--app-text-micro)] font-mono text-[var(--text-muted)]/70 max-w-[120px] truncate">{metaStr}</span>}
         <span
-          className="shrink-0 text-[11px] font-mono font-semibold tabular-nums"
+          className="shrink-0 text-[length:var(--app-text-xs)] font-mono font-semibold tabular-nums"
           style={{ color }}
         >
           {valueText}
         </span>
-        <span className="shrink-0 text-[9px] text-[var(--text-muted)]/70 tabular-nums w-12 text-right">{time}</span>
+        <span className="shrink-0 text-[length:var(--app-text-micro)] text-[var(--text-muted)]/70 tabular-nums w-12 text-right">{time}</span>
       </div>
 
       <div className="h-0.5 mx-2 mb-1 bg-[var(--bg-hover)] rounded-full overflow-hidden">
@@ -314,7 +319,7 @@ function RecordItem({ record }: { record: PerfRecord }) {
       {expanded && record.segments.length > 0 && (
         <div className="px-2 pb-2 space-y-0.5">
           {record.segments.map((seg, i) => (
-            <div key={i} className="flex items-center gap-2 text-[10px]">
+            <div key={i} className="flex items-center gap-2 text-[length:var(--app-text-2xs)]">
               <span className="text-[var(--text-muted)] w-[100px] text-right truncate shrink-0 font-mono">{seg.name}</span>
               <div className="flex-1 h-2.5 bg-[var(--bg-hover)] rounded overflow-hidden">
                 <div

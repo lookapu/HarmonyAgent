@@ -61,7 +61,7 @@ export const ConversationRunStatus = memo(function ConversationRunStatus({
   const elapsed = useElapsedSeconds(foreground ? startedAt : null)
 
   return (
-    <span className="flex items-center gap-1.5 text-[11px] text-[var(--accent)] mt-0.5 tabular-nums">
+    <span className="flex items-center gap-1.5 text-[length:var(--app-text-xs)] text-[var(--accent)] mt-0.5 tabular-nums">
       <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
       {foreground ? t('home.taskElapsed', { time: fmtElapsed(elapsed) }) : t('home.bgStreaming')}
     </span>
@@ -111,7 +111,7 @@ export const RunningTaskOpsBadge = memo(function RunningTaskOpsBadge({
         agents={agents}
       />
       {(currentTool || charsPerSec > 0) && (
-        <div className="flex items-center gap-2 pl-3.5 text-[10.5px] text-[var(--text-muted)] mt-0.5 tabular-nums">
+        <div className="flex items-center gap-2 pl-3.5 text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5 tabular-nums">
           {currentTool && (
             <span className="flex items-center gap-1 truncate max-w-[180px]" title={currentTool}>
               <span className="w-1 h-1 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
@@ -179,7 +179,7 @@ export const SilentStreamHint = memo(function SilentStreamHint({
   if (!active) return null
   if (remediationCount > 0) {
     return (
-      <div className="flex items-center gap-2 text-[11.5px] text-[var(--warning)]">
+      <div className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--warning)]">
         <Icon name="spark" size={12} />
         <span title={remediationBlockers.join('、')}>
           {t('home.agentRemediating', { count: remediationCount })}
@@ -189,7 +189,7 @@ export const SilentStreamHint = memo(function SilentStreamHint({
   }
   if (silentSeconds < 15) return null
   return (
-    <div className="flex items-center gap-2 text-[11.5px] text-[var(--text-muted)] animate-pulse">
+    <div className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] animate-pulse">
       <Icon name="spark" size={12} />
       {t('home.silentHint', { time: fmtElapsed(silentSeconds) })}
     </div>

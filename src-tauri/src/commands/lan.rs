@@ -5,6 +5,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::db::DbState;
+use crate::services::licensing::{self, Capability};
 use crate::services::lan_server::{
     LanConfigInput, LanServer, LanTokenInfo, count_tokens, create_token, list_lan_ips, list_tokens,
     load_config, revoke_token,
@@ -54,6 +55,10 @@ pub async fn start_lan_server(
 ) -> Result<(), String> {
     let config = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // 能力网关放在最前面：绕过 UI 直接调 command 也必须被拦。
+        // 放在 load_config 之后会让「先查配置再报错」，
+        // 报错文案还可能带上别人的端口号。
+        licensing::check(&conn, Capability::LanCollaboration)?;
         load_config(&conn)
     };
     let has_token = {
@@ -123,6 +128,14 @@ pub async fn stop_lan_server(
 }
 
 /// 查询 LAN 服务状态 + 配置（token 明文不回传）
+///
+/// **刻意不过网关**——这是本文件唯一的例外，理由要写清楚：
+/// 设置页要用它来判断「该不该显示升级引导」。若这里也拦，用户看到的就是一个
+/// 报错而不是「此功能需要 Team 档」，而后者才是能引导他下一步的信息。
+///
+/// 只读、无副作用、且返回的全是本机配置，泄露不了什么。
+/// 真正会启动服务或签发令牌的入口（start / update / create_token / list）
+/// 全部过网关——那里才是必须拦的地方。
 #[tauri::command]
 pub async fn get_lan_server_status(
     db: State<'_, DbState>,
@@ -150,6 +163,7 @@ pub async fn get_lan_server_status(
 #[tauri::command]
 pub fn update_lan_server_config(db: State<DbState>, input: LanConfigInput) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    licensing::check(&conn, Capability::LanCollaboration)?;
     if let Some(port) = input.port {
         conn.execute(
             "UPDATE lan_config SET port = ?1 WHERE id = 1",
@@ -172,6 +186,7 @@ pub fn update_lan_server_config(db: State<DbState>, input: LanConfigInput) -> Re
 #[tauri::command]
 pub fn create_lan_token(db: State<DbState>, name: String, expires_at: i64) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    licensing::check(&conn, Capability::LanCollaboration)?;
     let (_, token) = create_token(&conn, &name, expires_at)?;
     Ok(token)
 }
@@ -180,10 +195,17 @@ pub fn create_lan_token(db: State<DbState>, name: String, expires_at: i64) -> Re
 #[tauri::command]
 pub fn list_lan_tokens(db: State<DbState>) -> Result<Vec<LanTokenInfo>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    licensing::check(&conn, Capability::LanCollaboration)?;
     Ok(list_tokens(&conn))
 }
 
 /// 撤销令牌：删除记录立即失效，并定向断开该令牌的全部 SSE 连接（网页端回登录页）
+///
+/// **刻意不过网关**，理由与「关闭多池」是同一条不对称：
+/// 撤销是**收口**动作，不是**开闸**动作。若撤也要 Team 档，
+/// 管理员降级后那些已经发出去的访问令牌就再也收不回来了——
+/// 令牌还在、连接还在、而唯一能关掉它的入口被锁死。
+/// 能力分级管的是「谁能开通」，绝不能管到「谁能关闭」上面去。
 #[tauri::command]
 pub async fn revoke_lan_token(
     db: State<'_, DbState>,
@@ -200,6 +222,9 @@ pub async fn revoke_lan_token(
 }
 
 /// 枚举本机局域网 IPv4 地址（设置页访问地址 + 二维码用）
+///
+/// 只读、无 DB 访问、返回的全是本机网络接口地址——拿它既开不了服务也签不了令牌。
+/// 与 `get_lan_server_status` 同属「UI 需要它来决定要不要显示升级引导」的一类。
 #[tauri::command]
 pub fn get_lan_ips() -> Vec<String> {
     list_lan_ips()

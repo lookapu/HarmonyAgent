@@ -821,13 +821,18 @@ fn store_detail(conn: &Connection, d: &ApiDetail) -> Result<usize, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|x| x.as_secs() as i64)
         .unwrap_or(0);
-    let members_json = serde_json::to_string(&d.members).unwrap_or_else(|_| "[]".to_string());
+    // ⚠️ 这里**曾经**还会把 `d.members` 序列化成 JSON 写进 `api_details.members`。
+    // 086 迁移已删掉那一列——因为**没有任何读路径经过它**：
+    // 列表计数、详情页、Agent 检索全部走 `api_members` 表，诊断包也压根不含这张表。
+    // 子项数据没有丢：下面紧接着就把同一个 `d.members` 逐条写进 `api_members`。
+    // 写 JSON 副本的那份**纯浪费**：种子库实测 19.7MB，且因为没人读，
+    // 它与表里那份的 9 行口径分歧（台账 T-12）才一直无人察觉。
 
     conn.execute(
         "INSERT INTO api_details
             (module, slug, title, kit, since_api_level, deprecated, import_snippet,
-             syscap, permissions, device_types, body, examples, members, source_url, fetched_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             syscap, permissions, device_types, body, examples, source_url, fetched_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
          ON CONFLICT(slug) DO UPDATE SET
             module=excluded.module,
             title=excluded.title,
@@ -840,7 +845,6 @@ fn store_detail(conn: &Connection, d: &ApiDetail) -> Result<usize, String> {
             device_types=excluded.device_types,
             body=excluded.body,
             examples=excluded.examples,
-            members=excluded.members,
             source_url=excluded.source_url,
             fetched_at=excluded.fetched_at",
         params![
@@ -856,14 +860,13 @@ fn store_detail(conn: &Connection, d: &ApiDetail) -> Result<usize, String> {
             d.device_types,
             d.body,
             d.examples,
-            members_json,
             d.source_url,
             now,
         ],
     )
     .map_err(|e| e.to_string())?;
 
-    // 重建 members
+    // 重建 members（子项的真源就在这张表）
     conn.execute("DELETE FROM api_members WHERE detail_slug = ?1", params![d.slug])
         .map_err(|e| e.to_string())?;
 

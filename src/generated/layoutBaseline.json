@@ -1,0 +1,36 @@
+{
+  "_comment": "本文件的 `measured` 段由 scripts/layout-probe.mjs 生成，**不要手改**。\n改 CSS 之后跑 `node scripts/layout-probe.mjs --update` 重新测量。\nscripts/check-density.py 负责把 `measured` 与 `targets` 对照。\n\n`targets` 是**人的承诺**，`--update` 不会改写它；\n要下调必须显式 `--accept-regression <指标>`，那一次下调会留在 git diff 里。\n\n计数（sessionsFullyVisible / messagesFullyVisible）是**门禁判据**；\n高度（*Height / *Scrollable）只用于解释变化，跨机器会飘，不作判据。",
+  "viewport": {
+    "width": 1100,
+    "height": 720
+  },
+  "measured": {
+    "counts": {
+      "sessionsFullyVisible": 7,
+      "sessionTotal": 40,
+      "messagesFullyVisible": 2,
+      "messageTotal": 32
+    },
+    "diagnostic": {
+      "sessionRowHeightMedian": 45.09,
+      "sessionRowHeightMin": 45.09,
+      "sessionRowHeightMax": 45.09,
+      "sessionListClientPx": 366,
+      "sessionScrollablePx": 1620,
+      "messageScrollablePx": 6655,
+      "messageMounted": 6,
+      "messageMsgMounted": 5
+    }
+  },
+  "targets": {
+    "sessionsFullyVisible": 7,
+    "messagesFullyVisible": 2
+  },
+  "acceptedRegressions": [],
+  "probe": {
+    "browser": "msedge.exe",
+    "browserVersion": "Edg/154.0.4258.37",
+    "invokedCommands": 49,
+    "missingFixtures": []
+  }
+}

@@ -1,5 +1,5 @@
 // @ui-states: loading, empty, partial, failed, retry
-import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useNavigate } from 'react-router-dom'
@@ -15,10 +15,8 @@ import { useThemeStore } from '../stores/themeStore'
 import { useNotificationStore } from '../stores/notificationStore'
 import NotificationBell from '../components/NotificationBell'
 import LangToggle from '../components/LangToggle'
-import { useAuditStore, type AuditCategory } from '../stores/auditStore'
-import { usePinStore, PIN_MAX_PER_CONV } from '../stores/pinStore'
-import { useRatingStore } from '../stores/ratingStore'
-import { useNoteStore, NOTE_MAX_LEN } from '../stores/noteStore'
+import { useAuditStore } from '../stores/auditStore'
+import { usePinStore } from '../stores/pinStore'
 import {
   inspectProject,
   listConversations,
@@ -82,18 +80,15 @@ import {
 import { warmupSymbolIndex } from '../api/symbols'
 import Icon, { type IconName } from '../icons/Icon'
 import AddProjectDialog from '../components/AddProjectDialog'
+import { hasSeenFirstRun } from '../utils/firstRun'
 import TrustDialog from '../components/TrustDialog'
 import FileTreePanel from '../components/FileTreePanel'
 import GitPanel from '../components/GitPanel'
 import Markdown from '../components/Markdown'
-import { toPinyinInitials, toPinyinFull } from '../utils/pinyin'
+import { toPinyinInitials, toPinyinFull, preloadPinyin, onPinyinReady } from '../utils/pinyin'
 import { getItem, setItem, removeItem, getJSON, setJSON } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
 import {
-  ThinkingBlock,
-  ThumbUpIcon,
-  ThumbDownIcon,
-  ModifiedFilesCard,
   ErrorCard,
   EmptyState,
   ChatEmptyState,
@@ -124,11 +119,14 @@ import {
   impactDisplay,
   interruptedTailMessage,
   restoreSelectionRange,
-  sanitizeToolMarkers,
   shouldSubmitComposerKey,
 } from '../chat/chatUtils'
 import { detectGpu, getRecommendedOverscan, shouldUseSmoothScroll } from '../utils/gpuDetect'
 import { getLastProjectId } from '../stores/slices/projectSlice'
+import { ShortcutsPanel, ProjectSwitcher } from '../components/home/HomeOverlays'
+import { BatchSendDialog, ImportDialog, AuditDialog } from '../components/home/HomeDialogs'
+import { ConvNoteBar, PinnedBar } from '../components/home/HomeBars'
+import { MessageItem } from '../components/home/MessageItem'
 import {
   externalTextReference,
   imageMimeFromPath,
@@ -151,10 +149,25 @@ const GEN_ITEMS: { kind: GenKind; icon: IconName }[] = [
 ]
 
 // 设备/工程分析/时间线仅在右侧对应 Tab 打开时加载，避免约 100KB 的低频组件源码进入首页首屏执行路径。
-const DevicesPanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.DevicesPanel })))
-const AnalyzePanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.AnalyzePanel })))
-const SymbolsPanel = lazy(() => import('../chat/components/devicePanels').then((m) => ({ default: m.SymbolsPanel })))
+//
+// 三块面板**必须各自 import 各自的模块**。原先三行都指向同一个 devicePanels 模块，
+// 而 Rollup 对同一模块的多次 import() 只产出一个 chunk —— 于是「懒加载」只懒了
+// 一整个 63.6KB 的大块，打开任一面板都会把另外两块一起下载。
+// 拆成三个模块后（见 src/chat/components/devicePanels/），才真的分成三块。
+const DevicesPanel = lazy(() =>
+  import('../chat/components/devicePanels/DevicesPanel').then((m) => ({ default: m.DevicesPanel })),
+)
+const AnalyzePanel = lazy(() =>
+  import('../chat/components/devicePanels/AnalyzePanel').then((m) => ({ default: m.AnalyzePanel })),
+)
+const SymbolsPanel = lazy(() =>
+  import('../chat/components/devicePanels/SymbolsPanel').then((m) => ({ default: m.SymbolsPanel })),
+)
 const TimelinePanel = lazy(() => import('../components/TimelinePanel'))
+
+// 首启引导同样懒加载：绝大多数用户只会在第一次见到它，
+// 没必要让它进首屏执行路径（Home 已在体积预算的 92%）。
+const Onboarding = lazy(() => import('../components/Onboarding'))
 
 /** 斜杠快捷指令清单：输入 / 触发，插入预置 prompt；action 触发额外行为（plan=开启计划模式，compact=手动压缩历史） */
 function getSlashCommands(t: (key: string) => string): { id: string; icon: IconName; title: string; prompt: string; action?: 'plan' | 'compact' }[] {
@@ -447,12 +460,32 @@ export default function Home() {
   const toggleTheme = useThemeStore((s) => s.toggle)
 
   const [showAddDialog, setShowAddDialog] = useState(false)
+  // 首启引导：默认开着，落地后由 markFirstRunSeen() 关掉。
+  // 放在 useState 初始化里而不是 effect 里——effect 版本会在首帧先渲染一次
+  // 无引导的主界面，闪一下才弹引导。
+  const [showOnboarding, setShowOnboarding] = useState(() => !hasSeenFirstRun())
   const [pendingTrust, setPendingTrust] = useState<{ projectId: string; inspect: ProjectInspect } | null>(null)
   const [trustBusy, setTrustBusy] = useState(false)
   const [showRightPanel, setShowRightPanel] = useState(
     () => getItem(STORAGE_KEYS.RIGHT_PANEL) !== 'collapsed',
   )
   const [rightTab, setRightTab] = useState<'overview' | 'files' | 'memories' | 'stats' | 'git' | 'preview' | 'devices' | 'symbols' | 'terminal' | 'shell' | 'analyze' | 'timeline'>('overview')
+  // 右侧面板的 tab 定义。**必须提到组件体**：此前它是一个就地 IIFE 里的局部 const，
+  // 于是 tabpanel 拿不到当前 tab 的 label，aria-label 无从填写。
+  const rightTabs: { key: typeof rightTab; icon: IconName; label: string }[] = [
+    { key: 'overview', icon: 'info', label: t('home.overview') },
+    { key: 'files', icon: 'folder', label: t('home.fileTree') },
+    { key: 'memories', icon: 'lightbulb', label: t('home.memories') },
+    { key: 'stats', icon: 'receipt', label: t('home.toolStats') },
+    { key: 'git', icon: 'git-branch', label: t('home.git') },
+    { key: 'preview', icon: 'devices', label: t('home.openPreview') },
+    { key: 'devices', icon: 'phone', label: t('home.devices') },
+    { key: 'symbols', icon: 'search', label: t('home.symbols') },
+    { key: 'analyze', icon: 'spark', label: t('home.analyze') },
+    { key: 'shell', icon: 'terminal', label: t('home.terminal') },
+    { key: 'terminal', icon: 'receipt', label: t('home.terminalLogs') },
+    { key: 'timeline', icon: 'archive', label: t('home.timeline') },
+  ]
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => getItem(STORAGE_KEYS.SIDEBAR_COLLAPSED) === '1',
   )
@@ -2329,6 +2362,10 @@ export default function Home() {
     if (atIdx >= 0 && (atIdx === 0 || !/[\w\u4e00-\u9fa5]/.test(v[atIdx - 1]))) {
       const rest = v.slice(atIdx + 1)
       if (rest && !rest.includes(' ') && !rest.includes('\n')) {
+        // 拼音词典是懒加载的（见 utils/pinyin.ts：词典占 Home chunk 30.7%，但只在打 @ 后用得上）。
+        // 在这里触发：用户从打出 @ 到打出「sy」至少还有几百毫秒，词典必然已就绪；
+        // 万一没赶上，下面 onPinyinReady 的兜底会用当前 draft 重算一次，用户无感。
+        void preloadPinyin()
         const q = rest.toLowerCase()
         setRefQuery(q)
         const list = refPool
@@ -2356,6 +2393,19 @@ export default function Home() {
     }
     setRefCandidates(null)
   }
+
+  // 拼音词典就绪后的兜底重算：把当前 draft 重新过一遍候选逻辑。
+  // 没有这条，用户在词典就绪前打出「@sy」会搜不到「首页」，且不会自愈——
+  // 搜索框看起来就是坏的。用 ref 转发是为了让 effect 依赖保持为空：
+  // handleDraftChange 每次渲染都是新函数，直接进依赖会变成每次渲染都订阅一次。
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  const recomputeRef = useRef(handleDraftChange)
+  recomputeRef.current = handleDraftChange
+  useEffect(
+    () => onPinyinReady(() => recomputeRef.current(draftRef.current)),
+    [],
+  )
 
   /** /compact 斜杠指令：手动压缩会话历史（较早消息总结为摘要，保留最近 10 条） */
   const compactHistory = async () => {
@@ -3933,8 +3983,8 @@ export default function Home() {
             <Icon name="bolt" size={17} white />
           </div>
           <div className={`min-w-0 leading-tight ${sidebarCollapsed ? 'hidden' : ''}`}>
-            <div className="text-[13px] font-semibold tracking-wide">DevEco Switch</div>
-            <div className="text-[10px] text-[var(--text-muted)]">Agent Workspace</div>
+            <div className="text-[length:var(--app-text-md)] font-semibold tracking-wide">DevEco Switch</div>
+            <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">Agent Workspace</div>
           </div>
         </div>
 
@@ -3955,11 +4005,11 @@ export default function Home() {
         {/* 最近项目 */}
         <div className={`shrink-0 px-3 ${sidebarCollapsed ? 'pb-3' : 'pb-2'}`}>
           {!sidebarCollapsed && (
-            <div className="px-2 pb-1.5 text-[11px] font-medium text-[var(--text-muted)]">{t('home.recentProjects')}</div>
+            <div className="px-2 pb-1.5 text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)]">{t('home.recentProjects')}</div>
           )}
           {projects.length === 0 ? (
             !sidebarCollapsed && (
-              <div className="px-2 py-4 text-[11px] text-[var(--text-muted)] text-center leading-relaxed whitespace-pre-line">
+              <div className="px-2 py-4 text-[length:var(--app-text-xs)] text-[var(--text-muted)] text-center leading-relaxed whitespace-pre-line">
                 {t('home.noProject')}
               </div>
             )
@@ -3988,7 +4038,7 @@ export default function Home() {
                       <>
                         <span className="min-w-0 flex-1">
                           <span
-                            className={`block text-[13px] truncate leading-4 ${
+                            className={`block text-[length:var(--app-text-md)] truncate leading-4 ${
                               active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'
                             }`}
                           >
@@ -4000,7 +4050,7 @@ export default function Home() {
                               e.stopPropagation()
                               void copyId(p.id)
                             }}
-                            className="block max-w-full truncate text-left font-mono text-[9.5px] leading-3.5 text-[var(--text-muted)]/70 hover:text-[var(--accent)] transition-colors"
+                            className="block max-w-full truncate text-left font-mono text-[length:var(--app-text-micro)] leading-3.5 text-[var(--text-muted)]/70 hover:text-[var(--accent)] transition-colors"
                             title={`${t('home.projId')}: ${p.id}\n${t('home.clickToCopy')}`}
                           >
                             {copiedId === p.id ? <Icon name="check" size={8} className="inline text-[var(--success)]" /> : 'P:'}
@@ -4009,7 +4059,7 @@ export default function Home() {
                         </span>
                         {total > 0 && (
                           <span
-                            className="shrink-0 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[10px] font-medium"
+                            className="shrink-0 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[length:var(--app-text-2xs)] font-medium"
                             title={t('home.scopedCountHint', { mcp: counts!.mcp, skills: counts!.skills })}
                           >
                             {total}
@@ -4018,7 +4068,7 @@ export default function Home() {
                         {/* 会话数：项目维度统计，与模块能力计数区分展示 */}
                         {p.conversation_count > 0 && (
                           <span
-                            className="shrink-0 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full modern-card border-[var(--border)] text-[var(--text-muted)] text-[10px] font-medium tabular-nums"
+                            className="shrink-0 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full modern-card border-[var(--border)] text-[var(--text-muted)] text-[length:var(--app-text-2xs)] font-medium tabular-nums"
                             title={t('home.conversationCount', { n: p.conversation_count })}
                           >
                             {p.conversation_count}
@@ -4090,7 +4140,7 @@ export default function Home() {
             }}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--text-muted)] truncate" title={projectMenu.project.path}>
+            <div className="px-3 py-1.5 text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)] truncate" title={projectMenu.project.path}>
               {projectMenu.project.name}
             </div>
             <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
@@ -4100,7 +4150,7 @@ export default function Home() {
                 void handleOpenProjectFolder(projectMenu.project)
                 setProjectMenu(null)
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="folder" size={13} />
               {t('home.openProjectFolder')}
@@ -4111,7 +4161,7 @@ export default function Home() {
                 void handleRefreshProjectAll(projectMenu.project)
                 setProjectMenu(null)
               }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="refresh" size={13} />
               {t('home.refreshProjectInfo')}
@@ -4130,27 +4180,27 @@ export default function Home() {
             }}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--text-muted)] truncate">
+            <div className="px-3 py-1.5 text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)] truncate">
               {convMenu.conv.title}
             </div>
             <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
             <button
               onClick={() => { togglePin(convMenu.conv.id, convMenu.conv.is_pinned); setConvMenu(null) }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="pin" size={13} />
               {convMenu.conv.is_pinned ? t('home.unpin') : t('home.pin')}
             </button>
             <button
               onClick={() => { toggleArchive(convMenu.conv.id, convMenu.conv.archived); setConvMenu(null) }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="archive" size={13} />
               {convMenu.conv.archived ? t('home.unarchive') : t('home.archive')}
             </button>
             <button
               onClick={() => { setRenamingId(convMenu.conv.id); setRenamingText(convMenu.conv.title); setConvMenu(null) }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="edit" size={13} />
               {t('home.rename')}
@@ -4158,7 +4208,7 @@ export default function Home() {
             <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
             <button
               onClick={() => { navigator.clipboard.writeText(convMenu.conv.id); setConvMenu(null) }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="copy" size={13} />
               {t('home.copyConvId')}
@@ -4166,7 +4216,7 @@ export default function Home() {
             <div className="mx-2 my-1 h-px bg-[var(--border)]" aria-hidden="true" />
             <button
               onClick={() => { handleDeleteConversation(convMenu.conv.id); setConvMenu(null) }}
-              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
+              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--danger)] hover:bg-[var(--danger)]/10 transition-colors"
             >
               <Icon name="delete" size={13} />
               {t('home.deleteConversation')}
@@ -4178,7 +4228,7 @@ export default function Home() {
         <div className="flex-1 flex flex-col min-h-0 mt-1">
           <div className={`flex items-center justify-between pb-1.5 ${sidebarCollapsed ? 'px-3 justify-center' : 'px-4'}`}>
             {!sidebarCollapsed && (
-              <span className="text-[11px] font-medium text-[var(--text-muted)]">
+              <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)]">
                 {showArchived ? t('home.archived') : t('home.conversations')}
               </span>
             )}
@@ -4220,7 +4270,7 @@ export default function Home() {
                       ? t('home.messageSearchPlaceholder')
                       : `${t('home.searchPlaceholder')} (Ctrl+K)`
                   }
-                  className="w-full h-7 pl-7 pr-6 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[11.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)] transition-colors"
+                  className="w-full h-7 pl-7 pr-6 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[length:var(--app-text-xs)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)] transition-colors"
                 />
                 {searchText && (
                   <button
@@ -4244,7 +4294,7 @@ export default function Home() {
                     setSearchMode('conv')
                     setMsgHits([])
                   }}
-                  className={`flex-1 h-6 rounded-md text-[10.5px] transition-colors ${
+                  className={`flex-1 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors ${
                     searchMode === 'conv'
                       ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                       : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
@@ -4257,7 +4307,7 @@ export default function Home() {
                     setSearchMode('msg')
                     void setConversationKeyword('')
                   }}
-                  className={`flex-1 h-6 rounded-md text-[10.5px] transition-colors ${
+                  className={`flex-1 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors ${
                     searchMode === 'msg'
                       ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                       : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
@@ -4271,7 +4321,7 @@ export default function Home() {
                     void setConversationKeyword('')
                     setMsgHits([])
                   }}
-                  className={`flex-1 h-6 rounded-md text-[10.5px] transition-colors ${
+                  className={`flex-1 h-6 rounded-md text-[length:var(--app-text-xs)] transition-colors ${
                     searchMode === 'all'
                       ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                       : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
@@ -4285,7 +4335,7 @@ export default function Home() {
                 <div className="flex gap-1 mt-1">
                   <button
                     onClick={() => setMsgSearchScope(msgSearchScope === 'current' ? 'all' : 'current')}
-                    className={`h-5 px-2 rounded text-[10px] transition-colors ${
+                    className={`h-5 px-2 rounded text-[length:var(--app-text-2xs)] transition-colors ${
                       msgSearchScope === 'current'
                         ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                         : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
@@ -4301,7 +4351,7 @@ export default function Home() {
                 <div className="mt-1.5 px-1 flex flex-wrap gap-1">
                   <button
                     onClick={() => setActiveTagFilter(null)}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                    className={`px-1.5 py-0.5 rounded text-[length:var(--app-text-2xs)] font-medium transition-colors ${
                       activeTagFilter === null
                         ? 'tab-active'
                         : 'tab-inactive'
@@ -4313,7 +4363,7 @@ export default function Home() {
                     <button
                       key={tc.tag}
                       onClick={() => setActiveTagFilter(activeTagFilter === tc.tag ? null : tc.tag)}
-                      className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                      className={`px-1.5 py-0.5 rounded text-[length:var(--app-text-2xs)] font-medium transition-colors ${
                         activeTagFilter === tc.tag
                           ? 'tab-active'
                           : 'tab-inactive'
@@ -4328,7 +4378,7 @@ export default function Home() {
               {searchMode === 'msg' && searchText.trim().length >= 2 && (
                 <div className="mt-1.5 max-h-72 overflow-y-auto rounded-lg modern-card shadow-lg shadow-black/20 py-1">
                   {msgSearching && msgHits.length === 0 && (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
+                    <div className="px-2.5 py-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
                   {!msgSearching && msgHits.length === 0 && (
                     <UiEmptyState compact title={t('home.noMessageHits')} />
@@ -4345,12 +4395,12 @@ export default function Home() {
                             hit.role === 'user' ? 'bg-[var(--accent)]' : 'bg-[var(--success)]'
                           }`}
                         />
-                        <span className="text-[10.5px] font-medium text-[var(--text-secondary)] truncate flex-1">
+                        <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)] truncate flex-1">
                           {hit.conversation_title}
                         </span>
-                        <span className="text-[9.5px] text-[var(--text-muted)] shrink-0">{formatTime(hit.created_at)}</span>
+                        <span className="text-[length:var(--app-text-micro)] text-[var(--text-muted)] shrink-0">{formatTime(hit.created_at)}</span>
                       </div>
-                      <div className="text-[10.5px] text-[var(--text-muted)] leading-relaxed line-clamp-2">
+                      <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed line-clamp-2">
                         {highlightSnippet(hit.snippet)}
                       </div>
                     </button>
@@ -4361,7 +4411,7 @@ export default function Home() {
               {searchMode === 'all' && searchText.trim().length >= 2 && (
                 <div className="mt-1.5 max-h-72 overflow-y-auto rounded-lg modern-card shadow-lg shadow-black/20 py-1">
                   {allProjectSearching && allProjectHits.length === 0 && (
-                    <div className="px-2.5 py-2 text-[11px] text-[var(--text-muted)]">{t('home.searching')}</div>
+                    <div className="px-2.5 py-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.searching')}</div>
                   )}
                   {!allProjectSearching && allProjectHits.length === 0 && (
                     <UiEmptyState compact title={t('home.noMessageHits')} />
@@ -4401,11 +4451,11 @@ export default function Home() {
                             }}
                             className="w-full text-left px-2.5 py-1.5 hover:bg-[var(--bg-hover)] transition-colors"
                           >
-                            <div className="flex items-center gap-1.5 text-[10.5px] text-[var(--text-muted)]">
+                            <div className="flex items-center gap-1.5 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
                               <span className="truncate font-medium">{hit.conversation_title}</span>
                               <span className="shrink-0">{hit.role === 'user' ? '👤' : '✨'}</span>
                             </div>
-                            <div className="text-[11px] text-[var(--text-secondary)] line-clamp-2 mt-0.5">{hit.snippet}</div>
+                            <div className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)] line-clamp-2 mt-0.5">{hit.snippet}</div>
                           </button>
                         )
                       }
@@ -4417,6 +4467,7 @@ export default function Home() {
             </div>
           )}
           <div
+            data-layout="session-list"
             className={`flex-1 overflow-y-auto pb-2 space-y-0.5 ${sidebarCollapsed ? 'px-2' : 'px-2'}`}
             tabIndex={0}
             onKeyDown={(e) => {
@@ -4459,9 +4510,10 @@ export default function Home() {
               return (
                 <div
                   key={c.id}
+                  data-layout="session-item"
                   className={`list-row group w-full flex items-center rounded-lg transition-colors ${
                     active ? 'bg-[var(--bg-card)] is-active' : focused ? 'bg-[var(--bg-hover)] ring-1 ring-[var(--accent)]/30' : 'hover:bg-[var(--bg-hover)]'
-                  } ${sidebarCollapsed ? 'justify-center py-1' : 'pl-2.5 pr-1.5 py-1.5'}`}
+                  } ${sidebarCollapsed ? 'justify-center py-1' : 'pl-2.5 pr-1.5 py-1'}`}
                   onContextMenu={(e) => {
                     if (sidebarCollapsed) return
                     e.preventDefault()
@@ -4478,7 +4530,7 @@ export default function Home() {
                         if (e.key === 'Escape') setRenamingId(null)
                       }}
                       onBlur={() => submitRename(c.id)}
-                      className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent)] rounded-md px-2 py-1 text-[13px] outline-none"
+                      className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent)] rounded-md px-2 py-1 text-[length:var(--app-text-md)] outline-none"
                     />
                   ) : sidebarCollapsed ? (
                     <IconButton
@@ -4493,14 +4545,14 @@ export default function Home() {
                       <button onClick={() => openConversation(c.id)} className="flex-1 min-w-0 text-left">
                         <span className="flex items-center gap-1.5">
                           <span
-                            className={`block text-[13px] truncate min-w-0 ${c.is_pinned ? 'text-[var(--accent)]' : active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'}`}
+                            className={`block text-[length:var(--app-text-md)] truncate min-w-0 ${c.is_pinned ? 'text-[var(--accent)]' : active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)] group-hover:text-[var(--text-primary)]'}`}
                           >
                             {c.is_pinned && <Icon name="pin" size={11} className="mr-1 text-[var(--accent)] align-[-1px]" />}
                             {c.title}
                           </span>
                           {c.work_mode === 'worktree' && (
                             <span
-                              className="shrink-0 inline-flex items-center gap-1 text-[9.5px] px-1 py-px rounded font-medium bg-[var(--accent)]/10 text-[var(--accent)]"
+                              className="shrink-0 inline-flex items-center gap-1 text-[length:var(--app-text-micro)] px-1 py-px rounded font-medium bg-[var(--accent)]/10 text-[var(--accent)]"
                               title={c.worktree_path ?? c.worktree_branch ?? 'worktree'}
                             >
                               <Icon name="git-branch" size={9} />
@@ -4513,7 +4565,7 @@ export default function Home() {
                           <span className="flex items-center gap-1 mt-0.5 flex-wrap">
                             {pendingItems.some((p) => p.kind === 'approval') && (
                               <span
-                                className="flex items-center gap-1 px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--danger-50)] text-[var(--danger)]"
+                                className="flex items-center gap-1 px-1.5 py-px rounded text-[length:var(--app-text-micro)] font-medium bg-[var(--danger-50)] text-[var(--danger)]"
                                 title={t('home.pendingApprovalTip')}
                               >
                                 <Icon name="bolt" size={9} />
@@ -4522,7 +4574,7 @@ export default function Home() {
                             )}
                             {pendingItems.some((p) => p.kind === 'plan') && (
                               <span
-                                className="flex items-center gap-1 px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--warning-50)] text-[var(--warning-600)]"
+                                className="flex items-center gap-1 px-1.5 py-px rounded text-[length:var(--app-text-micro)] font-medium bg-[var(--warning-50)] text-[var(--warning-600)]"
                                 title={t('home.pendingPlanTip')}
                               >
                                 <Icon name="lightbulb" size={9} />
@@ -4531,7 +4583,7 @@ export default function Home() {
                             )}
                             {pendingItems.some((p) => p.kind === 'ask') && (
                               <span
-                                className="flex items-center gap-1 px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--accent-soft)] text-[var(--accent)]"
+                                className="flex items-center gap-1 px-1.5 py-px rounded text-[length:var(--app-text-micro)] font-medium bg-[var(--accent-soft)] text-[var(--accent)]"
                                 title={t('home.pendingAskTip')}
                               >
                                 <Icon name="headphones" size={9} />
@@ -4546,13 +4598,13 @@ export default function Home() {
                             {c.tags.split(',').slice(0, 3).map((tag) => (
                               <span
                                 key={tag}
-                                className="px-1.5 py-px rounded text-[9.5px] font-medium bg-[var(--accent-soft)] text-[var(--accent)] border border-[var(--accent)]/20"
+                                className="px-1.5 py-px rounded text-[length:var(--app-text-micro)] font-medium bg-[var(--accent-soft)] text-[var(--accent)] border border-[var(--accent)]/20"
                               >
                                 {tag.trim()}
                               </span>
                             ))}
                             {c.tags.split(',').length > 3 && (
-                              <span className="text-[9.5px] text-[var(--text-muted)]">+{c.tags.split(',').length - 3}</span>
+                              <span className="text-[length:var(--app-text-micro)] text-[var(--text-muted)]">+{c.tags.split(',').length - 3}</span>
                             )}
                           </div>
                         )}
@@ -4562,24 +4614,19 @@ export default function Home() {
                             foreground={streamingConversationId === c.id}
                           />
                         ) : (
-                          <span className="flex items-center gap-1.5 mt-0.5">
-                            <span className="text-[11px] text-[var(--text-muted)]">{formatTime(c.updated_at)}</span>
-                            {/* 会话短 ID：hover 可见，点击复制 */}
-                            <button
-                              onClick={(e) => { e.stopPropagation(); copyId(c.id) }}
-                              className="debug-id-badge font-mono text-[8.5px] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-[color,background-color,border-color,opacity,transform] opacity-0 group-hover:opacity-100"
-                              title={`${t('home.convId')}: ${c.id}\n${t('home.clickToCopy')}`}
-                            >
-                              {copiedId === c.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
-                              {shortId(c.id)}
-                            </button>
+                          /* 元信息行：`whitespace-nowrap` + 短 ID 徽章当压缩垫。
+                             **短 ID 徽章默认 opacity-0（完全看不见）却照样占约 29px 横向空间**，
+                             归档徽章一出现就把它挤到第二行，整行高度从 50px 翻倍到 66.5px。
+                             「默认就看不见」的元素理应第一个被压扁——它是这里唯一可牺牲的。 */
+                          <span className="flex items-center gap-1.5 mt-px min-w-0 whitespace-nowrap">
+                            <span className="shrink-0 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{formatTime(c.updated_at)}</span>
                             {/* 智能归档建议徽章：7+ 天未活动弱提醒，30+ 天强提醒（强建议时背景更显眼） */}
                             {(() => {
                               const sug = suggestArchive(c)
                               if (sug === 'suggest') {
                                 return (
                                   <span
-                                    className="text-[9.5px] px-1 rounded font-medium bg-[var(--warning-50)] text-[var(--warning-600)]"
+                                    className="shrink-0 text-[length:var(--app-text-micro)] px-1 rounded font-medium bg-[var(--warning-50)] text-[var(--warning-600)]"
                                     title={t('home.suggestArchiveHint')}
                                   >
                                     {t('home.suggestArchive')}
@@ -4589,7 +4636,7 @@ export default function Home() {
                               if (sug === 'strong') {
                                 return (
                                   <span
-                                    className="text-[9.5px] px-1 rounded font-medium bg-[var(--danger-50)] text-[var(--danger)]"
+                                    className="shrink-0 text-[length:var(--app-text-micro)] px-1 rounded font-medium bg-[var(--danger-50)] text-[var(--danger)]"
                                     title={t('home.strongArchiveHint')}
                                   >
                                     {t('home.strongArchive')}
@@ -4599,10 +4646,20 @@ export default function Home() {
                               return null
                             })()}
                             {!active && (unreadMap[c.id] ?? 0) > 0 && (
-                              <span className="min-w-[16px] h-[16px] px-1 flex items-center justify-center rounded-full btn-primary text-[9.5px] font-semibold leading-none">
+                              <span className="shrink-0 min-w-[16px] h-[16px] px-1 flex items-center justify-center rounded-full btn-primary text-[length:var(--app-text-micro)] font-semibold leading-none">
                                 {unreadMap[c.id] > 99 ? '99+' : unreadMap[c.id]}
                               </span>
                             )}
+                            {/* 会话短 ID：hover 可见，点击复制。放在最后且 min-w-0 可压缩，
+                                这样它 hover 出现时不会把前面的时间/徽章挤走。 */}
+                            <button
+                              onClick={(e) => { e.stopPropagation(); copyId(c.id) }}
+                              className="debug-id-badge font-mono text-[length:var(--app-text-micro)] px-1 py-px rounded border border-transparent text-[var(--text-muted)]/70 hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-[color,background-color,border-color,opacity,transform] opacity-0 group-hover:opacity-100 min-w-0 truncate shrink"
+                              title={`${t('home.convId')}: ${c.id}\n${t('home.clickToCopy')}`}
+                            >
+                              {copiedId === c.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
+                              {shortId(c.id)}
+                            </button>
                           </span>
                         )}
                       </button>
@@ -4685,7 +4742,7 @@ export default function Home() {
             <button
               onClick={() => setShowSettingsMenu((v) => !v)}
               title={t('home.settings')}
-              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 justify-center' : 'w-full'} ${showSettingsMenu ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : ''}`}
+              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg text-[length:var(--app-text-md)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors ${sidebarCollapsed ? 'w-9 h-9 justify-center' : 'w-full'} ${showSettingsMenu ? 'text-[var(--accent)] bg-[var(--accent-soft)]' : ''}`}
             >
               <Icon name="settings" size={15} />
               {!sidebarCollapsed && t('home.settings')}
@@ -4694,7 +4751,7 @@ export default function Home() {
               <div
                 className={`absolute bottom-full mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 animate-modal-in ${sidebarCollapsed ? 'left-0' : 'left-0'} w-52`}
               >
-                <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
+                <div className="px-3 py-1.5 text-[length:var(--app-text-2xs)] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
                   {t('home.settings')}
                 </div>
                 {settingsItems.map((item) => (
@@ -4704,7 +4761,7 @@ export default function Home() {
                       setShowSettingsMenu(false)
                       navigate(item.path)
                     }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <Icon name={item.icon} size={14} />
                     <span className="flex-1 text-left">{t(item.labelKey)}</span>
@@ -4735,11 +4792,11 @@ export default function Home() {
                       setShowSettingsMenu(false)
                       setAuditOpen(true)
                     }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <Icon name="history" size={14} />
                     <span className="flex-1 text-left">{t('home.audit')}</span>
-                    <span className="text-[10px] text-[var(--text-muted)] tnum">
+                    <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] tnum">
                       {useAuditStore.getState().entries.length}
                     </span>
                   </button>
@@ -4805,14 +4862,14 @@ export default function Home() {
             <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center brand-glow shrink-0">
               <Icon name="bolt" size={14} white />
             </div>
-            <span className="text-[13.5px] font-medium truncate">
+            <span className="text-[length:var(--app-text-md)] font-medium truncate">
               {currentConversation?.title ?? (currentProject ? currentProject.name : t('home.welcome'))}
             </span>
             {/* 会话 ID：点击复制完整 ID，排查问题用 */}
             {currentConversation && (
               <button
                 onClick={() => copyId(currentConversation.id)}
-                className="debug-id-badge shrink-0 font-mono text-[9.5px] px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]/40 transition-colors"
+                className="debug-id-badge shrink-0 font-mono text-[length:var(--app-text-micro)] px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-secondary)]/60 text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]/40 transition-colors"
                 title={`${t('home.convId')}: ${currentConversation.id}\n${t('home.clickToCopy')}`}
               >
                 {copiedId === currentConversation.id ? <Icon name="check" size={9} className="text-[var(--success)]" /> : '#'}
@@ -4822,7 +4879,7 @@ export default function Home() {
             {/* 会话内 token/成本累计（会话打开时加载，任务结束后刷新） */}
             {currentConversation && tokenStats && tokenStats.messages_count > 0 && (
               <span
-                className="shrink-0 text-[10px] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)] text-[var(--text-muted)]"
+                className="shrink-0 text-[length:var(--app-text-2xs)] tabular-nums px-1.5 py-0.5 rounded-md bg-[var(--bg-hover)] text-[var(--text-muted)]"
                 title={t('home.tokenTotalHint')}
               >
                 ↑{fmtTokens(tokenStats.total_in)} ↓{fmtTokens(tokenStats.total_out)}
@@ -4853,7 +4910,7 @@ export default function Home() {
                       <button
                         onClick={() => setShowExportMenu((v) => !v)}
                         disabled={messages.length === 0}
-                        className="w-full flex items-center justify-between gap-2 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="w-full flex items-center justify-between gap-2 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <span className="flex items-center gap-2.5">
                           <Icon name="download" size={14} />
@@ -4874,7 +4931,7 @@ export default function Home() {
                                 exportConversationFile(fmt)
                                 setShowMoreMenu(false)
                               }}
-                              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                             >
                               <Icon name="file" size={14} />
                               {label}
@@ -4885,7 +4942,7 @@ export default function Home() {
                               copyConversation()
                               setShowMoreMenu(false)
                             }}
-                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                           >
                             <Icon name="check" size={14} />
                             {t('home.exportCopy')}
@@ -4899,7 +4956,7 @@ export default function Home() {
                         void handleRollback()
                       }}
                       disabled={rollbackBusy || messages.length === 0}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                     >
                       <Icon name="git-branch" size={14} />
                       {t('home.rollback')}
@@ -4910,7 +4967,7 @@ export default function Home() {
                         handleOpenTimeline()
                       }}
                       disabled={messages.length === 0}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                     >
                       <Icon name="history" size={14} />
                       {t('home.timeline')}
@@ -4921,7 +4978,7 @@ export default function Home() {
                         void handleSummarizeMemory()
                       }}
                       disabled={summarizing || messages.length === 0}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                     >
                       <Icon name="lightbulb" size={14} />
                       {t('home.summarizeMemory')}
@@ -4932,7 +4989,7 @@ export default function Home() {
                         void handleCompact()
                       }}
                       disabled={compacting || messages.length === 0}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40"
                     >
                       <Icon name="refresh" size={14} className={compacting ? 'animate-spin' : ''} />
                       {t('home.compactHistory')}
@@ -4943,7 +5000,7 @@ export default function Home() {
                           setShowMoreMenu(false)
                           handleOpenShell()
                         }}
-                        className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         <Icon name="terminal" size={14} />
                         {t('home.openShell')}
@@ -4955,7 +5012,7 @@ export default function Home() {
                         setShowMoreMenu(false)
                         setSidebarCollapsed((v) => !v)
                       }}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <Icon name="panel" size={14} />
                       {t('home.toggleSidebar')}
@@ -4967,7 +5024,7 @@ export default function Home() {
                           setSearchMode('conv')
                           setTimeout(() => searchInputRef.current?.focus(), 50)
                         }}
-                        className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         <Icon name="search" size={14} />
                         {t('home.searchInConv')}
@@ -5007,7 +5064,7 @@ export default function Home() {
         {toolHealthMissing.length > 0 && (
           <button
             onClick={() => navigate('/health')}
-            className="shrink-0 flex items-center justify-center gap-2 px-4 py-1.5 text-[11px] bg-[var(--warning)]/15 text-[var(--warning)] border-b border-[var(--border)] hover:bg-[var(--warning)]/25 transition-colors"
+            className="shrink-0 flex items-center justify-center gap-2 px-4 py-1.5 text-[length:var(--app-text-xs)] bg-[var(--warning)]/15 text-[var(--warning)] border-b border-[var(--border)] hover:bg-[var(--warning)]/25 transition-colors"
           >
             <Icon name="health" size={12} />
             {t('home.toolsHealthBanner', { missing: toolHealthMissing.join(' / ') })}
@@ -5015,7 +5072,12 @@ export default function Home() {
         )}
 
         {/* 消息区 / 空状态 */}
-        <div ref={scrollRef} onScroll={handleScroll} className="chat-scroll flex-1 overflow-y-auto px-6 py-6">
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          data-layout="message-list"
+          className="chat-scroll flex-1 overflow-y-auto px-6 py-6"
+        >
           {!currentProject ? (
             <EmptyState
               onAdd={() => setShowAddDialog(true)}
@@ -5028,7 +5090,7 @@ export default function Home() {
               // 会话切换中：messages 已清空、新会话消息尚未加载完成，轻量占位避免空状态闪烁
               <div className="h-full flex flex-col items-center justify-center text-center">
                 <Spinner size={32} />
-                <p className="text-[12px] text-[var(--text-muted)] mt-3">{t('home.loadingConv')}</p>
+                <p className="text-[length:var(--app-text-sm)] text-[var(--text-muted)] mt-3">{t('home.loadingConv')}</p>
               </div>
             ) : (
               <ChatEmptyState onQuick={(text) => fillDraft(text)} />
@@ -5057,13 +5119,23 @@ export default function Home() {
               )}
               {/* 虚拟滚动容器：只挂载可视区域附近的条目，条目绝对定位 + translateY 排列；
                   height 为全部条目累计高度，滚动容器据此产生真实滚动条；measureElement 动态测量并缓存 */}
-              <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+              {/* data-layout / data-total 是布局探针（scripts/layout-probe.mjs）的定位点。
+                  **总数必须由应用自己报**（data-total），不能让探针去数 DOM——
+                  虚拟列表只挂载可视窗口附近的条目，querySelectorAll 拿到的是「挂载数」，
+                  把它当总数会让基线变成一个没人能解释的数字。 */}
+              <div
+                data-layout="message-virtual"
+                data-total={virtualItems.length}
+                style={{ height: virtualizer.getTotalSize(), position: 'relative' }}
+              >
                 {virtualizer.getVirtualItems().map((vi) => {
                   const item = virtualItems[vi.index]
                   return (
                     <div
                       key={vi.key}
                       ref={virtualizer.measureElement}
+                      data-layout="message-item"
+                      data-kind={item.kind}
                       data-index={vi.index}
                       data-vkey={item.key}
                       style={{
@@ -5132,8 +5204,8 @@ export default function Home() {
                             <details className="rounded-xl border border-[var(--success)]/40 bg-[var(--bg-elevated)] animate-fade-in-up overflow-hidden" open={false}>
                               <summary className="flex items-center gap-2 px-4 py-2 cursor-pointer select-none list-none [&::-webkit-details-marker]:hidden">
                                 <Icon name="check" size={13} className="text-[var(--success)] shrink-0" />
-                                <span className="text-[12px] font-semibold text-[var(--success)]">{t('home.approvedPlanTitle')}</span>
-                                <span className="text-[11px] text-[var(--text-muted)]">{t('home.approvedPlanHint')}</span>
+                                <span className="text-[length:var(--app-text-sm)] font-semibold text-[var(--success)]">{t('home.approvedPlanTitle')}</span>
+                                <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.approvedPlanHint')}</span>
                               </summary>
                               <div className="max-h-48 overflow-y-auto px-4 pb-3 border-t border-[var(--border)]">
                                 <Markdown>{approvedPlan.plan}</Markdown>
@@ -5147,11 +5219,11 @@ export default function Home() {
                               <div className="rounded-2xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)] animate-fade-in-up overflow-hidden">
                                 <div className="flex items-center gap-2 px-4 py-2.5 border-b border-[var(--border)] bg-[var(--accent-soft)]">
                                   <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-pulse" />
-                                  <span className="text-[13px] font-semibold text-[var(--accent)]">{t('home.planReviewTitle')}</span>
-                                  <span className="text-[11px] text-[var(--text-muted)] ml-auto">{t('home.planReviewHint')}</span>
+                                  <span className="text-[length:var(--app-text-md)] font-semibold text-[var(--accent)]">{t('home.planReviewTitle')}</span>
+                                  <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] ml-auto">{t('home.planReviewHint')}</span>
                                   <button
                                     onClick={() => setPlanEditing((v) => !v)}
-                                    className="ml-1 flex items-center gap-1 px-2 h-6 rounded-md text-[11px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
+                                    className="ml-1 flex items-center gap-1 px-2 h-6 rounded-md text-[length:var(--app-text-xs)] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors"
                                     title={t('home.planEdit')}
                                   >
                                     <Icon name={planEditing ? 'check' : 'edit'} size={11} />
@@ -5165,7 +5237,7 @@ export default function Home() {
                                       onChange={(e) => setPlanDraft(e.target.value)}
                                       rows={10}
                                       spellCheck={false}
-                                      className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[12px] leading-relaxed outline-none resize-y font-mono placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+                                      className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[length:var(--app-text-sm)] leading-relaxed outline-none resize-y font-mono placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
                                     />
                                   </div>
                                 ) : (
@@ -5179,7 +5251,7 @@ export default function Home() {
                                     onChange={(e) => setPlanFeedback(e.target.value)}
                                     placeholder={t('home.planFeedbackPlaceholder')}
                                     rows={2}
-                                    className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[12px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+                                    className="w-full rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] px-3 py-2 text-[length:var(--app-text-sm)] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
                                   />
                                 </div>
                                 <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-card)]">
@@ -5193,7 +5265,7 @@ export default function Home() {
                                       void resolvePlanReview(pendingPlan.requestId, false, fb || undefined)
                                       setPlanFeedback('')
                                     }}
-                                    className="h-8 px-4 rounded-lg border border-[var(--border)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--warning)] hover:border-[var(--warning)]/50 transition-colors"
+                                    className="h-8 px-4 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] font-medium text-[var(--text-secondary)] hover:text-[var(--warning)] hover:border-[var(--warning)]/50 transition-colors"
                                   >
                                     {t('home.planReject')}
                                   </button>
@@ -5232,8 +5304,8 @@ export default function Home() {
                                   className="w-full flex items-center gap-2 py-1.5 text-left hover:opacity-80 transition-opacity"
                                 >
                                   <Icon name="check" size={11} className="text-[var(--accent)] shrink-0" />
-                                  <span className="text-[12px] text-[var(--text-secondary)]">{t('home.todoTitle')}</span>
-                                  <span className="text-[11px] text-[var(--text-muted)] tabular-nums">{done}/{todos.length}</span>
+                                  <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">{t('home.todoTitle')}</span>
+                                  <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] tabular-nums">{done}/{todos.length}</span>
                                   <div className="ml-auto h-1 w-12 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                                     <div className="h-full rounded-full bg-[var(--accent)] transition-[width]" style={{ width: `${pct}%` }} />
                                   </div>
@@ -5242,7 +5314,7 @@ export default function Home() {
                                 {todoOpen && (
                                   <div className="border-t border-[var(--border)]/60 py-1.5 space-y-0.5">
                                     {todos.map((td) => (
-                                      <div key={td.id} className="flex items-start gap-2 py-0.5 text-[12px] leading-relaxed">
+                                      <div key={td.id} className="flex items-start gap-2 py-0.5 text-[length:var(--app-text-sm)] leading-relaxed">
                                         {td.status === 'done' ? (
                                           <Icon name="check" size={11} className="text-[var(--success)] shrink-0 mt-0.5" />
                                         ) : td.status === 'in_progress' && isStreaming ? (
@@ -5267,7 +5339,7 @@ export default function Home() {
                                         >
                                           {td.content}
                                           {td.status === 'in_progress' && !isStreaming && (
-                                            <span className="text-[11px] text-[var(--text-muted)]">（未完成）</span>
+                                            <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">（未完成）</span>
                                           )}
                                         </span>
                                       </div>
@@ -5315,12 +5387,12 @@ export default function Home() {
                             <div className="flex items-center gap-3 rounded-xl border border-dashed border-[var(--warning)]/50 bg-[var(--warning)]/8 px-3.5 py-2.5 animate-fade-in-up">
                               <Icon name="refresh" size={14} className="shrink-0 text-[var(--warning)]" />
                               <div className="min-w-0 flex-1">
-                                <div className="text-[12px] font-semibold text-[var(--text-secondary)]">
+                                <div className="text-[length:var(--app-text-sm)] font-semibold text-[var(--text-secondary)]">
                                   {orphanUserMessage.role === 'assistant'
                                     ? t('home.interruptedBannerPartial')
                                     : t('home.interruptedBanner')}
                                 </div>
-                                <div className="text-[11px] text-[var(--text-muted)] leading-relaxed">
+                                <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed">
                                   {orphanUserMessage.role === 'assistant'
                                     ? t('home.interruptedBannerPartialDesc')
                                     : t('home.interruptedBannerDesc')}
@@ -5354,7 +5426,7 @@ export default function Home() {
               <Icon name="chevron-right" size={13} className="rotate-90" />
               {isStreaming ? t('home.scrollToLatest') : t('home.scrollBottom')}
               {unreadCount > 0 && (
-                <span className="ml-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full btn-primary text-[10px] font-semibold leading-none shadow-[0_0_0_3px_var(--accent-soft)]">
+                <span className="ml-0.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full btn-primary text-[length:var(--app-text-2xs)] font-semibold leading-none shadow-[0_0_0_3px_var(--accent-soft)]">
                   {unreadCount > 99 ? '99+' : unreadCount}
                 </span>
               )}
@@ -5367,7 +5439,7 @@ export default function Home() {
           {/* 上下文可视条 + 断点续跑入口 */}
           <div className="max-w-3xl mx-auto flex items-center gap-2 pb-1.5 min-h-5">
             {runtimeWatching && (
-              <span className="flex items-center gap-1 px-1.5 py-px rounded-full bg-[var(--success)]/15 text-[var(--success)] text-[11px]">
+              <span className="flex items-center gap-1 px-1.5 py-px rounded-full bg-[var(--success)]/15 text-[var(--success)] text-[length:var(--app-text-xs)]">
                 <span className="relative flex h-1.5 w-1.5">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--success)] opacity-75" />
                   <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-[var(--success)]" />
@@ -5377,7 +5449,7 @@ export default function Home() {
             )}
             {isStreaming && streamingRecoveryParentRunId && (
               <span
-                className="flex items-center gap-1 px-1.5 py-px rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px]"
+                className="flex items-center gap-1 px-1.5 py-px rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[length:var(--app-text-xs)]"
                 title={streamingRecoveryParentRunId}
               >
                 <Icon name="refresh" size={10} />
@@ -5390,7 +5462,7 @@ export default function Home() {
               </span>
             )}
             {ctxInfo && currentConversation && (
-              <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]">
+              <div className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
                 <Icon name="info" size={11} />
                 {t('home.ctxBar', { count: ctxInfo.message_count })}
                 {ctxInfo.event_count > 0 && (
@@ -5430,7 +5502,7 @@ export default function Home() {
                       {t('home.ctxV2Badge', { count: ctxInfo.context_v2.fact_count })}
                     </button>
                     {ctxV2Open && ctxV2Detail && (
-                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-96 max-h-96 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] p-3 text-[11px] text-[var(--text-secondary)] shadow-xl">
+                      <span className="absolute bottom-full left-0 z-50 mb-2 block w-96 max-h-96 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] p-3 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] shadow-xl">
                         <span className="mb-2 block font-medium text-[var(--text-primary)]">
                           {t('home.ctxV2PanelTitle')}
                         </span>
@@ -5546,7 +5618,7 @@ export default function Home() {
                               { count: ctxV2Detail.reconciliation.count },
                             )}
                             {ctxV2Detail.reconciliation.latest_conflicts.length > 0 && (
-                              <span className="mt-1 block break-all text-[10px]">
+                              <span className="mt-1 block break-all text-[length:var(--app-text-2xs)]">
                                 {ctxV2Detail.reconciliation.latest_conflicts.join(' · ')}
                               </span>
                             )}
@@ -5558,7 +5630,7 @@ export default function Home() {
                               {t('home.ctxBudgetBarTitle')}
                             </span>
                             {ctxV2Detail.budget.profile && (
-                              <span className="rounded bg-[var(--accent)]/10 px-1 py-px text-[10px] text-[var(--accent)]">
+                              <span className="rounded bg-[var(--accent)]/10 px-1 py-px text-[length:var(--app-text-2xs)] text-[var(--accent)]">
                                 {ctxV2Detail.budget.profile}
                               </span>
                             )}
@@ -5591,7 +5663,7 @@ export default function Home() {
                               }}
                             />
                             <span
-                              className="bg-[var(--info)]"
+                              className="bg-[var(--accent)]"
                               title={`archive ${ctxV2Detail.budget.archive_tokens.toLocaleString()}`}
                               style={{
                                 width: `${(ctxV2Detail.budget.archive_tokens / Math.max(ctxV2Detail.budget.total_tokens, 1)) * 100}%`,
@@ -5605,7 +5677,7 @@ export default function Home() {
                               }}
                             />
                           </span>
-                          <span className="mt-1 block text-[10px] text-[var(--text-muted)]">
+                          <span className="mt-1 block text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                             {t('home.ctxV2Budget', {
                               hot: ctxV2Detail.budget.hot_tokens.toLocaleString(),
                               task: ctxV2Detail.budget.task_tokens.toLocaleString(),
@@ -5639,12 +5711,12 @@ export default function Home() {
                             <span className="mb-1 flex items-center gap-1 font-medium text-[var(--text-primary)]">
                               {t('home.ctxHealthTitle')}
                               {sessionHealth.degraded && (
-                                <span className="rounded bg-[var(--warning)]/15 px-1 py-px text-[10px] text-[var(--warning)]">
+                                <span className="rounded bg-[var(--warning)]/15 px-1 py-px text-[length:var(--app-text-2xs)] text-[var(--warning)]">
                                   {t('home.ctxHealthDegraded')}
                                 </span>
                               )}
                             </span>
-                            <span className="block text-[10px] text-[var(--text-muted)]">
+                            <span className="block text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                               {t('home.ctxHealthMetrics', {
                                 compress: sessionHealth.compress_count,
                                 flip: Math.round(sessionHealth.fact_flip_rate * 100),
@@ -5654,13 +5726,13 @@ export default function Home() {
                             </span>
                             {sessionHealth.recent_invalidations.length > 0 && (
                               <span className="mt-1 block">
-                                <span className="block text-[10px] font-medium text-[var(--text-primary)]">
+                                <span className="block text-[length:var(--app-text-2xs)] font-medium text-[var(--text-primary)]">
                                   {t('home.ctxHealthInvalidations')}
                                 </span>
                                 {sessionHealth.recent_invalidations.map((item) => (
                                   <span
                                     key={`${item.fact_kind}/${item.fact_key}/${item.invalidated_at}`}
-                                    className="block break-all text-[10px] text-[var(--text-muted)]"
+                                    className="block break-all text-[length:var(--app-text-2xs)] text-[var(--text-muted)]"
                                   >
                                     · {item.fact_kind}/{item.fact_key} — {item.reason}
                                   </span>
@@ -5670,7 +5742,7 @@ export default function Home() {
                             {sessionHealth.advice.length > 0 && (
                               <span className="mt-1 block space-y-0.5">
                                 {sessionHealth.advice.map((item) => (
-                                  <span key={item} className="block break-all text-[10px] text-[var(--warning)]">
+                                  <span key={item} className="block break-all text-[length:var(--app-text-2xs)] text-[var(--warning)]">
                                     · {item}
                                   </span>
                                 ))}
@@ -5711,7 +5783,7 @@ export default function Home() {
                       {/* 剩余轮数预测：<5 轮时变橙提醒，<2 变红 */}
                       {turnsLeft > 0 && turnsLeft <= 5 && (
                         <span
-                          className={`tnum text-[10.5px] px-1 rounded ${
+                          className={`tnum text-[length:var(--app-text-xs)] px-1 rounded ${
                             turnsLeft <= 2
                               ? 'text-[var(--danger)] bg-[var(--danger-50)]'
                               : 'text-[var(--warning)] bg-[var(--warning-50)]'
@@ -5729,12 +5801,12 @@ export default function Home() {
             {unfinishedConv && unfinishedConv.conversationId === currentConversation?.id && !isStreaming && (
               <div className="ml-auto flex items-center gap-2 min-w-0">
                 {unfinishedConv.recoveryPolicy === 'manual' && (
-                  <span className="truncate text-[10.5px] text-[var(--warning)]" title={unfinishedConv.error || t('home.recoveryManualHint')}>
+                  <span className="truncate text-[length:var(--app-text-xs)] text-[var(--warning)]" title={unfinishedConv.error || t('home.recoveryManualHint')}>
                     {t('home.recoveryManual')}
                   </span>
                 )}
                 {unfinishedConv.recoveryPolicy === 'verify_effects' && (
-                  <span className="truncate text-[10.5px] text-[var(--warning)]" title={unfinishedConv.error || t('home.recoveryVerifyHint')}>
+                  <span className="truncate text-[length:var(--app-text-xs)] text-[var(--warning)]" title={unfinishedConv.error || t('home.recoveryVerifyHint')}>
                     {t('home.recoveryVerify')}
                   </span>
                 )}
@@ -5756,7 +5828,7 @@ export default function Home() {
                         : modelOptions,
                     )
                   }}
-                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium hover:brightness-110 transition-[filter]"
+                  className="shrink-0 flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[length:var(--app-text-xs)] font-medium hover:brightness-110 transition-[filter]"
                 >
                   <Icon name="arrow-down" size={11} />
                   {unfinishedConv.recoveryPolicy === 'manual' || unfinishedConv.recoveryPolicy === 'verify_effects'
@@ -5774,7 +5846,7 @@ export default function Home() {
                 <button
                   onClick={() => setQueuedOpen((v) => !v)}
                   aria-expanded={queuedOpen}
-                  className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                  className="flex items-center gap-1.5 text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 >
                   <Icon name="terminal" size={11} />
                   {t('home.queuedBar', { count: queuedList.length })}
@@ -5787,7 +5859,7 @@ export default function Home() {
                 <button
                   onClick={() => void handleInsertQueued()}
                   title={t(isStreaming ? 'home.queuedInsertHint' : 'home.queuedInsertIdleHint')}
-                  className="flex items-center gap-1 h-5 px-2 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] text-[10px] font-medium hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,transform]"
+                  className="flex items-center gap-1 h-5 px-2 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] text-[length:var(--app-text-2xs)] font-medium hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,transform]"
                 >
                   <Icon name="bolt" size={10} />
                   {t(isStreaming ? 'home.queuedInsert' : 'home.queuedInsertIdle')}
@@ -5800,11 +5872,11 @@ export default function Home() {
                       key={q.id}
                       className="flex items-center gap-2 rounded-lg modern-card border-[var(--border)] px-2.5 py-1.5"
                     >
-                      <span className="text-[11px] text-[var(--text-primary)] truncate flex-1" title={q.content}>
+                      <span className="text-[length:var(--app-text-xs)] text-[var(--text-primary)] truncate flex-1" title={q.content}>
                         {q.content}
                       </span>
                       {q.agent_owned && (
-                        <span className="text-[9px] px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] shrink-0">
+                        <span className="text-[length:var(--app-text-micro)] px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] shrink-0">
                           {t('home.queuedAgentLabel')}
                         </span>
                       )}
@@ -5845,13 +5917,13 @@ export default function Home() {
             {dragActive && (
               <div className="absolute -inset-px rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--bg-secondary)]/85 backdrop-blur-sm flex items-center justify-center gap-2 z-40 pointer-events-none">
                 <Icon name="file" size={15} className="text-[var(--accent)]" />
-                <span className="text-[12px] font-medium text-[var(--accent)]">{t('home.dropHint')}</span>
+                <span className="text-[length:var(--app-text-sm)] font-medium text-[var(--accent)]">{t('home.dropHint')}</span>
               </div>
             )}
             {/* 斜杠快捷指令面板（行首 / 后弹出） */}
             {slashCandidates && (
               <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 max-h-72 overflow-y-auto animate-modal-in">
-                <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
+                <div className="px-3 py-1.5 text-[length:var(--app-text-2xs)] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
                   {t('home.slashHint')}
                 </div>
                 {slashCandidates.length === 0 && (
@@ -5870,8 +5942,8 @@ export default function Home() {
                       <Icon name={c.icon} size={13} />
                     </span>
                     <span className="min-w-0">
-                      <span className="block text-[12px] text-[var(--text-primary)]">{c.title}</span>
-                      <span className="block text-[10.5px] text-[var(--text-muted)] truncate">/{c.id}</span>
+                      <span className="block text-[length:var(--app-text-sm)] text-[var(--text-primary)]">{c.title}</span>
+                      <span className="block text-[length:var(--app-text-xs)] text-[var(--text-muted)] truncate">/{c.id}</span>
                     </span>
                   </button>
                 ))}
@@ -5880,7 +5952,7 @@ export default function Home() {
             {/* @ 引用候选面板（@ 后输入路径片段时弹出） */}
             {refCandidates && (
               <div className="absolute bottom-full left-3 right-3 mb-1.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 z-50 max-h-60 overflow-y-auto animate-modal-in">
-                <div className="px-3 py-1.5 text-[10px] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
+                <div className="px-3 py-1.5 text-[length:var(--app-text-2xs)] font-medium text-[var(--text-muted)] border-b border-[var(--border)]">
                   {t('home.refHint')}「@{refQuery}」
                 </div>
                 {refCandidates.length === 0 && (
@@ -5898,7 +5970,7 @@ export default function Home() {
                       }`}
                     >
                       <Icon name={isConv ? 'chat' : 'file'} size={12} className="text-[var(--text-muted)] shrink-0" />
-                      <span className="text-[11.5px] text-[var(--text-primary)] truncate">{isConv ? `会话：${c.name}` : c.path}</span>
+                      <span className="text-[length:var(--app-text-xs)] text-[var(--text-primary)] truncate">{isConv ? `会话：${c.name}` : c.path}</span>
                     </button>
                   )
                 })}
@@ -5977,7 +6049,7 @@ export default function Home() {
             />
             {/* 生成媒体状态条（图片/视频/音频任务进行中；含停止按钮，复用 stopGeneration） */}
             {currentGen && (
-              <div className="flex items-center gap-2 mx-3 mt-1.5 px-2.5 py-1.5 rounded-lg bg-[var(--accent-soft)] text-[11px] text-[var(--accent)]">
+              <div className="flex items-center gap-2 mx-3 mt-1.5 px-2.5 py-1.5 rounded-lg bg-[var(--accent-soft)] text-[length:var(--app-text-xs)] text-[var(--accent)]">
                 <Icon name="spark" size={11} className="animate-pulse shrink-0" />
                 <span className="truncate">
                   {t('home.genProgress', '正在生成{{kind}}', {
@@ -6000,7 +6072,7 @@ export default function Home() {
             )}
             {/* 消息引用条（Quote 后展示；× 仅移除 msg: 标记，正文引用行可手动编辑） */}
             {pendingQuote && (
-              <div className="flex items-center gap-1.5 mx-3 mt-1 px-2 py-1 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)]">
+              <div className="flex items-center gap-1.5 mx-3 mt-1 px-2 py-1 rounded-md bg-[var(--accent-soft)] text-[length:var(--app-text-xs)] text-[var(--accent)]">
                 <Icon name="quote" size={10} className="shrink-0" />
                 <button
                   onClick={() => locateQuotedMessage(pendingQuote.id)}
@@ -6029,7 +6101,7 @@ export default function Home() {
                   return (
                     <span
                       key={p}
-                      className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[10.5px] text-[var(--accent)] max-w-56"
+                      className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[length:var(--app-text-xs)] text-[var(--accent)] max-w-56"
                     >
                       <Icon name={convTitle ? 'chat' : 'file'} size={10} className="shrink-0" />
                       <span className="truncate" title={p}>
@@ -6081,7 +6153,7 @@ export default function Home() {
                     title={t('home.generate')}
                     aria-label={t('home.generate')}
                     aria-expanded={genMenuOpen}
-                    className={`flex items-center gap-1 pl-1.5 pr-2 py-1 rounded-lg text-[11px] transition-colors ${
+                    className={`flex items-center gap-1 pl-1.5 pr-2 py-1 rounded-lg text-[length:var(--app-text-xs)] transition-colors ${
                       genMenuOpen || genMode
                         ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                         : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -6104,7 +6176,7 @@ export default function Home() {
                             setGenMenuOpen(false)
                             inputRef.current?.focus()
                           }}
-                          className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] transition-colors ${
+                          className={`w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] transition-colors ${
                             genMode === item.kind
                               ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                               : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -6123,7 +6195,7 @@ export default function Home() {
                               setGenMode(null)
                               setGenMenuOpen(false)
                             }}
-                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors"
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors"
                           >
                             <Icon name="close" size={14} className="shrink-0" />
                             {t('home.genCancel')}
@@ -6146,7 +6218,7 @@ export default function Home() {
                   <button
                     onClick={() => setShowModelSettings((v) => !v)}
                     title={t('home.modelSettings')}
-                    className={`flex items-center gap-1.5 pl-1.5 pr-2 py-1 rounded-lg text-[11px] transition-colors ${
+                    className={`flex items-center gap-1.5 pl-1.5 pr-2 py-1 rounded-lg text-[length:var(--app-text-xs)] transition-colors ${
                       showModelSettings
                         ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                         : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -6163,7 +6235,7 @@ export default function Home() {
                 {/* Web 预览已移至右侧栏 Preview 面板 */}
                 {isStreaming && (
                   <span
-                    className="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] shrink-0"
+                    className="flex items-center gap-1.5 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] shrink-0"
                     title={t('home.queuedHint')}
                   >
                     <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse shrink-0" />
@@ -6173,7 +6245,7 @@ export default function Home() {
                   </span>
                 )}
                 {/* 快捷键提示：仅 2xl 显示完整说明，避免窄屏挤压 */}
-                <span className="hidden 2xl:inline whitespace-nowrap text-[11px] text-[var(--text-muted)] shrink-0">
+                <span className="hidden 2xl:inline whitespace-nowrap text-[length:var(--app-text-xs)] text-[var(--text-muted)] shrink-0">
                   {isStreaming
                     ? t('home.queuedHint')
                     : `Enter ${t('home.send')} · Shift+Enter ${t('home.newline')}`}
@@ -6182,7 +6254,7 @@ export default function Home() {
               {/* 右侧操作按钮：sm 以下也允许换行（避免与左侧状态挤一行） */}
               <div className="flex items-center gap-1.5 flex-wrap justify-end">
                 {!isStreaming && (
-                  <span className="hidden sm:inline text-[11px] tabular-nums text-[var(--text-muted)]">{draft.length}</span>
+                  <span className="hidden sm:inline text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-muted)]">{draft.length}</span>
                 )}
                 {isStreaming ? (
                   <>
@@ -6190,7 +6262,7 @@ export default function Home() {
                     {toolRuns.some((r) => r.status === 'running') && (
                       <button
                         onClick={() => stopCurrentTool()}
-                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-medium"
+                        className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[length:var(--app-text-sm)] font-medium"
                         title={t('home.stopTool')}
                       >
                         <Icon name="bolt" size={12} className="shrink-0" />
@@ -6204,7 +6276,7 @@ export default function Home() {
                         const next = cycle[(cycle.indexOf(streamSpeed) + 1) % cycle.length]
                         setStreamSpeed(next)
                       }}
-                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-mono font-medium tnum"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center gap-1 hover:bg-[var(--bg-hover)] active:scale-95 transition-[color,background-color,border-color,transform] text-[length:var(--app-text-sm)] font-mono font-medium tnum"
                       title={t('home.streamSpeedHint')}
                     >
                       {streamSpeed}x
@@ -6224,7 +6296,7 @@ export default function Home() {
                       }}
                       disabled={stopRequested}
                       aria-label={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
-                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
+                      className="h-8 px-2.5 md:px-3 rounded-full bg-[var(--danger)]/12 text-[var(--danger)] flex items-center gap-1.5 hover:bg-[var(--danger)]/20 active:scale-95 disabled:opacity-60 disabled:cursor-wait transition-[color,background-color,border-color,opacity,transform] text-[length:var(--app-text-sm)] font-medium"
                       title={t(stopRequested ? 'home.stopping' : 'home.stopGenerating')}
                     >
                       <span className={`w-2.5 h-2.5 rounded-[3px] bg-[var(--danger)] shrink-0 ${stopRequested ? 'animate-pulse' : ''}`} />
@@ -6234,7 +6306,7 @@ export default function Home() {
                     <button
                       onClick={handleSendToAgent}
                       disabled={!draft.trim() || stopRequested}
-                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] items-center justify-start gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[length:var(--app-text-sm)] font-medium"
                       title={t('home.sendToAgent')}
                     >
                       <Icon name="bolt" size={12} className="shrink-0" />
@@ -6254,7 +6326,7 @@ export default function Home() {
                     <button
                       onClick={() => setBatchOpen(true)}
                       disabled={!draft.trim() || stopRequested}
-                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[12px] font-medium"
+                      className="hidden xl:flex h-8 xl:px-2.5 rounded-full bg-[var(--bg-card)] text-[var(--text-secondary)] items-center justify-start gap-1 hover:bg-[var(--bg-hover)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-[color,background-color,border-color,opacity,transform] text-[length:var(--app-text-sm)] font-medium"
                       title={t('home.batchSend')}
                     >
                       <Icon name="package" size={12} />
@@ -6284,7 +6356,7 @@ export default function Home() {
                                 stopCurrentTool()
                                 setToolbarMoreOpen(false)
                               }}
-                              className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--warning)] hover:bg-[var(--bg-hover)] transition-colors"
+                              className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--warning)] hover:bg-[var(--bg-hover)] transition-colors"
                             >
                               <Icon name="bolt" size={14} className="shrink-0" />
                               {t('home.stopTool')}
@@ -6292,7 +6364,7 @@ export default function Home() {
                           )}
                           {/* 流式速度：弹层里做成横向 chip 选择 */}
                           <div className="px-3 py-2">
-                            <div className="text-[10px] text-[var(--text-muted)] mb-1.5 flex items-center gap-1.5">
+                            <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mb-1.5 flex items-center gap-1.5">
                               <Icon name="bolt" size={11} />
                               {t('home.streamSpeedHint')}
                             </div>
@@ -6304,7 +6376,7 @@ export default function Home() {
                                     setStreamSpeed(s)
                                     setToolbarMoreOpen(false)
                                   }}
-                                  className={`flex-1 h-7 rounded-md text-[11px] font-mono font-medium tnum transition-colors ${
+                                  className={`flex-1 h-7 rounded-md text-[length:var(--app-text-xs)] font-mono font-medium tnum transition-colors ${
                                     streamSpeed === s
                                       ? 'bg-[var(--accent)] text-white'
                                       : 'bg-[var(--bg-hover)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -6325,7 +6397,7 @@ export default function Home() {
                               }
                             }}
                             disabled={!draft.trim() || stopRequested}
-                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--accent)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             <Icon name="bolt" size={14} className="shrink-0" />
                             {t('home.sendToAgent')}
@@ -6337,7 +6409,7 @@ export default function Home() {
                               setToolbarMoreOpen(false)
                             }}
                             disabled={!draft.trim() || stopRequested}
-                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           >
                             <Icon name="package" size={14} className="shrink-0" />
                             {t('home.batchSend')}
@@ -6353,7 +6425,7 @@ export default function Home() {
                       <button
                         onClick={() => setGenMode(null)}
                         title={t('home.genCancelHint', '取消生成模式')}
-                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[12px] font-medium"
+                        className="h-8 px-2.5 rounded-full bg-[var(--accent)]/12 text-[var(--accent)] flex items-center gap-1.5 hover:bg-[var(--accent)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[length:var(--app-text-sm)] font-medium"
                       >
                         <Icon name={GEN_ITEMS.find((g) => g.kind === genMode)?.icon ?? 'spark'} size={12} className="shrink-0" />
                         <span className="hidden sm:inline">{t(`home.genKind.${genMode}`)}</span>
@@ -6403,22 +6475,11 @@ export default function Home() {
           >
           {/* Tab 切换：右侧栏过窄时仅显示图标（flex-1 均分），悬停 title 提示 */}
           {(() => {
-            const tabs: { key: typeof rightTab; icon: IconName; label: string }[] = [
-              { key: 'overview', icon: 'info', label: t('home.overview') },
-              { key: 'files', icon: 'folder', label: t('home.fileTree') },
-              { key: 'memories', icon: 'lightbulb', label: t('home.memories') },
-              { key: 'stats', icon: 'receipt', label: t('home.toolStats') },
-              { key: 'git', icon: 'git-branch', label: t('home.git') },
-              { key: 'preview', icon: 'devices', label: t('home.openPreview') },
-              { key: 'devices', icon: 'phone', label: t('home.devices') },
-              { key: 'symbols', icon: 'search', label: t('home.symbols') },
-              { key: 'analyze', icon: 'spark', label: t('home.analyze') },
-              { key: 'shell', icon: 'terminal', label: t('home.terminal') },
-              { key: 'terminal', icon: 'receipt', label: t('home.terminalLogs') },
-              { key: 'timeline', icon: 'archive', label: t('home.timeline') },
-            ]
+            const tabs = rightTabs
             return (
               <div
+                role="tablist"
+                aria-label={t('home.rightPanel')}
                 className={`right-tabbar flex flex-wrap items-center gap-1 border-b border-[var(--border)] shrink-0 ${
                   rightCompact ? 'px-2 py-1.5' : 'px-3 py-1.5'
                 }`}
@@ -6428,15 +6489,18 @@ export default function Home() {
                   return (
                     <button
                       key={tb.key}
+                      role="tab"
+                      aria-selected={active}
+                      aria-controls={`right-panel-${tb.key}`}
                       onClick={() => setRightTab(tb.key)}
                       title={tb.label}
-                      className={`flex items-center gap-2 h-9 shrink-0 rounded-lg text-[12.5px] font-medium transition-colors ${
+                      className={`flex items-center gap-2 h-9 shrink-0 rounded-lg text-[length:var(--app-text-sm)] font-medium transition-colors ${
                         active
                           ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
                           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
                       } px-3.5`}
                     >
-                      <Icon name={tb.icon} size={15} />
+                      <span aria-hidden="true"><Icon name={tb.icon} size={15} /></span>
                       <span className="whitespace-nowrap">{tb.label}</span>
                     </button>
                   )
@@ -6445,8 +6509,16 @@ export default function Home() {
             )
           })()}
 
-          {/* Tab 内容 */}
-          <div className="flex-1 overflow-y-auto">
+          {/* Tab 内容：单一 tabpanel 容器，id 跟随当前 tab，
+              与各 tab 的 aria-controls 对上。未激活的 tab 不渲染内容
+              （本来的行为），所以不需要 aria-hidden 那一套。 */}
+          <div
+            role="tabpanel"
+            id={`right-panel-${rightTab}`}
+            aria-label={rightTabs.find((tb) => tb.key === rightTab)?.label}
+            tabIndex={0}
+            className="flex-1 overflow-y-auto focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+          >
             <Suspense
               fallback={(
                 <div className="h-full min-h-40 flex items-center justify-center" role="status" aria-live="polite">
@@ -6463,8 +6535,8 @@ export default function Home() {
                       <Icon name="bolt" size={16} white />
                     </div>
                     <div className="min-w-0">
-                      <div className="text-[13px] font-medium truncate">{currentProject.name}</div>
-                      <div className="text-[11px] text-[var(--text-muted)]">
+                      <div className="text-[length:var(--app-text-md)] font-medium truncate">{currentProject.name}</div>
+                      <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
                         {deriveProjectType(currentProject).label}
                       </div>
                     </div>
@@ -6494,7 +6566,7 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={handleOpenShell}
-                      className="w-full flex items-center justify-center gap-1.5 mt-1 px-2.5 py-2 rounded-lg text-[11px] text-[var(--text-secondary)] bg-[var(--bg-hover)]/60 border border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+                      className="w-full flex items-center justify-center gap-1.5 mt-1 px-2.5 py-2 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] bg-[var(--bg-hover)]/60 border border-[var(--border)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
                     >
                       <Icon name="terminal" size={12} />
                       {t('home.openShell')}
@@ -6559,8 +6631,8 @@ export default function Home() {
                     <div className="rounded-xl modern-card p-3">
                       <div className="flex items-center gap-1.5">
                         <Icon name="folder" size={12} className="text-[var(--accent)]" />
-                        <span className="text-[12px] font-medium">{t('home.workspaceModules')}</span>
-                        <span className="px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[var(--accent)]/10 text-[var(--accent)]">
+                        <span className="text-[length:var(--app-text-sm)] font-medium">{t('home.workspaceModules')}</span>
+                        <span className="px-1.5 py-0.5 rounded-full text-[length:var(--app-text-2xs)] font-medium bg-[var(--accent)]/10 text-[var(--accent)]">
                           {editingModules ? moduleDraft.length : mods.length}
                         </span>
                         {!editingModules && (
@@ -6591,7 +6663,7 @@ export default function Home() {
                       {/* 只读展示 */}
                       {!editingModules && (
                         mods.length === 0 ? (
-                          <p className="text-[11px] text-[var(--text-muted)] mt-2 flex items-center gap-2">
+                          <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-2 flex items-center gap-2">
                             {t('home.noWorkspaceModules')}
                             <button onClick={() => void handleRescanModules()} className="text-[var(--accent)] hover:underline">
                               {t('home.rescanModules')}
@@ -6613,7 +6685,7 @@ export default function Home() {
                                     key={g.key}
                                     type="button"
                                     onClick={() => setModuleFilter(g.key)}
-                                    className={`px-1.5 py-0.5 rounded text-[9.5px] transition-colors ${
+                                    className={`px-1.5 py-0.5 rounded text-[length:var(--app-text-micro)] transition-colors ${
                                       moduleFilter === g.key
                                         ? 'bg-[var(--accent)]/15 text-[var(--accent)] font-medium'
                                         : 'bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
@@ -6626,12 +6698,12 @@ export default function Home() {
                             )}
                             <div className="mt-2 space-y-0.5 max-h-48 overflow-y-auto">
                               {filteredMods.length === 0 && (
-                                <p className="text-[10.5px] text-[var(--text-muted)] py-1">{t('home.moduleNoMatch')}</p>
+                                <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] py-1">{t('home.moduleNoMatch')}</p>
                               )}
                               {filteredMods.map((m) => (
                                 <div
                                   key={m.rel_path}
-                                  className="flex items-center gap-2 text-[11px] rounded px-1 py-0.5 -mx-1 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors"
+                                  className="flex items-center gap-2 text-[length:var(--app-text-xs)] rounded px-1 py-0.5 -mx-1 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors"
                                   title={`${m.rel_path}（${t('home.moduleOpenInExplorer')}）`}
                                   onClick={() => openInExplorer(m.rel_path)}
                                 >
@@ -6640,11 +6712,11 @@ export default function Home() {
                                     {m.rel_path}
                                   </span>
                                   {mainRel && m.rel_path === mainRel && (
-                                    <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-medium bg-[var(--accent)]/15 text-[var(--accent)]">
+                                    <span className="shrink-0 px-1 py-0.5 rounded text-[length:var(--app-text-micro)] font-medium bg-[var(--accent)]/15 text-[var(--accent)]">
                                       ◉ {t('home.analyzeHarmonyRoot')}
                                     </span>
                                   )}
-                                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 ${kindColor(m.kind)}`}>
+                                  <span className={`px-1.5 py-0.5 rounded text-[length:var(--app-text-2xs)] font-medium shrink-0 ${kindColor(m.kind)}`}>
                                     {MODULE_KIND_LABELS[m.kind]}
                                   </span>
                                   {m.manual && (
@@ -6669,12 +6741,12 @@ export default function Home() {
                                   value={m.rel_path}
                                   onChange={(e) => updateModuleRow(idx, { rel_path: e.target.value })}
                                   placeholder={t('home.modulePathPlaceholder')}
-                                  className="flex-1 min-w-0 h-7 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[11px] font-mono outline-none focus:border-[var(--accent)]"
+                                  className="flex-1 min-w-0 h-7 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] px-2 text-[length:var(--app-text-xs)] font-mono outline-none focus:border-[var(--accent)]"
                                 />
                                 <select
                                   value={m.kind}
                                   onChange={(e) => updateModuleRow(idx, { kind: e.target.value as ModuleKind })}
-                                  className="h-7 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] px-1.5 text-[11px] outline-none focus:border-[var(--accent)]"
+                                  className="h-7 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] px-1.5 text-[length:var(--app-text-xs)] outline-none focus:border-[var(--accent)]"
                                 >
                                   {MODULE_KINDS.map((k) => (
                                     <option key={k} value={k}>{MODULE_KIND_LABELS[k]}</option>
@@ -6695,7 +6767,7 @@ export default function Home() {
                           <button
                             type="button"
                             onClick={addModuleRow}
-                            className="w-full h-7 rounded-md border border-dashed border-[var(--border-strong)] text-[11px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
+                            className="w-full h-7 rounded-md border border-dashed border-[var(--border-strong)] text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
                           >
                             + {t('home.addModule')}
                           </button>
@@ -6703,7 +6775,7 @@ export default function Home() {
                             <button
                               type="button"
                               onClick={cancelEditModules}
-                              className="px-2.5 h-7 rounded-md text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                              className="px-2.5 h-7 rounded-md text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                             >
                               {t('dialog.cancel')}
                             </button>
@@ -6711,7 +6783,7 @@ export default function Home() {
                               type="button"
                               onClick={() => void saveModules()}
                               disabled={savingModules}
-                              className="px-2.5 h-7 rounded-md text-[11px] font-medium btn-primary  disabled:opacity-50"
+                              className="px-2.5 h-7 rounded-md text-[length:var(--app-text-xs)] font-medium btn-primary  disabled:opacity-50"
                             >
                               {savingModules ? '…' : t('dialog.save')}
                             </button>
@@ -6726,7 +6798,7 @@ export default function Home() {
                 <div className="rounded-xl modern-card p-3">
                   <div className="flex items-center gap-1.5">
                     <Icon name="receipt" size={12} className="text-[var(--text-secondary)]" />
-                    <span className="text-[12px] font-medium">{t('home.recentTasks')}</span>
+                    <span className="text-[length:var(--app-text-sm)] font-medium">{t('home.recentTasks')}</span>
                     <button
                       type="button"
                       onClick={() => void loadRecentRuns()}
@@ -6739,7 +6811,7 @@ export default function Home() {
                   </div>
                   <div className="mt-1.5 space-y-0.5">
                     {recentRuns.length === 0 ? (
-                      <div className="text-[11px] text-[var(--text-muted)] py-1">{t('home.recentTasksEmpty')}</div>
+                      <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] py-1">{t('home.recentTasksEmpty')}</div>
                     ) : (
                       recentRuns.slice(0, 6).map((r) => (
                         <button
@@ -6759,10 +6831,10 @@ export default function Home() {
                             }`}
                           />
                           <span className="flex-1 min-w-0">
-                            <span className="block truncate text-[11px] text-[var(--text-primary)]">
+                            <span className="block truncate text-[length:var(--app-text-xs)] text-[var(--text-primary)]">
                               {r.model || t('home.unknownModel')}
                             </span>
-                            <span className="block text-[9.5px] text-[var(--text-muted)]">
+                            <span className="block text-[length:var(--app-text-micro)] text-[var(--text-muted)]">
                               {r.error_kind ||
                                 (r.status === 'success'
                                   ? t('home.taskSuccess')
@@ -6771,7 +6843,7 @@ export default function Home() {
                                     : t('home.taskCancelled'))}
                             </span>
                           </span>
-                          <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">
+                          <span className="shrink-0 text-[length:var(--app-text-2xs)] tabular-nums text-[var(--text-muted)]">
                             {fmtElapsed(r.duration_ms / 1000)}
                           </span>
                         </button>
@@ -6783,7 +6855,7 @@ export default function Home() {
                 {/* 提示卡 */}
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-window)]/50 p-3 flex gap-2">
                   <Icon name="info" size={14} className="mt-0.5 shrink-0 opacity-50" />
-                  <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.panelTip')}</p>
+                  <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed">{t('home.panelTip')}</p>
                 </div>
               </div>
             ) : rightTab === 'files' ? (
@@ -6886,6 +6958,26 @@ export default function Home() {
 
       {/* ============ 对话框 ============ */}
       {showAddDialog && <AddProjectDialog onConfirm={handleAddConfirm} onClose={() => setShowAddDialog(false)} />}
+      {/* 首启引导。放在 AddProjectDialog **之后**：引导里点「添加工程」会打开上面那个
+          弹窗，z-index 相同下后挂载的在上层，否则两个弹窗会叠在一起。引导本身是
+          可关闭的（跳过/完成都会 markFirstRunSeen），不阻塞用户。 */}
+      {showOnboarding && (
+        <Suspense fallback={null}>
+          <Onboarding
+            open
+            hasProjects={projects.length > 0}
+            onClose={() => setShowOnboarding(false)}
+            onAddProject={() => {
+              setShowOnboarding(false)
+              setShowAddDialog(true)
+            }}
+            onGoProviders={() => {
+              setShowOnboarding(false)
+              navigate('/providers')
+            }}
+          />
+        </Suspense>
+      )}
       {pendingTrust && (
         <TrustDialog
           inspect={pendingTrust.inspect}
@@ -6911,8 +7003,8 @@ export default function Home() {
             <div className="flex items-start gap-2 p-3">
               <Icon name={icon as React.ComponentProps<typeof Icon>['name']} size={14} className="shrink-0 mt-0.5" />
               <div className="flex-1 min-w-0">
-                <div className="text-[12px] font-semibold">{card.title}</div>
-                <div className="text-[10.5px] text-[var(--text-secondary)] mt-1 leading-relaxed whitespace-pre-wrap break-words">{card.message}</div>
+                <div className="text-[length:var(--app-text-sm)] font-semibold">{card.title}</div>
+                <div className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)] mt-1 leading-relaxed whitespace-pre-wrap break-words">{card.message}</div>
               </div>
               <button type="button" aria-label={t('common.close')} title={t('common.close')} onClick={() => handleDiagnoseDismiss(card)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] shrink-0">
                 <Icon name="close" size={12} />
@@ -6920,7 +7012,7 @@ export default function Home() {
             </div>
             {actionLabel && (
               <div className="px-3 pb-3 flex justify-end gap-1.5">
-                <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="h-7 px-2.5 rounded-lg text-[10.5px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors">
+                <button type="button" onClick={() => handleDiagnoseDismiss(card)} className="h-7 px-2.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] transition-colors">
                   {t('home.diagnoseLater')}
                 </button>
                 <Button variant="primary" size="sm" onClick={() => void handleDiagnoseAction(card)}>
@@ -6940,10 +7032,10 @@ export default function Home() {
           <div className="w-[480px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="headphones" size={14} className="text-[var(--accent)] shrink-0" />
-              <span className="text-[13px] font-semibold">{t('home.askTitle')}</span>
-              <span className="text-[10px] px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono ml-auto">ask_user</span>
+              <span className="text-[length:var(--app-text-md)] font-semibold">{t('home.askTitle')}</span>
+              <span className="text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono ml-auto">ask_user</span>
             </div>
-            <div className="mt-3 text-[13px] leading-relaxed whitespace-pre-wrap break-words">{askCard.question}</div>
+            <div className="mt-3 text-[length:var(--app-text-md)] leading-relaxed whitespace-pre-wrap break-words">{askCard.question}</div>
             {askCard.options.length > 0 && (
               <div className="mt-2.5 flex flex-wrap gap-1.5">
                 {askCard.options.map((opt) => (
@@ -6951,7 +7043,7 @@ export default function Home() {
                     key={opt}
                     type="button"
                     onClick={() => setAskAnswer(opt)}
-                    className="h-7 px-2.5 rounded-lg border border-[var(--border)] text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)]/50 bg-[var(--bg-card)] transition-colors"
+                    className="h-7 px-2.5 rounded-lg border border-[var(--border)] text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)]/50 bg-[var(--bg-card)] transition-colors"
                   >
                     {opt}
                   </button>
@@ -6972,10 +7064,10 @@ export default function Home() {
               rows={3}
               autoFocus
               spellCheck={false}
-              className="mt-3 w-full rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[12px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+              className="mt-3 w-full rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[length:var(--app-text-sm)] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
             />
             <div className="mt-3 flex items-center justify-end gap-2">
-              <span className="text-[10.5px] text-[var(--text-muted)] mr-auto">Ctrl+Enter ↵</span>
+              <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mr-auto">Ctrl+Enter ↵</span>
               <Button variant="secondary" size="md" onClick={handleAskSkip}>
                 {t('home.askSkip')}
               </Button>
@@ -6995,20 +7087,20 @@ export default function Home() {
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-[var(--warning)] animate-pulse" />
-              <span className="text-[13px] font-semibold">{t('home.toolApprovalTitle')}</span>
-              <span className={`text-[10px] px-2 py-0.5 rounded-md font-medium ml-auto ${risk.cls}`}>{risk.label}</span>
+              <span className="text-[length:var(--app-text-md)] font-semibold">{t('home.toolApprovalTitle')}</span>
+              <span className={`text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded-md font-medium ml-auto ${risk.cls}`}>{risk.label}</span>
             </div>
             <div className="mt-3 space-y-2">
               <div className="flex items-center gap-2">
-                <span className="text-[10px] px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono shrink-0">
+                <span className="text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono shrink-0">
                   {toolApprovals[0].tool}
                 </span>
-                <span className="text-[11px] text-[var(--text-muted)] truncate">
+                <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] truncate">
                   {t('home.toolApprovalArgs')}
                 </span>
               </div>
               {toolApprovals[0].desc && (
-                <p className="rounded-lg border border-[var(--border)] bg-[var(--bg-tertiary)]/60 px-3 py-2 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                <p className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]/60 px-3 py-2 text-[length:var(--app-text-xs)] leading-relaxed text-[var(--text-secondary)]">
                   {toolApprovals[0].desc}
                 </p>
               )}
@@ -7018,22 +7110,22 @@ export default function Home() {
                 const { reversibilityKey, scopeKey, tone: impactTone } = impactDisplay(impact)
                 const tone =
                   impactTone === 'danger'
-                    ? 'border-[var(--danger-border,var(--danger))] text-[var(--danger)]'
+                    ? 'border-[var(--danger)] text-[var(--danger)]'
                     : impactTone === 'warning'
                       ? 'border-[var(--warning)] text-[var(--warning)]'
                       : 'border-[var(--border)] text-[var(--text-muted)]'
                 return (
-                  <div className={`rounded-lg border ${tone} bg-[var(--bg-tertiary)]/40 px-3 py-2 space-y-1`}>
-                    <div className="flex items-center gap-2 text-[10px] font-medium">
+                  <div className={`rounded-lg border ${tone} bg-[var(--bg-card)]/40 px-3 py-2 space-y-1`}>
+                    <div className="flex items-center gap-2 text-[length:var(--app-text-2xs)] font-medium">
                       <span>{t(reversibilityKey)}</span>
                       <span className="opacity-70">·</span>
                       <span className="opacity-80">{t(scopeKey)}</span>
                     </div>
-                    <p className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                    <p className="text-[length:var(--app-text-xs)] leading-relaxed text-[var(--text-secondary)]">
                       {impact.note}
                     </p>
                     {impact.targets.length > 0 && (
-                      <div className="text-[10px] text-[var(--text-muted)] truncate">
+                      <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] truncate">
                         {t('home.toolApprovalImpactTargets')}
                         <span className="font-mono">{impact.targets.join(' · ')}</span>
                       </div>
@@ -7041,7 +7133,7 @@ export default function Home() {
                   </div>
                 )
               })()}
-              <pre className="tool-output max-h-32 overflow-y-auto rounded-lg modern-card border-[var(--border)] p-2.5 text-[11px] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
+              <pre className="tool-output max-h-32 overflow-y-auto rounded-lg modern-card border-[var(--border)] p-2.5 text-[length:var(--app-text-xs)] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]">
                 {toolApprovals[0].args || '{}'}
               </pre>
               <textarea
@@ -7049,7 +7141,7 @@ export default function Home() {
                 onChange={(e) => setApprovalFeedback(e.target.value)}
                 placeholder={t('home.toolApprovalFeedbackPlaceholder')}
                 rows={2}
-                className="w-full rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[11px] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
+                className="w-full rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[length:var(--app-text-xs)] outline-none resize-none placeholder:text-[var(--text-muted)]/60 focus:border-[var(--accent)] transition-colors"
               />
               {/* 记忆范围：仅本次 / 本会话 / 本项目持久化（白名单跨会话重启生效） */}
               <div className="flex items-center gap-3 select-none">
@@ -7066,7 +7158,7 @@ export default function Home() {
                       onChange={() => setApprovalScope(opt.v)}
                       className="w-3 h-3 accent-[var(--accent)]"
                     />
-                    <span className={`text-[11px] ${approvalScope === opt.v ? 'text-[var(--accent)] font-medium' : 'text-[var(--text-secondary)]'}`}>
+                    <span className={`text-[length:var(--app-text-xs)] ${approvalScope === opt.v ? 'text-[var(--accent)] font-medium' : 'text-[var(--text-secondary)]'}`}>
                       {opt.label}
                     </span>
                   </label>
@@ -7075,7 +7167,7 @@ export default function Home() {
               {/* 白名单管理入口：查看/移除本项目已永久放行的工具 */}
               <button
                 onClick={() => void openWhitelistDialog()}
-                className="text-[11px] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex items-center gap-1"
+                className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex items-center gap-1"
               >
                 <Icon name="check" size={10} />
                 {t('home.whitelistManage')}
@@ -7120,35 +7212,35 @@ export default function Home() {
           <div className="flex items-center gap-0.5 rounded-xl modern-card shadow-2xl shadow-black/40 py-1 px-1">
             <button
               onClick={copySelection}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="check" size={12} />
               {t('home.selectionCopy')}
             </button>
             <button
               onClick={() => sendWithInstruction(t('home.selectionExplain'), selectionMenu.text)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="lightbulb" size={12} />
               {t('home.selectionExplain')}
             </button>
             <button
               onClick={() => sendWithInstruction(t('home.selectionTranslate'), selectionMenu.text)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="language" size={12} />
               {t('home.selectionTranslate')}
             </button>
             <button
               onClick={searchSelection}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="notifications" size={12} />
               {t('home.selectionSearch')}
             </button>
             <button
               onClick={quoteSelection}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               <Icon name="chat" size={12} />
               {t('home.selectionQuote')}
@@ -7176,7 +7268,7 @@ export default function Home() {
           <div className="w-[520px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="history" size={15} />
-              <span className="text-[13px] font-semibold">{t('home.timelineTitle')}</span>
+              <span className="text-[length:var(--app-text-md)] font-semibold">{t('home.timelineTitle')}</span>
               <IconButton
                 icon="close"
                 label={t('common.close')}
@@ -7185,7 +7277,7 @@ export default function Home() {
                 onClick={() => setTimelineOpen(false)}
               />
             </div>
-            <div className="mt-2 text-[11px] text-[var(--text-muted)] leading-relaxed">{t('home.timelineDesc')}</div>
+            <div className="mt-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] leading-relaxed">{t('home.timelineDesc')}</div>
             {branchParentId && (
               <button
                 onClick={() => {
@@ -7198,7 +7290,7 @@ export default function Home() {
                     })))
                     .catch((error) => alert(String(error)))
                 }}
-                className="mt-2 w-full px-2.5 py-1.5 rounded-lg text-[11px] text-[var(--accent)] bg-[var(--accent-soft)] hover:opacity-80 transition-opacity"
+                className="mt-2 w-full px-2.5 py-1.5 rounded-lg text-[length:var(--app-text-xs)] text-[var(--accent)] bg-[var(--accent-soft)] hover:opacity-80 transition-opacity"
               >
                 {t('home.branchMergeStructured')}
               </button>
@@ -7207,7 +7299,7 @@ export default function Home() {
               {loadingSnapshots && snapshots.length === 0 ? (
                 <Skeleton lines={4} label={t('common.loading')} className="py-2" />
               ) : snapshots.length === 0 ? (
-                <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('home.timelineEmpty')}</div>
+                <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] py-4 text-center">{t('home.timelineEmpty')}</div>
               ) : (
                 snapshots.map((snap) => {
                   const isCurrent = snap.is_current
@@ -7218,10 +7310,10 @@ export default function Home() {
                     >
                       <Icon name="history" size={13} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
                       <div className="flex-1 min-w-0">
-                        <div className="text-[12px] text-[var(--text-primary)] truncate">
+                        <div className="text-[length:var(--app-text-sm)] text-[var(--text-primary)] truncate">
                           {snap.label || t('home.timelineToolRound')}
                         </div>
-                        <div className="text-[10px] text-[var(--text-muted)] mt-0.5">
+                        <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-0.5">
                           {formatTime(snap.created_at)} · {t('home.timelineTools', { count: String(snap.tool_count) })}
                           {isCurrent && <span className="ml-1.5 text-[var(--success)]">{t('home.timelineCurrent')}</span>}
                         </div>
@@ -7231,7 +7323,7 @@ export default function Home() {
                           setTimelineOpen(false)
                           void forkCurrentConversation(undefined, { kind: 'checkpoint', ref: snap.id })
                         }}
-                        className="shrink-0 px-2 py-1 rounded-lg text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                        className="shrink-0 px-2 py-1 rounded-lg text-[length:var(--app-text-xs)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                       >
                         {t('home.timelineFork')}
                       </button>
@@ -7241,7 +7333,7 @@ export default function Home() {
                           handleRestoreSnapshot(snap)
                         }}
                         disabled={isCurrent}
-                        className="shrink-0 px-2.5 py-1 rounded-lg text-[11px] text-[var(--accent)] bg-[var(--accent-soft)] hover:opacity-80 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="shrink-0 px-2.5 py-1 rounded-lg text-[length:var(--app-text-xs)] text-[var(--accent)] bg-[var(--accent-soft)] hover:opacity-80 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         {t('home.timelineRestore')}
                       </button>
@@ -7270,7 +7362,7 @@ export default function Home() {
           <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="check" size={15} />
-              <span className="text-[13px] font-semibold">{t('home.whitelistTitle')}</span>
+              <span className="text-[length:var(--app-text-md)] font-semibold">{t('home.whitelistTitle')}</span>
               <IconButton
                 icon="close"
                 label={t('common.close')}
@@ -7281,15 +7373,15 @@ export default function Home() {
             </div>
             <div className="mt-3 space-y-1 max-h-72 overflow-y-auto">
               {whitelist.length === 0 && (
-                <div className="text-[11px] text-[var(--text-muted)] py-4 text-center">{t('home.whitelistEmpty')}</div>
+                <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] py-4 text-center">{t('home.whitelistEmpty')}</div>
               )}
               {whitelist.map((w) => (
                 <div
                   key={w.tool}
                   className="flex items-center gap-2 rounded-lg modern-card border-[var(--border)] px-2.5 py-1.5"
                 >
-                  <span className="text-[11px] font-mono text-[var(--text-primary)] flex-1 truncate">{w.tool}</span>
-                  <span className="text-[10px] text-[var(--text-muted)] shrink-0">{formatTime(w.created_at)}</span>
+                  <span className="text-[length:var(--app-text-xs)] font-mono text-[var(--text-primary)] flex-1 truncate">{w.tool}</span>
+                  <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] shrink-0">{formatTime(w.created_at)}</span>
                   <IconButton
                     icon="delete"
                     label={t('home.whitelistRemove')}
@@ -7441,21 +7533,21 @@ export default function Home() {
       {runtimeAnomaly && (
         <div className="fixed bottom-6 right-6 z-50 w-[400px] max-w-[92vw] rounded-xl modern-card border-red-500/60 shadow-2xl p-4 space-y-3">
           <div className="flex items-start gap-2">
-            <span className="text-red-500 text-[16px] leading-none mt-0.5">⚠️</span>
+            <span className="text-red-500 text-[length:var(--app-text-lg)] leading-none mt-0.5">⚠️</span>
             <div className="flex-1 min-w-0">
-              <h3 className="text-[13px] font-semibold">{t('runtime.anomalyTitle')}</h3>
-              <p className="text-[11px] text-[var(--text-muted)] mt-0.5">{t('runtime.anomalyHint', { category: runtimeAnomaly.category })}</p>
+              <h3 className="text-[length:var(--app-text-md)] font-semibold">{t('runtime.anomalyTitle')}</h3>
+              <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5">{t('runtime.anomalyHint', { category: runtimeAnomaly.category })}</p>
             </div>
             <button
               onClick={() => setRuntimeAnomaly(null)}
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[14px] leading-none"
+              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[length:var(--app-text-base)] leading-none"
             >
               ×
             </button>
           </div>
           <div className="rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] p-2.5 space-y-1.5 max-h-[200px] overflow-auto">
-            <div className="text-[12px] font-medium break-words">{runtimeAnomaly.summary}</div>
-            <pre className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap break-words font-mono leading-relaxed">
+            <div className="text-[length:var(--app-text-sm)] font-medium break-words">{runtimeAnomaly.summary}</div>
+            <pre className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] whitespace-pre-wrap break-words font-mono leading-relaxed">
               {runtimeAnomaly.detail.slice(0, 800)}
             </pre>
           </div>
@@ -7480,24 +7572,24 @@ export default function Home() {
       {projectMetaToast && (
         <div className="fixed bottom-6 right-6 z-50 w-[360px] max-w-[92vw] rounded-xl modern-card border-[var(--accent)]/50 shadow-2xl p-4 space-y-2.5">
           <div className="flex items-start gap-2">
-            <span className="text-[var(--accent)] text-[16px] leading-none mt-0.5">🔄</span>
+            <span className="text-[var(--accent)] text-[length:var(--app-text-lg)] leading-none mt-0.5">🔄</span>
             <div className="flex-1 min-w-0">
-              <h3 className="text-[13px] font-semibold">{t('projectMeta.title')}</h3>
-              <p className="text-[11px] text-[var(--text-muted)] mt-0.5">{t('projectMeta.body')}</p>
+              <h3 className="text-[length:var(--app-text-md)] font-semibold">{t('projectMeta.title')}</h3>
+              <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5">{t('projectMeta.body')}</p>
             </div>
             <button
               onClick={() => setProjectMetaToast(null)}
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[14px] leading-none"
+              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[length:var(--app-text-base)] leading-none"
             >
               ×
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <span className="px-2 py-0.5 rounded-md bg-[var(--bg-hover)] text-[12px] font-medium">
+            <span className="px-2 py-0.5 rounded-md bg-[var(--bg-hover)] text-[length:var(--app-text-sm)] font-medium">
               {t(`projectMeta.kind.${projectMetaToast.old_kind}`)}
             </span>
-            <span className="text-[var(--text-muted)] text-[12px]">→</span>
-            <span className="px-2 py-0.5 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] text-[12px] font-medium">
+            <span className="text-[var(--text-muted)] text-[length:var(--app-text-sm)]">→</span>
+            <span className="px-2 py-0.5 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] text-[length:var(--app-text-sm)] font-medium">
               {t(`projectMeta.kind.${projectMetaToast.new_kind}`)}
             </span>
           </div>
@@ -7510,14 +7602,14 @@ export default function Home() {
           className="fixed bottom-6 right-6 z-50 w-[380px] max-w-[92vw] rounded-xl modern-card border-[var(--border)] shadow-2xl p-4 space-y-3"
         >
           <div className="flex items-start gap-2">
-            <span className="text-[var(--accent)] text-[16px] leading-none mt-0.5">💡</span>
+            <span className="text-[var(--accent)] text-[length:var(--app-text-lg)] leading-none mt-0.5">💡</span>
             <div className="flex-1 min-w-0">
-              <h3 className="text-[13px] font-semibold">{t('knowledge.candidateTitle')}</h3>
-              <p className="text-[11px] text-[var(--text-muted)] mt-0.5">{t('knowledge.candidateHint')}</p>
+              <h3 className="text-[length:var(--app-text-md)] font-semibold">{t('knowledge.candidateTitle')}</h3>
+              <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mt-0.5">{t('knowledge.candidateHint')}</p>
             </div>
             <button
               onClick={() => setKnowledgeCandidate(null)}
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[14px] leading-none"
+              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[length:var(--app-text-base)] leading-none"
             >
               ×
             </button>
@@ -7561,1658 +7653,6 @@ export default function Home() {
 }
 
 
-/* ============ 消息（无气泡，Claude/Qoder 风格） ============ */
-/** 无版本历史时的稳定空数组引用：避免在 MessageItem 内每次渲染创建新数组破坏子组件 memo */
-const EMPTY_VERSIONS: ChatMessage[] = []
-const MessageItem = memo(function MessageItem({
-  message,
-  time,
-  userMessageId,
-  isLastAssistant,
-  onRegenerate,
-  onBranch,
-  onRate,
-  onDislike,
-  onOpenVersions,
-  onSpeak,
-  speaking,
-  onEditMessage,
-  onDeleteMessage,
-  confirmDeleteMsgId,
-  projectPath,
-  highlighted,
-  onOpenFile,
-  onQuoteMessage,
-  onLocateMessage,
-  onForkFrom,
-  onCopyId,
-  shortId,
-  copiedId,
-}: {
-  message: ChatMessage
-  time: string
-  userMessageId: string
-  isLastAssistant?: boolean
-  onRegenerate?: () => void
-  /** 从该 user 消息分支重生成（保留旧回复为版本历史） */
-  onBranch?: (message: ChatMessage) => void
-  onRate: (messageId: string, feedback: 'like' | 'dislike' | 'neutral', reason?: string) => void
-  onDislike: (messageId: string) => void
-  onOpenVersions: (message: ChatMessage, userMessageId: string) => void
-  onSpeak: (messageId: string, text: string) => void
-  speaking: boolean
-  onEditMessage?: (message: ChatMessage) => void
-  onDeleteMessage?: (message: ChatMessage) => void
-  confirmDeleteMsgId?: string | null
-  /** 项目路径（变更审查用；非 git 项目时为 undefined，保持只读列表） */
-  projectPath?: string
-  /** 搜索命中高亮：消息卡片闪烁背景 3 秒 */
-  highlighted?: boolean
-  /** 代码块文件路径点击：在项目中定位/引用该文件 */
-  onOpenFile?: (path: string) => void
-  /** 引用该消息到输入框（Quote） */
-  onQuoteMessage?: (message: ChatMessage) => void
-  /** 点击消息引用标签：定位并高亮被引用消息 */
-  onLocateMessage?: (msgId: string) => void
-  /** 从该 user 消息派生新会话（Fork：复制至此的消息，原会话不动） */
-  onForkFrom?: (message: ChatMessage) => void
-  /** 复制 ID 到剪贴板（排查问题用） */
-  onCopyId?: (id: string) => void
-  shortId: (id: string) => string
-  copiedId: string | null
-}) {
-  const { t } = useTranslation()
-  // 按消息粒度订阅：整表订阅会在任意一条消息点赞/版本更新时触发全部历史消息重渲染
-  const feedback = useProjectStore((s) => s.feedbackMap[message.id])
-  const versions = useProjectStore((s) => s.versionMap[userMessageId] ?? EMPTY_VERSIONS)
-  const { role, content, reasoning, model } = message
-  const [copied, setCopied] = useState(false)
-  // 右键菜单：x/y 定位
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
-
-  // 右键菜单：x/y + 菜单项动作（直接挂在 onContextMenu）
-  const onContextMenu = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault()
-      setCtxMenu({ x: e.clientX, y: e.clientY })
-    },
-    [],
-  )
-  // 点击其他位置/滚动/失焦时关闭菜单
-  useEffect(() => {
-    if (!ctxMenu) return
-    const close = () => setCtxMenu(null)
-    window.addEventListener('click', close)
-    window.addEventListener('scroll', close, true)
-    return () => {
-      window.removeEventListener('click', close)
-      window.removeEventListener('scroll', close, true)
-    }
-  }, [ctxMenu])
-  // 超长回复折叠：超过 2 万字符时默认收起，仅渲染纯文本摘要（避免单条消息数千行拖慢列表渲染与滚动）
-  const [expanded, setExpanded] = useState(false)
-  // “记住这次修复”弹窗：把当前对话里的错误+解法沉淀为知识库条目
-  const [rememberOpen, setRememberOpen] = useState(false)
-  const [rememberSaving, setRememberSaving] = useState(false)
-  const [rememberForm, setRememberForm] = useState({ title: '', error_text: '', fix: '' })
-  // 分支展开面板：对话内切换预览历史版本（预览为临时视图，不落库）
-  const [branchOpen, setBranchOpen] = useState(false)
-  const [previewVersionId, setPreviewVersionId] = useState<string | null>(null)
-
-  // 本回复修改的文件列表（ChatGPT 式折叠卡片；edit_file/write_file 收集，相对路径）
-  const modifiedFiles = useMemo(() => {
-    if (!message.modified_files_json) return []
-    try {
-      const v = JSON.parse(message.modified_files_json)
-      return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []
-    } catch {
-      return []
-    }
-  }, [message.modified_files_json])
-
-  // 本条 user 消息的 @ 引用列表（references_json，气泡下方标签展示）；
-  // "msg:{id}" 前缀条目为消息引用（Quote 功能），与文件引用分开渲染
-  const { fileRefs, quotedMsgIds } = useMemo(() => {
-    const fileRefs: string[] = []
-    const quotedMsgIds: string[] = []
-    if (!message.references_json) return { fileRefs, quotedMsgIds }
-    try {
-      const v = JSON.parse(message.references_json)
-      if (!Array.isArray(v)) return { fileRefs, quotedMsgIds }
-      for (const x of v) {
-        if (typeof x !== 'string') continue
-        if (x.startsWith('msg:')) quotedMsgIds.push(x.slice(4))
-        else fileRefs.push(x)
-      }
-    } catch {
-      /* 忽略损坏数据 */
-    }
-    return { fileRefs, quotedMsgIds }
-  }, [message.references_json])
-
-  // 注：role === 'tool' 的消息已在 renderItems 中合并为 ToolRunGroup 折叠组，不会进入本组件
-
-  const isUser = role === 'user'
-  const previewVersion = previewVersionId ? versions.find((v) => v.id === previewVersionId) ?? null : null
-  const displayContent = previewVersion ? previewVersion.content : content
-  const displayReasoning = previewVersion ? (previewVersion.reasoning ?? undefined) : reasoning
-  const isLong = displayContent.length > 20000
-  // 缓存 sanitizeToolMarkers 结果：长文本正则替换是 O(n) 开销，memoise 避免 MessageItem 因无关
-  // props 变化（如 speaking/highlighted/confirmDeleteMsgId）重渲染时重复执行
-  const sanitizedContent = useMemo(() => sanitizeToolMarkers(displayContent), [displayContent])
-
-  /** 复制消息内容（带 1.5s 成功反馈） */
-  const copyMessage = async () => {
-    try {
-      await navigator.clipboard.writeText(displayContent)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // 剪贴板不可用时静默失败
-    }
-  }
-
-  const openRemember = () => {
-    // 默认把助手回复的纯文本作为“修复方法”，标题/错误现象留空让用户补充
-    const plainFix = displayContent
-      .replace(/```[\s\S]*?```/g, ' ')
-      .replace(/[#*`>_~-]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 600)
-    setRememberForm({ title: '', error_text: '', fix: plainFix })
-    setRememberOpen(true)
-  }
-
-  const saveRemember = async () => {
-    if (!rememberForm.error_text.trim()) {
-      alert(t('knowledge.rememberNeedError'))
-      return
-    }
-    setRememberSaving(true)
-    try {
-      const pid = useProjectStore.getState().currentProject?.id ?? null
-      await saveKnowledgeFromText(
-        {
-          title: rememberForm.title || undefined,
-          error_text: rememberForm.error_text,
-          fix: rememberForm.fix,
-        },
-        pid,
-      )
-      setRememberOpen(false)
-    } catch (e) {
-      alert(String(e))
-    } finally {
-      setRememberSaving(false)
-    }
-  }
-
-  if (isUser) {
-    const queued = message.queued === 1
-    return (
-      <div
-        data-msg-id={message.id}
-        onContextMenu={onContextMenu}
-        className={`flex justify-end gap-3 group msg-row ${highlighted ? 'msg-highlight' : ''}`}
-      >
-        <div className="max-w-[80%] rounded-2xl rounded-tr-md bg-[var(--bg-secondary)] px-4 py-2 transition-colors">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-[11px] font-medium text-[var(--text-secondary)]">{t('home.you')}</span>
-            <span className="text-[10px] text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">{time}</span>
-            {/* 消息 ID：默认隐藏，悬浮时显示（排查问题用） */}
-            {onCopyId && (
-              <button
-                onClick={() => onCopyId(message.id)}
-                className="font-mono text-[9px] px-1 py-px rounded text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors opacity-0 group-hover:opacity-100"
-                title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
-              >
-                {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
-                {shortId(message.id)}
-              </button>
-            )}
-            {queued && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--accent)]/10 text-[var(--accent)]">
-                {message.agent_owned === 1 ? t('home.queuedAgentLabel') : t('home.queuedLabel')}
-              </span>
-            )}
-            {/* @ 引用标签（references_json 落库展示） */}
-            {fileRefs.length > 0 && (
-              <span
-                className="flex items-center gap-1 text-[10px] text-[var(--text-muted)] max-w-52 overflow-hidden"
-                title={fileRefs.join('\n')}
-              >
-                <Icon name="file" size={10} className="shrink-0" />
-                <span className="truncate">{fileRefs.join(', ')}</span>
-              </span>
-            )}
-            {/* 消息引用标签（Quote 落库 msg:{id}；点击定位被引用消息） */}
-            {quotedMsgIds.length > 0 && onLocateMessage && quotedMsgIds.map((mid) => (
-              <button
-                key={mid}
-                onClick={() => onLocateMessage(mid)}
-                className="flex items-center gap-1 text-[10px] text-[var(--accent)] hover:text-[var(--accent-hover)] max-w-40"
-                title={t('home.locateQuoted')}
-              >
-                <Icon name="quote" size={10} className="shrink-0" />
-                <span className="truncate">{t('home.quotedMsgLabel')}</span>
-              </button>
-            ))}
-            <div className="ml-auto flex items-center gap-0.5 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
-              {onQuoteMessage && (
-                <button
-                  onClick={() => onQuoteMessage(message)}
-                  className="text-[10px] text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] rounded-md px-1.5 py-0.5 flex items-center gap-0.5"
-                  title={t('home.quoteMessage')}
-                >
-                  <Icon name="quote" size={11} />{t('home.quoteMessage')}
-                </button>
-              )}
-              {onForkFrom && (
-                <button
-                  onClick={() => onForkFrom(message)}
-                  className="text-[10px] text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] rounded-md px-1.5 py-0.5 flex items-center gap-0.5"
-                  title={t('home.forkFromHere')}
-                >
-                  <Icon name="git-branch" size={11} />{t('home.forkFromHere')}
-                </button>
-              )}
-              <button
-                onClick={copyMessage}
-                className={`text-[10px] rounded-md px-1.5 py-0.5 flex items-center gap-0.5 ${
-                  copied ? 'text-[var(--success)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
-                }`}
-                title={t('home.copyMessage')}
-              >
-                {copied ? <><Icon name="check" size={11} />{t('home.copied')}</> : <><Icon name="copy" size={11} />{t('home.copyMessage')}</>}
-              </button>
-              {onEditMessage && (
-                <button
-                  onClick={() => onEditMessage(message)}
-                  className="text-[10px] text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] rounded-md px-1.5 py-0.5"
-                  title={t('home.editMessage')}
-                >
-                  {t('home.editMessage')}
-                </button>
-              )}
-              {onDeleteMessage && (
-                <button
-                  onClick={() => onDeleteMessage(message)}
-                  className={`text-[10px] px-1.5 py-0.5 rounded-md transition-[color,background-color,border-color,box-shadow] ${
-                    confirmDeleteMsgId === message.id
-                      ? 'text-white bg-[var(--danger)] shadow-[0_0_0_3px_var(--danger-50)]'
-                      : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'
-                  }`}
-                  title={
-                    confirmDeleteMsgId === message.id
-                      ? t('home.deleteMessageConfirm')
-                      : t('home.deleteMessage')
-                  }
-                >
-                  {confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
-                </button>
-              )}
-              {onBranch && !queued && (
-                <button
-                  onClick={() => onBranch(message)}
-                  className="text-[10px] px-1.5 py-0.5 rounded-md text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] flex items-center gap-0.5"
-                  title={t('home.branchRegenerate')}
-                >
-                  <Icon name="git-branch" size={10} />
-                  {t('home.branchRegenerate')}
-                </button>
-              )}
-            </div>
-          </div>
-          <div className="text-sm break-words leading-relaxed">
-            {/* 超长消息折叠（粘贴大段日志等）：与助手分支同规则 */}
-            {isLong && !expanded ? (
-              <div>
-                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-[var(--text-secondary)] max-h-48 overflow-y-auto">
-                  {content.slice(0, 2000)}
-                </pre>
-                <span className="text-[10.5px] text-[var(--text-muted)]">…</span>
-                <button
-                  onClick={() => setExpanded(true)}
-                  className="ml-1 text-[11px] text-[var(--accent)] hover:underline"
-                >
-                  {t('home.expandFullMessage', { count: content.length.toLocaleString() })}
-                </button>
-              </div>
-            ) : (
-              <Markdown onOpenFile={onOpenFile}>{content}</Markdown>
-            )}
-          </div>
-        </div>
-        <div className="w-7 h-7 shrink-0 rounded-lg modern-card border-[var(--border)] flex items-center justify-center text-[11px] font-medium text-[var(--text-secondary)]">
-          {t('home.you').charAt(0)}
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div
-      data-msg-id={message.id}
-      onContextMenu={onContextMenu}
-      className={`flex gap-3 group msg-row ${highlighted ? 'msg-highlight' : ''}`}
-    >
-      <div className="w-6 h-6 rounded-full bg-[var(--bg-hover)] flex items-center justify-center shrink-0 mt-0.5">
-        <Icon name="spark" size={12} className="text-[var(--text-muted)]" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-[12px] font-medium text-[var(--text-primary)]">{t('home.agent')}</span>
-          <span className="text-[11px] text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">{time}</span>
-          {/* 次要元信息：默认隐藏，悬浮消息时显示，保持清爽 */}
-          <div className="flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-            {onCopyId && (
-              <button
-                onClick={() => onCopyId(message.id)}
-                className="font-mono text-[9px] px-1 py-px rounded text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
-                title={`${t('home.msgId')}: ${message.id}\n${t('home.clickToCopy')}`}
-              >
-                {copiedId === message.id ? <Icon name="check" size={8} className="text-[var(--success)]" /> : '#'}
-                {shortId(message.id)}
-              </button>
-            )}
-            {model && <span className="text-[10px] text-[var(--text-muted)]">{model}</span>}
-            {message.duration_ms != null && message.duration_ms > 0 && (
-              <span
-                className="text-[10px] tabular-nums text-[var(--text-muted)]"
-                title={t('home.replyDurationHint')}
-              >
-                {fmtElapsed(message.duration_ms / 1000)}
-              </span>
-            )}
-            {(message.tokens_in != null || message.tokens_out != null) && (
-              <span
-                className="text-[10px] tabular-nums text-[var(--text-muted)]"
-                title={`${t('home.tokenHint')}：${t('home.tokenIn')} ${message.tokens_in ?? 0} / ${t('home.tokenOut')} ${message.tokens_out ?? 0}`}
-              >
-                ↑{(message.tokens_in ?? 0).toLocaleString()} ↓{(message.tokens_out ?? 0).toLocaleString()}
-              </span>
-            )}
-          </div>
-        </div>
-        {previewVersion && (
-          <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[var(--warning)]/12 text-[var(--warning)] flex items-center gap-1">
-              <Icon name="git-branch" size={10} />
-              {t('home.branchPreviewBadge')} · {new Date(previewVersion.created_at * 1000).toLocaleString()}
-            </span>
-            <button onClick={() => setPreviewVersionId(null)} className="text-[10px] text-[var(--accent)] hover:underline">
-              {t('home.branchBackToMain')}
-            </button>
-          </div>
-        )}
-        {displayReasoning && <ThinkingBlock content={displayReasoning} />}
-        <div className="text-sm break-words leading-relaxed text-[var(--text-primary)]">
-          {isLong && !expanded ? (
-            <div>
-              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-[var(--text-secondary)] max-h-48 overflow-y-auto">
-                {displayContent.slice(0, 2000)}
-              </pre>
-              <span className="text-[10.5px] text-[var(--text-muted)]">…</span>
-              <button
-                onClick={() => setExpanded(true)}
-                className="ml-1 text-[11px] text-[var(--accent)] hover:underline"
-              >
-                {t('home.expandFullMessage', { count: displayContent.length.toLocaleString() })}
-              </button>
-            </div>
-          ) : (
-            <Markdown onOpenFile={onOpenFile}>{sanitizedContent}</Markdown>
-          )}
-        </div>
-        {modifiedFiles.length > 0 && <ModifiedFilesCard files={modifiedFiles} projectPath={projectPath} />}
-        {/* 分支切换面板（对话内预览历史版本，点击版本直接切换显示） */}
-        {branchOpen && versions.length > 0 && (
-          <div className="mt-2 rounded-xl border border-[var(--accent)]/25 bg-[var(--accent-soft)]/40 p-2 animate-fade-in-up">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <button
-                onClick={() => setPreviewVersionId(null)}
-                className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${
-                  previewVersionId === null
-                    ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]'
-                    : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'
-                }`}
-              >
-                {t('home.versionCurrent')}
-              </button>
-              {[...versions].reverse().map((v) => (
-                <button
-                  key={v.id}
-                  onClick={() => setPreviewVersionId(v.id)}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${
-                    previewVersionId === v.id
-                      ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]'
-                      : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'
-                  }`}
-                >
-                  {t('home.versionLabel', { n: new Date(v.created_at * 1000).toLocaleString() })}
-                </button>
-              ))}
-              <IconButton
-                icon="close"
-                label={t('home.close')}
-                iconSize={12}
-                className="ml-auto"
-                onClick={() => setBranchOpen(false)}
-              />
-              <button
-                onClick={() => onOpenVersions(message, userMessageId)}
-                className="px-2.5 py-1 rounded-lg text-[11px] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
-              >
-                {t('home.branchCompareDiff')}
-              </button>
-            </div>
-          </div>
-        )}
-        {/* 操作栏：复制 / 引用 / 重新生成 / 点赞 / 点踩 / 朗读 / 版本对比 */}
-        <div className="flex items-center gap-0.5 mt-1.5 opacity-0 group-hover:opacity-100 max-md:opacity-100 transition-opacity">
-          <IconButton
-            icon={copied ? 'check' : 'copy'}
-            label={t('home.copyMessage')}
-            iconSize={13}
-            onClick={copyMessage}
-          />
-          {onQuoteMessage && (
-            <IconButton
-              icon="quote"
-              label={t('home.quoteMessage')}
-              iconSize={13}
-              onClick={() => onQuoteMessage(message)}
-            />
-          )}
-          <IconButton
-            icon="lightbulb"
-            label={t('knowledge.rememberThisFix')}
-            iconSize={13}
-            onClick={openRemember}
-          />
-          {isLastAssistant && onRegenerate && (
-            <IconButton
-              icon="refresh"
-              label={t('home.regenerate')}
-              iconSize={13}
-              onClick={onRegenerate}
-            />
-          )}
-          <button
-            onClick={() => onRate(message.id, feedback?.feedback === 'like' ? 'neutral' : 'like')}
-            className={`p-1 rounded-md transition-colors ${feedback?.feedback === 'like' ? 'text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'}`}
-            title={t('home.like')}
-          >
-            <ThumbUpIcon filled={feedback?.feedback === 'like'} />
-          </button>
-          <button
-            onClick={() =>
-              feedback?.feedback === 'dislike'
-                ? onRate(message.id, 'neutral')
-                : onDislike(message.id)
-            }
-            className={`p-1 rounded-md transition-colors ${feedback?.feedback === 'dislike' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
-            title={t('home.dislike')}
-          >
-            <ThumbDownIcon filled={feedback?.feedback === 'dislike'} />
-          </button>
-          <button
-            onClick={() => onSpeak(message.id, displayContent)}
-            className={`p-1 rounded-md transition-colors ${speaking ? 'text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'}`}
-            aria-label={speaking ? t('home.stopSpeak') : t('home.speak')}
-            title={speaking ? t('home.stopSpeak') : t('home.speak')}
-          >
-            <Icon name="headphones" size={13} />
-          </button>
-          {versions.length > 0 && (
-            <button
-              onClick={() => setBranchOpen((v) => !v)}
-              className={`p-1 rounded-md transition-colors text-[10px] flex items-center gap-1 ${
-                branchOpen
-                  ? 'text-[var(--accent)] bg-[var(--accent-soft)]'
-                  : 'text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)]'
-              }`}
-              aria-label={t('home.viewVersions')}
-              title={t('home.viewVersions')}
-            >
-              <Icon name="git-branch" size={12} />
-              {versions.length}
-            </button>
-          )}
-          {onDeleteMessage && (
-            <button
-              onClick={() => onDeleteMessage(message)}
-              className={`p-1 rounded-md transition-[color,background-color,border-color,box-shadow] ${confirmDeleteMsgId === message.id ? 'bg-[var(--danger)] text-white shadow-[0_0_0_3px_var(--danger-50)]' : 'text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)]'}`}
-              aria-label={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
-              title={confirmDeleteMsgId === message.id ? t('home.deleteMessageConfirm') : t('home.deleteMessage')}
-            >
-              <Icon name="delete" size={13} white={confirmDeleteMsgId === message.id} />
-            </button>
-          )}
-        </div>
-      </div>
-
-      {rememberOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onClick={() => setRememberOpen(false)}
-        >
-          <div
-            className="w-[480px] max-w-[92vw] rounded-xl modern-card border-[var(--border)] shadow-2xl p-4 space-y-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-[14px] font-semibold">{t('knowledge.rememberTitle')}</h3>
-            <p className="text-[11px] text-[var(--text-muted)]">{t('knowledge.rememberHint')}</p>
-            <Field
-              fieldSize="md"
-              label={t('knowledge.entryTitle')}
-              value={rememberForm.title}
-              onChange={(e) => setRememberForm({ ...rememberForm, title: e.target.value })}
-              placeholder={t('knowledge.rememberTitlePh')}
-            />
-            <TextArea
-              fieldSize="md"
-              label={t('knowledge.rememberError')}
-              value={rememberForm.error_text}
-              onChange={(e) => setRememberForm({ ...rememberForm, error_text: e.target.value })}
-              rows={4}
-              placeholder={t('knowledge.rememberErrorPh')}
-            />
-            <TextArea
-              fieldSize="md"
-              label={t('knowledge.fix')}
-              value={rememberForm.fix}
-              onChange={(e) => setRememberForm({ ...rememberForm, fix: e.target.value })}
-              rows={5}
-            />
-            <div className="flex justify-end gap-2 pt-1">
-              <Button variant="secondary" size="md" onClick={() => setRememberOpen(false)}>
-                {t('mcp.cancel')}
-              </Button>
-              <Button variant="primary" size="md" loading={rememberSaving} onClick={saveRemember}>
-                {t('knowledge.save')}
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 右键菜单：复制 / 重新生成（仅 assistant 最后一条）/ 编辑（仅 user）/ 删除 */}
-      {ctxMenu && (
-        <div
-          role="menu"
-          onClick={(e) => e.stopPropagation()}
-          className="fixed z-[var(--app-z-popover)] min-w-[180px] glass-card rounded-lg py-1 animate-modal-in text-[12.5px]"
-          style={{ left: ctxMenu.x, top: ctxMenu.y }}
-        >
-          <button
-            onClick={() => {
-              copyMessage()
-              setCtxMenu(null)
-            }}
-            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name={copied ? 'check' : 'copy'} size={13} />
-            {copied ? t('home.copied') : t('home.copyMessage')}
-          </button>
-          {message.role === 'user' && onEditMessage && (
-            <button
-              onClick={() => {
-                onEditMessage(message)
-                setCtxMenu(null)
-              }}
-              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-            >
-              <Icon name="edit" size={13} />
-              {t('home.edit')}
-            </button>
-          )}
-          {message.role === 'user' && onDeleteMessage && (
-            <button
-              onClick={() => {
-                onDeleteMessage(message)
-                setCtxMenu(null)
-              }}
-              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--danger)] hover:bg-[var(--danger-50)] transition-colors"
-            >
-              <Icon name="delete" size={13} />
-              {t('home.delete')}
-            </button>
-          )}
-          {message.role === 'assistant' && isLastAssistant && onRegenerate && (
-            <button
-              onClick={() => {
-                onRegenerate()
-                setCtxMenu(null)
-              }}
-              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-            >
-              <Icon name="refresh" size={13} />
-              {t('home.regenerate')}
-            </button>
-          )}
-          {message.role === 'assistant' && onBranch && (
-            <button
-              onClick={() => {
-                onBranch(message)
-                setCtxMenu(null)
-              }}
-              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-            >
-              <Icon name="git-branch" size={13} />
-              {t('home.forkFromHere')}
-            </button>
-          )}
-          {/* Pin 到会话顶部，同时持久化为 Context V2 权威上下文。 */}
-          <button
-            onClick={() => {
-              const convId = message.conversation_id
-              const isP = usePinStore.getState().isPinned(convId, message.id)
-              usePinStore.getState().toggle(convId, message.id)
-              void setConversationContextPin({
-                conversation_id: convId,
-                pin_kind: 'message',
-                source_ref: `message:${message.id}`,
-                label: message.role,
-                content: message.content,
-                pinned: !isP,
-              }).catch(() => {})
-              // toast 反馈
-              useNotificationStore.getState().push({
-                tone: isP ? 'info' : 'success',
-                title: isP ? t('home.unpinned') : t('home.pinned'),
-                body: isP
-                  ? t('home.unpinnedBody')
-                  : t('home.pinnedBody', { count: (usePinStore.getState().pins[convId]?.length ?? 0), max: PIN_MAX_PER_CONV }),
-              })
-              setCtxMenu(null)
-            }}
-            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name={usePinStore.getState().isPinned(message.conversation_id, message.id) ? 'check' : 'pin'} size={13} />
-            {usePinStore.getState().isPinned(message.conversation_id, message.id) ? t('home.unpinFromTop') : t('home.pinToTop')}
-          </button>
-          {/* 复制消息链接：hash 锚点格式 #msg={id}，贴到任意位置再点 → 切到该会话并滚动高亮 */}
-          <button
-            onClick={async () => {
-              const link = `${window.location.origin}${window.location.pathname}#msg=${message.id}`
-              try {
-                await navigator.clipboard.writeText(link)
-                useNotificationStore.getState().push({
-                  tone: 'success',
-                  title: t('home.linkCopied'),
-                  body: t('home.linkCopiedBody'),
-                })
-              } catch {
-                useNotificationStore.getState().push({
-                  tone: 'error',
-                  title: t('home.linkCopyFail'),
-                  body: '',
-                })
-              }
-              setCtxMenu(null)
-            }}
-            className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-          >
-            <Icon name="quote" size={13} />
-            {t('home.copyMessageLink')}
-          </button>
-          {message.role === 'assistant' && onOpenVersions && versions.length > 0 && (
-            <button
-              onClick={() => {
-                onOpenVersions(message, userMessageId)
-                setCtxMenu(null)
-              }}
-              className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-            >
-              <Icon name="history" size={13} />
-              {t('home.viewVersions')} ({versions.length})
-            </button>
-          )}
-          {/* 1-5 星评分（纯前端 localStorage；与 like/dislike 互不干扰）—— 仅 assistant 消息 */}
-          {message.role === 'assistant' && (
-            <div className="border-t border-[var(--border)] mt-1 pt-1">
-              <div className="px-3 py-1 text-[10px] font-medium text-[var(--text-muted)] uppercase tracking-wider flex items-center justify-between">
-                <span>{t('home.rateTitle')}</span>
-                {useRatingStore.getState().get(message.id) && (
-                  <button
-                    onClick={() => {
-                      useRatingStore.getState().remove(message.id)
-                      useNotificationStore.getState().push({ tone: 'info', title: t('home.rateCleared'), body: '' })
-                      setCtxMenu(null)
-                    }}
-                    className="text-[10px] text-[var(--text-muted)] hover:text-[var(--danger)] normal-case tracking-normal"
-                  >
-                    {t('home.rateClear')}
-                  </button>
-                )}
-              </div>
-              <div className="flex items-center justify-around px-2 py-1.5">
-                {[1, 2, 3, 4, 5].map((n) => {
-                  const cur = useRatingStore.getState().get(message.id)
-                  const active = cur?.score === n
-                  return (
-                    <button
-                      key={n}
-                      onClick={() => {
-                        useRatingStore.getState().set(message.id, { score: n, comment: null })
-                        useNotificationStore.getState().push({
-                          tone: 'success',
-                          title: t('home.rateSaved'),
-                          body: t('home.rateSavedBody', { n }),
-                        })
-                        setCtxMenu(null)
-                      }}
-                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[14px] font-semibold transition-[color,background-color,border-color,box-shadow,transform] active:scale-90 ${
-                        active
-                          ? 'bg-[var(--warning)] text-white shadow-sm'
-                          : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--warning)]'
-                      }`}
-                      title={t('home.rateStar', { n })}
-                    >
-                      {n}
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-})
-
-
-/* ============ 快捷键速查：键帽行（键 + 描述） ============ */
-export function ShortcutRow({ keys, desc }: { keys: string[]; desc: string }) {
-  return (
-    <div className="flex items-center justify-between gap-2 py-1">
-      <span className="text-[var(--text-secondary)] text-[12px]">{desc}</span>
-      <span className="flex items-center gap-1 shrink-0">
-        {keys.map((k, i) => (
-          <span key={i} className="inline-flex items-center">
-            <kbd className="px-1.5 py-0.5 text-[10.5px] font-mono font-medium rounded border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-primary)] min-w-[22px] text-center tnum">
-              {k}
-            </kbd>
-            {i < keys.length - 1 && <span className="text-[var(--text-muted)] text-[10.5px] mx-0.5">+</span>}
-          </span>
-        ))}
-      </span>
-    </div>
-  )
-}
-
-
-/* ============ 快捷键速查面板（? 触发）：分组 + 搜索 + 一键复制键位 ============
- * - 数据结构硬编码在组件内：每组若干 { keys, desc, groupKey }
- * - 顶部搜索框：模糊匹配 desc / keys
- * - 点击行复制键位组合到剪贴板（如 "Ctrl+Shift+P"），toast 反馈
- * - Esc 关闭
- */
-function ShortcutsPanel({ onClose }: { onClose: () => void }) {
-  const { t } = useTranslation()
-  const [query, setQuery] = useState('')
-  const [copiedKey, setCopiedKey] = useState<string | null>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  // 全部快捷键（硬编码）：分组 → [{ keys, desc, descKey }]
-  const groups: { titleKey: string; items: { keys: string[]; descKey: string; copyKey: string }[] }[] = [
-    {
-      titleKey: 'home.shortcutGroupNav',
-      items: [
-        { keys: ['Ctrl', 'K'], descKey: 'home.shortcutCommandPalette', copyKey: 'Ctrl+K' },
-        { keys: ['Ctrl', 'Shift', 'K'], descKey: 'home.shortcutFocusSearch', copyKey: 'Ctrl+Shift+K' },
-        { keys: ['Ctrl', 'Shift', 'P'], descKey: 'home.shortcutProjectSwitcher', copyKey: 'Ctrl+Shift+P' },
-        { keys: ['Ctrl', 'Shift', 'N'], descKey: 'home.shortcutNewConv', copyKey: 'Ctrl+Shift+N' },
-        { keys: ['?'], descKey: 'home.shortcutThisPanel', copyKey: '?' },
-        { keys: ['Esc'], descKey: 'home.shortcutClose', copyKey: 'Esc' },
-      ],
-    },
-    {
-      titleKey: 'home.shortcutGroupQuick',
-      items: [
-        { keys: ['Ctrl', 'Shift', 'B'], descKey: 'home.shortcutBuild', copyKey: 'Ctrl+Shift+B' },
-        { keys: ['Ctrl', 'Shift', 'D'], descKey: 'home.shortcutDeploy', copyKey: 'Ctrl+Shift+D' },
-        { keys: ['Ctrl', 'Shift', 'S'], descKey: 'home.shortcutScreenshot', copyKey: 'Ctrl+Shift+S' },
-        { keys: ['Ctrl', 'Shift', 'R'], descKey: 'home.shortcutRunCommand', copyKey: 'Ctrl+Shift+R' },
-      ],
-    },
-    {
-      titleKey: 'home.shortcutGroupInput',
-      items: [
-        { keys: ['Enter'], descKey: 'home.shortcutSend', copyKey: 'Enter' },
-        { keys: ['Shift', 'Enter'], descKey: 'home.shortcutNewline', copyKey: 'Shift+Enter' },
-        { keys: ['Ctrl', 'Enter'], descKey: 'home.shortcutSendCmd', copyKey: 'Ctrl+Enter' },
-      ],
-    },
-    {
-      titleKey: 'home.shortcutGroupMessage',
-      items: [
-        { keys: ['右键'], descKey: 'home.shortcutContextMenu', copyKey: 'RightClick' },
-      ],
-    },
-  ]
-
-  // 过滤：query 命中 keys 或 desc
-  const q = query.trim().toLowerCase()
-  const filtered = q
-    ? groups
-        .map((g) => ({
-          ...g,
-          items: g.items.filter((it) => {
-            const desc = t(it.descKey).toLowerCase()
-            const keyStr = it.copyKey.toLowerCase()
-            return desc.includes(q) || keyStr.includes(q)
-          }),
-        }))
-        .filter((g) => g.items.length > 0)
-    : groups
-
-  // 复制键位
-  const copyKey = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopiedKey(text)
-      setTimeout(() => setCopiedKey((cur) => (cur === text ? null : cur)), 1200)
-    } catch {
-      // 剪贴板不可用 → 静默
-    }
-  }
-
-  // 自动聚焦搜索框
-  useEffect(() => {
-    inputRef.current?.focus()
-  }, [])
-  useEscapeKey(onClose)
-
-  return (
-    <div className="cmdk-backdrop" onClick={onClose}>
-      <div
-        className="w-[560px] max-w-[92vw] max-h-[82vh] flex flex-col glass-card p-5 animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 标题 + 关闭 */}
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Icon name="bolt" size={15} />
-            <h2 className="text-[14px] font-semibold">{t('home.shortcuts')}</h2>
-          </div>
-          <IconButton icon="close" label={t('common.close')} onClick={onClose} />
-        </div>
-
-        {/* 搜索框 */}
-        <div className="mb-3 flex items-center gap-2 px-2.5 h-8 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] focus-within:border-[var(--accent)] transition-colors">
-          <Icon name="search" size={12} className="text-[var(--text-muted)]" />
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder={t('home.shortcutSearchPlaceholder')}
-            spellCheck={false}
-            className="flex-1 bg-transparent outline-none text-[12.5px] placeholder:text-[var(--text-muted)]"
-          />
-          {query && (
-            <button
-              aria-label={t('home.clearSearch')}
-              title={t('home.clearSearch')}
-              onClick={() => setQuery('')}
-              className="text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
-            >
-              <Icon name="close" size={11} />
-            </button>
-          )}
-        </div>
-
-        {/* 分组列表 */}
-        <div className="space-y-3 text-[12.5px] overflow-y-auto min-h-0 flex-1">
-          {filtered.length === 0 ? (
-            <UiEmptyState compact title={t('home.shortcutNoResults')} />
-          ) : (
-            filtered.map((g) => (
-              <div key={g.titleKey}>
-                <p className="text-[10.5px] font-medium text-[var(--text-muted)] uppercase tracking-wider mb-1.5">
-                  {t(g.titleKey)}
-                </p>
-                {g.items.map((it) => {
-                  const isCopied = copiedKey === it.copyKey
-                  return (
-                    <div
-                      key={it.copyKey}
-                      onClick={() => void copyKey(it.copyKey)}
-                      title={t('home.shortcutCopyHint')}
-                      className="group flex items-center justify-between gap-2 py-1 px-1.5 -mx-1.5 rounded-md hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                    >
-                      <span className="text-[var(--text-secondary)] text-[12px]">{t(it.descKey)}</span>
-                      <span className="flex items-center gap-0.5 shrink-0">
-                        {it.keys.map((k, i) => (
-                          <span key={i} className="flex items-center gap-0.5">
-                            {i > 0 && <span className="text-[10px] text-[var(--text-muted)]">+</span>}
-                            <kbd className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">
-                              {k}
-                            </kbd>
-                          </span>
-                        ))}
-                        <Icon
-                          name={isCopied ? 'check' : 'copy'}
-                          size={10}
-                          className={`ml-1.5 transition-[color,background-color,border-color,opacity] ${isCopied ? 'text-[var(--success)] opacity-100' : 'text-[var(--text-muted)] opacity-0 group-hover:opacity-100'}`}
-                        />
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            ))
-          )}
-        </div>
-
-        {/* 底部提示 */}
-        <p className="mt-3 pt-2.5 border-t border-[var(--border)] text-[10.5px] text-[var(--text-muted)]">
-          {t('home.shortcutFooter')}
-        </p>
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ 项目快速切换器：Ctrl+Shift+P 触发，fuzzy 搜项目 + 最近 5 个置顶 ============ */
-function ProjectSwitcher({ onClose, onSelect }: { onClose: () => void; onSelect: (id: string) => void }) {
-  const { t } = useTranslation()
-  const projects = useProjectStore((s) => s.projects) as Project[]
-  const currentProject = useProjectStore((s) => s.currentProject)
-  const [query, setQuery] = useState('')
-  const [sel, setSel] = useState(0)
-  const listRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  // fuzzy 过滤：项目名 / 路径包含 query
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    const list = !q
-      ? projects
-      : projects.filter((p) => p.name.toLowerCase().includes(q) || p.path.toLowerCase().includes(q))
-    // 当前项目置顶 + 最近 5 个靠前
-    return [...list].sort((a, b) => {
-      if (a.id === currentProject?.id) return -1
-      if (b.id === currentProject?.id) return 1
-      return (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)
-    })
-  }, [projects, query, currentProject?.id])
-
-  // 打开时聚焦输入框
-  useEffect(() => {
-    const h = setTimeout(() => inputRef.current?.focus(), 30)
-    return () => clearTimeout(h)
-  }, [])
-
-  // 键盘：↑↓ 移动 / Enter 选择（Esc 走全局栈，见下）
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        setSel((s) => Math.min(filtered.length - 1, s + 1))
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault()
-        setSel((s) => Math.max(0, s - 1))
-      } else if (e.key === 'Enter') {
-        e.preventDefault()
-        const p = filtered[sel]
-        if (p) onSelect(p.id)
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [filtered, sel, onSelect])
-  useEscapeKey(onClose)
-
-  return (
-    <div
-      className="w-[520px] max-w-[92vw] rounded-2xl glass-card overflow-hidden animate-modal-in"
-      onClick={(e) => e.stopPropagation()}
-    >
-      <div className="flex items-center gap-2.5 px-4 h-12 border-b border-[var(--border)]">
-        <Icon name="folder" size={16} className="text-[var(--text-muted)] shrink-0" />
-        <input
-          ref={inputRef}
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value)
-            setSel(0)
-          }}
-          placeholder={t('home.projectSwitcherPlaceholder')}
-          className="flex-1 bg-transparent outline-none text-[14px] placeholder:text-[var(--text-muted)]"
-          spellCheck={false}
-        />
-        <kbd className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">Esc</kbd>
-      </div>
-      <div ref={listRef} className="max-h-[50vh] overflow-y-auto py-1.5">
-        {filtered.length === 0 ? (
-          <div className="px-4 py-8 text-center text-[13px] text-[var(--text-muted)]">{t('home.projectSwitcherEmpty')}</div>
-        ) : (
-          filtered.map((p, i) => {
-            const active = i === sel
-            const isCurrent = p.id === currentProject?.id
-            return (
-              <button
-                key={p.id}
-                onClick={() => onSelect(p.id)}
-                onMouseEnter={() => setSel(i)}
-                className={`w-full flex items-center gap-2.5 px-4 py-2 text-left transition-colors ${
-                  active ? 'bg-[var(--accent-soft)]' : 'hover:bg-[var(--bg-hover)]'
-                }`}
-              >
-                <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shrink-0">
-                  <Icon name="folder" size={13} white />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[13px] truncate flex items-center gap-1.5">
-                    {p.name}
-                    {isCurrent && (
-                      <span className="text-[10px] px-1 rounded bg-[var(--accent)]/15 text-[var(--accent)]">{t('home.projectSwitcherCurrent')}</span>
-                    )}
-                  </div>
-                  <div className="text-[10.5px] text-[var(--text-muted)] truncate font-mono">{p.path}</div>
-                </div>
-                {p.index_state && (
-                  <span className="text-[10px] text-[var(--text-muted)] tnum shrink-0">
-                    {p.index_state === 'ready' ? '✓' : '…'}
-                  </span>
-                )}
-              </button>
-            )
-          })
-        )}
-      </div>
-      <div className="flex items-center gap-3 px-4 h-9 border-t border-[var(--border)] text-[11px] text-[var(--text-muted)] tnum">
-        <span><kbd className="px-1 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)]">↑</kbd> <kbd className="px-1 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)]">↓</kbd> {t('home.projectSwitcherNavigate')}</span>
-        <span><kbd className="px-1 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)]">Enter</kbd> {t('home.projectSwitcherOpen')}</span>
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ 批量任务浮层：每行一条入队（agentOwned=false 让任务结束后自动续跑） ============
- * - 多行文本 → 逐行入队 → Agent 串行处理
- * - 入参 initial：当前输入框草稿（默认填入，用户可继续编辑）
- * - 入参 onSubmit：用户点"入队"时触发，把行数组交给外层
- * - Esc 关闭、Cmd/Ctrl+Enter 直接入队
- */
-function BatchSendDialog({ initial, onClose, onSubmit }: {
-  initial: string
-  onClose: () => void
-  onSubmit: (lines: string[]) => void | Promise<void>
-}) {
-  const { t } = useTranslation()
-  const [text, setText] = useState(initial)
-  // 拆行：去空白、去空行；保留用户原顺序
-  const lines = useMemo(
-    () => text.split('\n').map((s) => s.trim()).filter(Boolean),
-    [text]
-  )
-  const submittingRef = useRef(false)
-
-  // 提交：避免重复触发（点按钮 / 按快捷键同时按）
-  const submit = async () => {
-    if (submittingRef.current) return
-    if (lines.length === 0) return
-    submittingRef.current = true
-    try {
-      await onSubmit(lines)
-    } finally {
-      submittingRef.current = false
-    }
-  }
-
-  // 快捷键：Ctrl+Enter 提交（Esc 走全局栈，见下）
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault()
-        void submit()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines.length]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
-  useEscapeKey(onClose)
-
-  return (
-    <div className="cmdk-backdrop" onClick={onClose}>
-      <div
-        className="w-[600px] max-w-[92vw] glass-card p-4 animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 标题栏 */}
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] flex items-center justify-center">
-              <Icon name="package" size={13} />
-            </div>
-            <h2 className="text-[14px] font-semibold">{t('home.batch')}</h2>
-          </div>
-          {/* h-6 w-6 锁死 24px 盒：裸 IconButton 只有 13px 图标 + 8px padding = 21px */}
-          <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
-        </div>
-
-        <p className="text-[11.5px] text-[var(--text-muted)] mb-2.5 leading-relaxed">
-          {t('home.batchHint')}
-        </p>
-
-        {/* 多行输入框：等宽字体，按行解析 */}
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={10}
-          autoFocus
-          spellCheck={false}
-          className="w-full rounded-lg modern-card p-3 text-[13px] font-mono leading-relaxed outline-none focus:border-[var(--accent)] resize-y min-h-[180px] max-h-[50vh]"
-          placeholder={t('home.batchPlaceholder')}
-        />
-
-        {/* 底部状态行 + 操作按钮 */}
-        <div className="flex items-center justify-between mt-3">
-          <div className="flex items-center gap-3 text-[11px] text-[var(--text-muted)] tnum">
-            <span className="flex items-center gap-1">
-              {t('home.batchLines', { count: lines.length })}
-            </span>
-            {lines.length > 1 && (
-              <span className="text-[10.5px] px-1.5 py-0.5 rounded bg-[var(--accent)]/10 text-[var(--accent)]">
-                {t('home.batchQueue', { count: lines.length })}
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            <kbd className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] tnum">
-              Ctrl+Enter
-            </kbd>
-            <Button variant="secondary" size="sm" onClick={onClose}>
-              {t('home.cancel')}
-            </Button>
-            <Button variant="primary" size="sm" disabled={lines.length === 0} onClick={submit}>
-              {t('home.batchSend')}
-            </Button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ 会话导入预览弹层：解析 md/json → 只读预览 → 复制全文 ============
- * - 不写数据库（避免污染历史/触发 agent）
- * - 用户可复制后粘贴到任意会话作为参考上下文
- * - 顶部展示元信息（文件名 / 消息数 / 角色分布）+ 中间消息列表 + 底部"复制全文"按钮
- */
-function ImportDialog({ data, onClose }: {
-  data: { title: string; messages: Array<{ role: string; content: string }> }
-  onClose: () => void
-}) {
-  const { t } = useTranslation()
-  const [copied, setCopied] = useState(false)
-  const copyRef = useRef<HTMLButtonElement>(null)
-
-  // 复制全文为 markdown（与 exportConversationMd 输出格式兼容）
-  const copyAll = async () => {
-    const md = data.messages
-      .map((m) => {
-        const role = m.role === 'user' ? '👤 User' : m.role === 'assistant' ? '🤖 Assistant' : `⚙️ ${m.role}`
-        return `## ${role}\n\n${m.content}`
-      })
-      .join('\n\n---\n\n')
-    try {
-      await navigator.clipboard.writeText(md)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch (e) {
-      console.error('copy failed', e)
-    }
-  }
-
-  // 统计
-  const stats = useMemo(() => {
-    let user = 0, assistant = 0, other = 0
-    for (const m of data.messages) {
-      if (m.role === 'user') user++
-      else if (m.role === 'assistant') assistant++
-      else other++
-    }
-    return { user, assistant, other }
-  }, [data.messages])
-
-  useEscapeKey(onClose)
-
-  return (
-    <div className="cmdk-backdrop" onClick={onClose}>
-      <div
-        className="w-[720px] max-w-[94vw] max-h-[86vh] flex flex-col glass-card animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 标题栏 */}
-        <div className="flex items-center justify-between px-4 h-12 border-b border-[var(--border)] shrink-0">
-          <div className="flex items-center gap-2 min-w-0">
-            <div className="w-6 h-6 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] flex items-center justify-center shrink-0">
-              <Icon name="file" size={13} />
-            </div>
-            <h2 className="text-[14px] font-semibold truncate" title={data.title}>{data.title}</h2>
-            <span className="text-[10.5px] text-[var(--text-muted)] shrink-0 tnum">
-              {t('home.importMsgCount', { count: data.messages.length })}
-            </span>
-          </div>
-          <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
-        </div>
-
-        {/* 角色分布小条 */}
-        <div className="flex items-center gap-3 px-4 py-2 border-b border-[var(--border)] text-[10.5px] text-[var(--text-muted)] tnum shrink-0">
-          <span className="flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />
-            {t('home.importRoleUser')}: {stats.user}
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)]" />
-            {t('home.importRoleAssistant')}: {stats.assistant}
-          </span>
-          {stats.other > 0 && (
-            <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-[var(--text-muted)]" />
-              {t('home.importRoleOther')}: {stats.other}
-            </span>
-          )}
-          <span className="ml-auto text-[10px] text-[var(--text-muted)]">{t('home.importPreviewHint')}</span>
-        </div>
-
-        {/* 消息列表（只读） */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
-          {data.messages.map((m, i) => {
-            const isUser = m.role === 'user'
-            return (
-              <div key={i} className={`flex gap-2.5 ${isUser ? 'flex-row-reverse' : ''}`}>
-                <div
-                  className={`shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-[11px] ${
-                    isUser
-                      ? 'bg-[var(--accent)]/15 text-[var(--accent)]'
-                      : 'bg-[var(--success)]/15 text-[var(--success)]'
-                  }`}
-                  title={m.role}
-                >
-                  {isUser ? '👤' : '🤖'}
-                </div>
-                <div
-                  className={`flex-1 min-w-0 rounded-lg p-2.5 text-[12.5px] leading-relaxed whitespace-pre-wrap break-words modern-card ${
-                    isUser ? 'bg-[var(--accent)]/5' : ''
-                  }`}
-                >
-                  {m.content || <span className="text-[var(--text-muted)] italic">（空消息）</span>}
-                </div>
-              </div>
-            )
-          })}
-        </div>
-
-        {/* 底部操作栏 */}
-        <div className="flex items-center justify-between px-4 h-12 border-t border-[var(--border)] shrink-0">
-          <span className="text-[11px] text-[var(--text-muted)]">{t('home.importReadOnly')}</span>
-          <div className="flex items-center gap-2">
-            <Button variant="secondary" size="sm" onClick={onClose}>
-              {t('home.cancel')}
-            </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              ref={copyRef}
-              icon={copied ? 'check' : 'copy'}
-              onClick={copyAll}
-            >
-              {copied ? t('home.importCopied') : t('home.importCopyAll')}
-            </Button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ Pinned 消息条：会话顶部钉住关键消息（仅前端 localStorage） ============
- * - 会话长了之后找回"报错信息/关键决策/成功命令"很痛 → 让用户手动 pin
- * - 数据结构：usePinStore（per conversationId，localStorage 持久化，最多 8 条）
- * - 点 chip 滚动到该消息（onJump 回调）；点 × 取消 pin
- * - 静默跳过"已 pin 但消息被删"的孤儿 id
- */
-
-
-/* ============ 会话笔记（顶部笔记区，per conversation 持久化） ============
- * - 默认收起（点 "📝 写笔记" 展开）
- * - 自动保存（debounce 600ms）
- * - 上限 4000 字（NOTE_MAX_LEN）
- * - 写过的会话：标题行显示 "📝" 标识 + 摘要预览
- * - 切换会话时表单值正确同步
- */
-function ConvNoteBar({ convId }: { convId: string }) {
-  const { t } = useTranslation()
-  const note = useNoteStore((s) => s.notes[convId] ?? null)
-  const setNote = useNoteStore((s) => s.set)
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(note?.text ?? '')
-  const debounceRef = useRef<number | null>(null)
-
-  // 切换会话：同步当前 draft 到最新值
-  useEffect(() => {
-    setDraft(note?.text ?? '')
-    setEditing(false)
-  }, [convId, note?.text])
-
-  // debounce 自动保存
-  useEffect(() => {
-    if (!editing) return
-    if (draft === (note?.text ?? '')) return
-    if (debounceRef.current) window.clearTimeout(debounceRef.current)
-    debounceRef.current = window.setTimeout(() => {
-      setNote(convId, draft)
-    }, 600)
-    return () => {
-      if (debounceRef.current) window.clearTimeout(debounceRef.current)
-    }
-  }, [draft, editing, convId, note?.text, setNote])
-
-  // 编辑模式：全屏 textarea
-  if (editing) {
-    return (
-      <div className="mb-3 rounded-lg glass-card border border-[var(--accent)]/30 p-2.5 animate-fade-in">
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="flex items-center gap-1.5 text-[10.5px] font-medium text-[var(--accent)]">
-            <Icon name="edit" size={11} />
-            {t('home.noteEditingTitle')}
-          </div>
-          <div className="flex items-center gap-2">
-            <span className={`text-[10px] tnum ${draft.length > NOTE_MAX_LEN * 0.9 ? 'text-[var(--warning)]' : 'text-[var(--text-muted)]'}`}>
-              {draft.length}/{NOTE_MAX_LEN}
-            </span>
-            <Button
-              variant="primary"
-              size="xs"
-              onClick={() => {
-                setNote(convId, draft)
-                setEditing(false)
-              }}
-            >
-              {t('home.noteDone')}
-            </Button>
-          </div>
-        </div>
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value.slice(0, NOTE_MAX_LEN))}
-          rows={4}
-          autoFocus
-          spellCheck={false}
-          className="w-full resize-y rounded-md bg-[var(--bg-primary)] border border-[var(--border)] px-2.5 py-1.5 text-[12.5px] leading-relaxed outline-none focus:border-[var(--accent)] min-h-[80px] max-h-[200px]"
-          placeholder={t('home.notePlaceholder')}
-        />
-      </div>
-    )
-  }
-
-  // 折叠态：未写过 → 灰提示；写过 → 显示摘要 + 时间
-  return (
-    <div
-      className={`mb-2 rounded-lg border transition-colors ${
-        note
-          ? 'border-[var(--accent)]/20 bg-[var(--accent)]/5'
-          : 'border-dashed border-[var(--border)] bg-[var(--bg-secondary)]/40 hover:border-[var(--accent)]/30'
-      }`}
-    >
-      <button
-        onClick={() => setEditing(true)}
-        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left"
-      >
-        <Icon name="edit" size={11} className={note ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'} />
-        {note ? (
-          <div className="flex-1 min-w-0">
-            <div className="text-[11.5px] text-[var(--text-primary)] truncate">{note.text.split('\n')[0]}</div>
-            <div className="text-[10px] text-[var(--text-muted)] tnum mt-0.5">
-              {t('home.noteUpdated', { time: new Date(note.updatedAt).toLocaleString() })}
-            </div>
-          </div>
-        ) : (
-          <span className="text-[11.5px] text-[var(--text-muted)] flex-1">{t('home.noteAdd')}</span>
-        )}
-        {note && (
-          <span
-            onClick={(e) => {
-              e.stopPropagation()
-              if (window.confirm(t('home.noteClearConfirm'))) {
-                useNoteStore.getState().clear(convId)
-              }
-            }}
-            className="p-1 text-[var(--text-muted)] hover:text-[var(--danger)] opacity-0 group-hover:opacity-100"
-            aria-label={t('home.noteClear')}
-            title={t('home.noteClear')}
-          >
-            <Icon name="close" size={11} />
-          </span>
-        )}
-      </button>
-    </div>
-  )
-}
-function PinnedBar({ convId, onJump }: { convId: string; onJump: (msgId: string) => void }) {
-  const { t } = useTranslation()
-  // ⚠️ ?? [] 必须在 selector 外：写在 selector 内时无 pin 会话每次返回新数组引用，
-  // useSyncExternalStore 判定快照持续变化 → 无限重渲染（Maximum update depth exceeded）
-  const pins = usePinStore((s) => s.pins[convId]) ?? []
-  const unpin = usePinStore((s) => s.unpin)
-  // 从 store 取消息（避免 prop drilling）
-  const messages = useProjectStore((s) => s.messages)
-  if (pins.length === 0) return null
-  // 过滤已删除的消息 + 按 pin 顺序展示
-  const items = pins
-    .map((id) => messages.find((m) => m.id === id))
-    .filter((m): m is NonNullable<typeof m> => m != null)
-  if (items.length === 0) return null
-  return (
-    <div className="mb-3 rounded-lg glass-card p-2 animate-fade-in">
-      <div className="flex items-center gap-1.5 px-1 mb-1.5">
-        <Icon name="pin" size={11} className="text-[var(--accent)]" />
-        <span className="text-[10.5px] font-medium text-[var(--text-muted)] uppercase tracking-wider">
-          {t('home.pinnedTitle')} · {items.length}
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {items.map((m) => {
-          const isUser = m.role === 'user'
-          const preview = m.content.replace(/[#*`>_~\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
-          const tone = isUser ? 'var(--accent)' : 'var(--success)'
-          return (
-            <div
-              key={m.id}
-              className="group flex items-center gap-1.5 max-w-[280px] rounded-md bg-[var(--bg-card)] border border-[var(--border)] hover:border-[var(--accent)]/40 transition-colors"
-            >
-              <button
-                onClick={() => onJump(m.id)}
-                className="flex-1 min-w-0 flex items-center gap-1.5 px-2 py-1 text-left"
-                title={m.content}
-              >
-                <span
-                  className="shrink-0 w-1.5 h-1.5 rounded-full"
-                  style={{ background: tone }}
-                />
-                <span className="text-[10.5px] text-[var(--text-muted)] shrink-0">
-                  {isUser ? '👤' : '🤖'}
-                </span>
-                <span className="text-[11.5px] text-[var(--text-primary)] truncate">
-                  {preview || t('home.pinnedEmpty')}
-                </span>
-              </button>
-              <button
-                onClick={() => {
-                  unpin(convId, m.id)
-                  void setConversationContextPin({
-                    conversation_id: convId,
-                    pin_kind: 'message',
-                    source_ref: `message:${m.id}`,
-                    label: m.role,
-                    content: m.content,
-                    pinned: false,
-                  }).catch(() => {})
-                }}
-                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger)] transition-[color,background-color,border-color,opacity] shrink-0"
-                aria-label={t('home.unpinFromTop')}
-                title={t('home.unpinFromTop')}
-              >
-                <Icon name="close" size={10} />
-              </button>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-
-/* ============ 审计日志查看页：表格列出所有敏感操作（localStorage 持久化，上限 200） ============
- * - 顶部：标题 + 清空按钮 + 分类过滤 chips
- * - 主体：时间 / 分类 / 名称 / 详情（按时间倒序）
- * - 底部：记录条数
- */
-function AuditDialog({ onClose }: { onClose: () => void }) {
-  const { t } = useTranslation()
-  const entries = useAuditStore((s) => s.entries)
-  const clear = useAuditStore((s) => s.clear)
-  const [filter, setFilter] = useState<'all' | AuditCategory>('all')
-
-  useEscapeKey(onClose)
-
-  const filtered = useMemo(
-    () => (filter === 'all' ? entries : entries.filter((e) => e.category === filter)).slice().sort((a, b) => b.ts - a.ts),
-    [entries, filter],
-  )
-
-  // 分类 chips 计数
-  const counts = useMemo(() => {
-    const map: Record<string, number> = { all: entries.length }
-    for (const e of entries) map[e.category] = (map[e.category] ?? 0) + 1
-    return map
-  }, [entries])
-
-  // 时间格式：YYYY-MM-DD HH:mm:ss
-  const fmtTs = (ts: number) => {
-    const d = new Date(ts)
-    const pad = (n: number) => String(n).padStart(2, '0')
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  }
-
-  // 分类 → i18n label
-  const catLabel = (c: AuditCategory) => t(`home.auditCat.${c}`)
-
-  return (
-    <div className="cmdk-backdrop" onClick={onClose}>
-      <div
-        className="w-[820px] max-w-[94vw] max-h-[86vh] flex flex-col glass-card animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 标题栏 */}
-        <div className="flex items-center justify-between px-4 h-12 border-b border-[var(--border)] shrink-0">
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] flex items-center justify-center">
-              <Icon name="history" size={13} />
-            </div>
-            <h2 className="text-[14px] font-semibold">{t('home.auditTitle')}</h2>
-            <span className="text-[10.5px] text-[var(--text-muted)] tnum">
-              {t('home.auditCount', { count: entries.length })}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="danger"
-              size="sm"
-              confirm
-              confirmLabel={t('common.confirmAgain')}
-              title={t('home.auditClearConfirm')}
-              disabled={entries.length === 0}
-              onClick={() => {
-                if (entries.length === 0) return
-                clear()
-              }}
-            >
-              {t('home.auditClear')}
-            </Button>
-            <IconButton icon="close" label={t('home.cancel')} iconSize={13} className="h-6 w-6" onClick={onClose} />
-          </div>
-        </div>
-
-        {/* 分类过滤 chips */}
-        <div className="flex items-center gap-1.5 px-4 py-2 border-b border-[var(--border)] overflow-x-auto shrink-0">
-          <button
-            onClick={() => setFilter('all')}
-            className={`shrink-0 px-2 py-0.5 rounded-md text-[11px] transition-colors ${
-              filter === 'all' ? 'tab-active' : 'tab-inactive'
-            }`}
-          >
-            {t('home.auditCatAll')} ({counts.all ?? 0})
-          </button>
-          {(Object.keys(counts) as string[]).filter((c) => c !== 'all' && counts[c] > 0).map((c) => (
-            <button
-              key={c}
-              onClick={() => setFilter(c as AuditCategory)}
-              className={`shrink-0 px-2 py-0.5 rounded-md text-[11px] transition-colors ${
-                filter === c ? 'tab-active' : 'tab-inactive'
-              }`}
-            >
-              {catLabel(c as AuditCategory)} ({counts[c]})
-            </button>
-          ))}
-        </div>
-
-        {/* 列表 */}
-        <div className="flex-1 overflow-y-auto min-h-0">
-          {filtered.length === 0 ? (
-            <p className="px-4 py-12 text-center text-[13px] text-[var(--text-muted)]">
-              {t('home.auditEmpty')}
-            </p>
-          ) : (
-            <table className="w-full text-[12px]">
-              <thead className="sticky top-0 bg-[var(--bg-card)] z-10">
-                <tr className="border-b border-[var(--border)] text-[var(--text-muted)]">
-                  <th className="text-left px-3 py-2 font-medium">{t('home.auditTime')}</th>
-                  <th className="text-left px-3 py-2 font-medium">{t('home.auditCategory')}</th>
-                  <th className="text-left px-3 py-2 font-medium">{t('home.auditName')}</th>
-                  <th className="text-left px-3 py-2 font-medium">{t('home.auditDetail')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((e) => (
-                  <tr key={e.id} className="border-b border-[var(--border)] last:border-0 align-top hover:bg-[var(--bg-hover)]">
-                    <td className="px-3 py-2 whitespace-nowrap font-mono text-[11px] text-[var(--text-secondary)] tnum">{fmtTs(e.ts)}</td>
-                    <td className="px-3 py-2">
-                      <span className="px-1.5 py-0.5 rounded text-[10.5px] bg-[var(--accent)]/10 text-[var(--accent)]">
-                        {catLabel(e.category)}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 max-w-[180px] truncate" title={e.label}>{e.label}</td>
-                    <td className="px-3 py-2 max-w-[320px] text-[var(--text-secondary)]">
-                      {e.detail ? (
-                        <span className="line-clamp-2" title={e.detail}>{e.detail}</span>
-                      ) : (
-                        <span className="text-[var(--text-muted)]">—</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
 
 
 /* ============ 设置菜单项 ============ */
@@ -9223,6 +7663,8 @@ const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/config', labelKey: 'nav.config', icon: 'settings' },
   { path: '/limits', labelKey: 'nav.limits', icon: 'tune' },
   { path: '/cost', labelKey: 'nav.cost', icon: 'payments' },
+  { path: '/usage', labelKey: 'nav.usage', icon: 'receipt' },
+  { path: '/license', labelKey: 'nav.license', icon: 'spark' },
   { path: '/proxy', labelKey: 'nav.proxy', icon: 'proxy' },
   { path: '/mcp', labelKey: 'nav.mcp', icon: 'mcp' },
   { path: '/skills', labelKey: 'nav.skill', icon: 'skill' },
@@ -9232,4 +7674,5 @@ const settingsItems: { path: string; labelKey: string; icon: IconName }[] = [
   { path: '/api-knowledge', labelKey: 'nav.apiKnowledge', icon: 'package' },
   { path: '/health', labelKey: 'nav.health', icon: 'health' },
   { path: '/ohpm', labelKey: 'nav.ohpm', icon: 'apps' },
+  { path: '/about', labelKey: 'nav.about', icon: 'info' },
 ]

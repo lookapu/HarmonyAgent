@@ -682,12 +682,16 @@ pub fn api_detail_upsert(
     let now = chrono::Utc::now().timestamp();
     let slug = harmony_api_ref::module_to_slug(&input.module);
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // ⚠️ 原来这里给 `members` 写的是字面量 `'[]'`——**这一列连数据都没写过**，
+    // 而它是 029 建表时就有的「子项 JSON 副本」。086 迁移已删掉该列（无人读，
+    // 且种子库实测占 19.7MB）。手工新建的详情本来就没有成员列表
+    // （成员来自抓取流程写进 `api_members` 表），所以少掉这一列没有任何行为变化。
     conn.execute(
         "INSERT INTO api_details
             (module, slug, title, kit, since_api_level, deprecated,
              import_snippet, syscap, permissions, device_types,
-             body, examples, members, source_url, fetched_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'[]',?13,?14)
+             body, examples, source_url, fetched_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
          ON CONFLICT(slug) DO UPDATE SET
             module=excluded.module, title=excluded.title, kit=excluded.kit,
             since_api_level=excluded.since_api_level,
@@ -802,10 +806,18 @@ pub async fn api_kb_refresh_details(
 /// 建索引任务运行标志（防并发重建）
 static EMBED_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 建索引取消标志。每批检查一次——20~30 分钟的任务不给取消入口等于让人守着。
+static EMBED_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Serialize)]
 pub struct ApiKbEmbedStatus {
-    /// 语义模型是否可用（未启用 embedding feature 或模型文件缺失均为 false）
+    /// 语义模型是否可用（未启用 embedding feature、模型文件缺失、
+    /// **或语义层开关已关闭**均为 false）
     pub available: bool,
+    /// 语义层是否参与检索（**默认 false**，P-7 方案②）。
+    /// `available` 说的是「模型在不在」，`enabled` 说的是「用户要不要它」——
+    /// 两个问题不同，合成一个字段就会出现「关着但显示可用」或反过来。
+    pub enabled: bool,
     pub model: Option<String>,
     /// 已索引条数
     pub indexed: i64,
@@ -813,6 +825,14 @@ pub struct ApiKbEmbedStatus {
     pub total: i64,
     /// 是否有建索引任务在后台运行
     pub running: bool,
+    /// 语义层真实状态（`ready` / `not_indexed` / `stale_index` / `partial_index` / `model_missing`）。
+    ///
+    /// **这个字段是修「显示说谎」用的**：只有 `available/indexed/total` 时，
+    /// 升级后的每个用户看到的都是「就绪 44856/44856」——
+    /// 而 `indexed == total` 恰恰**盖住了**「行数满但口径过期」这一种，
+    /// `vector_search` 实际正在因指纹不匹配而**拒绝检索**。
+    /// 卡片说就绪、功能是关的，就是这么来的。
+    pub state: String,
 }
 
 /// 查询向量索引状态（模型可用性 + 覆盖进度 + 运行标志）
@@ -825,10 +845,19 @@ pub fn api_kb_embed_status(db: State<DbState>) -> Result<ApiKbEmbedStatus, Strin
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM api_docs", [], |r| r.get(0))
         .unwrap_or(0);
+    // 开关必须在放锁前取（只读一次 settings，不碰模型）
+    let enabled = crate::services::embedding::semantic_enabled(&conn);
+    // 状态必须在放锁前取：它要读表 + 读指纹键，而 semantic_layer_state 内部
+    // 可能触发模型加载（OnceLock），**绝不能持着库锁做这件事**。
+    let state = semantic_state_code(&conn).to_string();
     drop(conn);
 
+    // **开关关着时绝不调 `global_embedder()`**（P-7 方案②的关键一行）：
+    // 那是 `OnceLock::get_or_init`，调它就会真的读 91MB 权重。
+    // 而这个 status 接口是**页面一打开就会调**的——若在这里无条件加载，
+    // ②「默认不碰那 91MB」的收益当场归零，剩下只是个装饰开关。
     #[cfg(feature = "embedding")]
-    let available = crate::services::embedding::global_embedder().is_some();
+    let available = enabled && crate::services::embedding::global_embedder().is_some();
     #[cfg(not(feature = "embedding"))]
     let available = false;
 
@@ -839,10 +868,26 @@ pub fn api_kb_embed_status(db: State<DbState>) -> Result<ApiKbEmbedStatus, Strin
         } else {
             None
         },
+        enabled,
         indexed,
         total,
         running: EMBED_RUNNING.load(std::sync::atomic::Ordering::SeqCst),
+        state,
     })
+}
+
+/// 语义层状态 → 稳定代码（前端据此选文案；`SemanticLayerState::label()` 是中文，
+/// 不能直接给前端，所以这里给一个跨语言稳定的 key）
+fn semantic_state_code(conn: &rusqlite::Connection) -> &'static str {
+    use crate::services::embedding::SemanticLayerState as S;
+    match crate::services::embedding::semantic_layer_state(conn) {
+        S::Ready => "ready",
+        S::NotIndexed => "not_indexed",
+        S::StaleIndex => "stale_index",
+        S::PartialIndex => "partial_index",
+        S::ModelMissing => "model_missing",
+        S::Disabled => "disabled",
+    }
 }
 
 /// 后台重建语义向量索引：进度经 `api-embed-progress` 事件推送，完成发 `api-embed-done`。
@@ -858,9 +903,21 @@ pub fn api_kb_embed_index(app: AppHandle, db: State<'_, DbState>) -> Result<(), 
 
     #[cfg(feature = "embedding")]
     {
+        // 开关关着时**拒绝开建**：否则用户能在 ② 的默认状态下触发一次
+        // 20~30 分钟的后台构建，而它建出来的向量默认根本不会被用（检索会降级）。
+        // 拒绝前要先解锁 EMBED_RUNNING，否则这次 Err 会把 running 卡在 true。
+        {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            if !crate::services::embedding::semantic_enabled(&conn) {
+                return Err("语义检索当前已关闭，请先在 API 知识库页面开启后再构建索引".into());
+            }
+        }
         if EMBED_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err("已有语义索引任务在运行中，请稍候".into());
         }
+        // 新任务开始前清掉上一次的取消请求，否则会被自己刚设的标志立刻取消
+        EMBED_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        let cancel = &EMBED_CANCEL;
         let state = db.0.clone();
         let app_clone = app.clone();
         std::thread::spawn(move || {
@@ -869,20 +926,63 @@ pub fn api_kb_embed_index(app: AppHandle, db: State<'_, DbState>) -> Result<(), 
             let cb: crate::services::embedding::EmbedProgressCb = Box::new(move |p| {
                 let _ = app_emit.emit("api-embed-progress", p);
             });
-            let result = crate::services::embedding::build_index_streaming(&state, 128, Some(cb));
+            let result =
+                crate::services::embedding::build_index_streaming(&state, 128, Some(cb), cancel);
             let elapsed = started.elapsed().as_secs();
+            let cancelled = cancel.load(std::sync::atomic::Ordering::SeqCst);
             let payload = match &result {
                 Ok((inserted, skipped)) => serde_json::json!({
-                    "ok": true, "indexed": inserted, "skipped": skipped, "elapsed": elapsed
+                    "ok": true, "indexed": inserted, "skipped": skipped,
+                    "elapsed": elapsed, "cancelled": cancelled
                 }),
                 Err(e) => serde_json::json!({
-                    "ok": false, "error": e, "elapsed": elapsed
+                    "ok": false, "error": e, "elapsed": elapsed, "cancelled": cancelled
                 }),
             };
-            let _ = app_clone.emit("api-embed-done", payload);
+            // **顺序是契约，不是风格**：必须先清运行标志再广播结束。
+            //
+            // 前端收到 done 后会立刻查 `api_kb_embed_status`，而那个查询读的就是
+            // `EMBED_RUNNING`。反过来的话，就存在一个窗口：done 已被收到、
+            // 但标志仍是 true → 卡片永远显示「建索引中」，而 done **不会发第二次**，
+            // 于是「构建索引」按钮永久禁用、取消按钮永久挂在上面，**不可恢复**
+            // （只能重启应用）。窗口虽窄，后果却是死状态而不是一次闪烁。
+            //
+            // 换序之后有个可断言的不变式：**收到 done ⇒ running 必为 false**。
             EMBED_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = app_clone.emit("api-embed-done", payload);
         });
         Ok(())
     }
+}
+
+/// 取消正在运行的语义索引任务。**幂等**：没在跑时也返回 Ok（不报错），
+/// 因为「点了取消但其实已经结束」不是错误。
+///
+/// 取消在每批开头检查 ⇒ 最长再等一批（128 条，CPU 上约 3~5 秒）。
+#[tauri::command]
+pub fn api_kb_embed_cancel() -> Result<(), String> {
+    EMBED_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// 读语义层开关（是否参与检索）。**默认关**（P-7 方案②）。
+#[tauri::command]
+pub fn api_kb_embed_enabled(db: State<'_, DbState>) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    Ok(crate::services::embedding::semantic_enabled(&conn))
+}
+
+/// 写语义层开关。开启只是**允许参与检索**——是否真能用仍由状态判定决定
+/// （可能还没建索引、模型缺失、索引过期）。
+///
+/// 幂等：写同值不报错，重复点击安全。
+#[tauri::command]
+pub fn api_kb_embed_set_enabled(
+    db: State<'_, DbState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    crate::services::embedding::set_semantic_enabled(&conn, enabled)?;
+    Ok(enabled)
 }
 

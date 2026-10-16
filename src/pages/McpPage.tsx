@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import { listMcpServers, addMcpServer, updateMcpServer, testMcpServer, toggleMcpServer, authorizeMcpServer, removeMcpServer, cloneMcpServer, exportMcpConfig, importMcpConfig, fetchMcpFromUrl, listMcpUsageStats, type McpServer, type CreateMcpInput, type McpDraft, type McpUsageStat } from '../api/mcp'
 import { mcpTemplates, mcpTemplateCategories, matchMcpTemplate, templateEnvDefaults, type McpTemplate, type McpTemplateCategory } from '../data/mcpTemplates'
+import { EmptyState } from '../components/ui/EmptyState'
 import { detectDevecoCli } from '../api/devecoCli'
 import { useProjectStore } from '../stores/projectStore'
 import { listExtensionGovernance, type ExtensionGovernanceRecord } from '../api/governance'
@@ -66,7 +67,7 @@ function CatChip({ active, onClick, children }: { active: boolean; onClick: () =
   return (
     <button
       onClick={onClick}
-      className={`px-2 h-5 rounded-md text-[10px] transition-colors ${
+      className={`px-2 h-5 rounded-md text-[length:var(--app-text-2xs)] transition-colors ${
         active
           ? 'bg-[var(--accent)]/15 text-[var(--accent)]'
           : 'bg-[var(--bg-card)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -115,27 +116,27 @@ function TemplateCard({ tpl, installed, globalOnly, justAdded, editing, onActiva
     >
       {/* 第一行：名称 + 徽章 + 状态标记 */}
       <span className="flex items-center gap-1.5 min-w-0">
-        <span className={`text-[12px] font-medium truncate ${highlighted ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}`}>
+        <span className={`text-[length:var(--app-text-sm)] font-medium truncate ${highlighted ? 'text-[var(--success)]' : 'text-[var(--text-primary)]'}`}>
           {justAdded ? t('mcp.added') : tpl.name}
         </span>
         {tpl.official && !justAdded && (
-          <span className="shrink-0 px-1 py-px rounded bg-[#6366f1]/15 text-[#6366f1] text-[9px] font-bold">🏛 {t('mcp.official')}</span>
+          <span className="shrink-0 px-1 py-px rounded bg-[#6366f1]/15 text-[#6366f1] text-[length:var(--app-text-micro)] font-bold">🏛 {t('mcp.official')}</span>
         )}
         {rec === 'hot' && !justAdded && (
-          <span className="shrink-0 px-1 py-px rounded bg-[#f59e0b]/15 text-[#f59e0b] text-[9px] font-bold">🔥 {t('mcp.hot')}</span>
+          <span className="shrink-0 px-1 py-px rounded bg-[#f59e0b]/15 text-[#f59e0b] text-[length:var(--app-text-micro)] font-bold">🔥 {t('mcp.hot')}</span>
         )}
         {rec === 'popular' && !justAdded && (
-          <span className="shrink-0 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[9px] font-bold">⭐ {t('mcp.popular')}</span>
+          <span className="shrink-0 px-1 py-px rounded bg-[var(--accent)]/10 text-[var(--accent)] text-[length:var(--app-text-micro)] font-bold">⭐ {t('mcp.popular')}</span>
         )}
-        {installed && !justAdded && <span className="shrink-0 text-[var(--success)] text-[11px]">✓</span>}
+        {installed && !justAdded && <span className="shrink-0 text-[var(--success)] text-[length:var(--app-text-xs)]">✓</span>}
         {globalOnly && !installed && (
-          <span className="shrink-0 px-1 py-px rounded bg-[var(--bg-hover)] text-[var(--text-muted)] text-[9px]">{t('mcp.globalOnly')}</span>
+          <span className="shrink-0 px-1 py-px rounded bg-[var(--bg-hover)] text-[var(--text-muted)] text-[length:var(--app-text-micro)]">{t('mcp.globalOnly')}</span>
         )}
       </span>
       {/* 第二行：功能描述 */}
-      <span className="block text-[11px] text-[var(--text-muted)] truncate mt-0.5">{tpl.description}</span>
+      <span className="block text-[length:var(--app-text-xs)] text-[var(--text-muted)] truncate mt-0.5">{tpl.description}</span>
       {/* 第三行：流行度 + 环境变量提示 */}
-      <span className="block text-[10px] text-[var(--text-secondary)] truncate mt-0.5">
+      <span className="block text-[length:var(--app-text-2xs)] text-[var(--text-secondary)] truncate mt-0.5">
         {tpl.popularity && <span>{t('mcp.popularity', { data: tpl.popularity })}</span>}
         {tpl.envHint && (
           <span className="font-mono">
@@ -154,7 +155,7 @@ function TemplateCard({ tpl, installed, globalOnly, justAdded, editing, onActiva
               e.preventDefault()
               shellOpen(tpl.homepage!).catch(() => window.open(tpl.homepage!, '_blank', 'noopener'))
             }}
-            className="text-[10px] text-[var(--accent)] hover:underline"
+            className="text-[length:var(--app-text-2xs)] text-[var(--accent)] hover:underline"
           >
             ↗ {t('mcp.homepageLabel')}
           </a>
@@ -545,7 +546,7 @@ export default function McpPage() {
       </div>
 
       {/* 视图切换：服务器列表 / 使用统计 */}
-      <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[12px]">
+      <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[length:var(--app-text-sm)]">
         <button
           onClick={() => setView('servers')}
           className={`px-3 h-7 rounded-md transition-colors ${view === 'servers' ? 'tab-active' : 'tab-inactive'}`}
@@ -570,7 +571,7 @@ export default function McpPage() {
       ) : (
         <>
       {projectId && (
-        <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[12px]">
+        <div className="inline-flex modern-card rounded-lg p-0.5 mb-4 text-[length:var(--app-text-sm)]">
           <button
             onClick={() => setScope('global')}
             className={`px-3 h-7 rounded-md transition-colors ${scope === 'global' ? 'tab-active' : 'tab-inactive'}`}
@@ -586,10 +587,10 @@ export default function McpPage() {
         </div>
       )}
       {!projectId && (
-        <p className="text-[11px] text-[var(--text-muted)] mb-4">{t('common.scopeGlobalOnly')}</p>
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mb-4">{t('common.scopeGlobalOnly')}</p>
       )}
       {projectId && effectiveScope === 'project' && !currentProject?.trusted && (
-        <div className="mb-4 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[11px] text-[var(--warning)]">
+        <div className="mb-4 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[length:var(--app-text-xs)] text-[var(--warning)]">
           ⚠️ {t('common.untrustedScopeWarn')}
         </div>
       )}
@@ -597,13 +598,13 @@ export default function McpPage() {
       <div className="flex items-center gap-2 mb-4">
         <button
           onClick={handleExport}
-          className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+          className="h-7 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
         >
           {t('common.exportConfig')}
         </button>
         <button
           onClick={() => importInputRef.current?.click()}
-          className="h-7 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+          className="h-7 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
         >
           {t('common.importConfig')}
         </button>
@@ -612,18 +613,18 @@ export default function McpPage() {
 
       {showForm && (
         <div className="modern-card rounded-2xl p-4 mb-6 space-y-4 animate-fade-in-up">
-          <div className="text-[13px] font-semibold text-[var(--text-primary)]">
+          <div className="text-[length:var(--app-text-md)] font-semibold text-[var(--text-primary)]">
             {editingId ? t('mcp.editTitle') : t('mcp.addTitle')}
           </div>
           {/* 内置模板选择：长方形信息卡片，可搜索/分类，区域固定高度，模板多时滚动 */}
           <div>
             <div className="flex items-center justify-between gap-2 mb-2">
-              <span className="text-[11px] font-medium text-[var(--text-muted)]">{t('mcp.templates')}</span>
+              <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)]">{t('mcp.templates')}</span>
               <input
                 value={templateQuery}
                 onChange={(e) => setTemplateQuery(e.target.value)}
                 placeholder={t('mcp.templateSearch')}
-                className="w-44 h-6 px-2 rounded-md modern-card text-[11px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-44 h-6 px-2 rounded-md modern-card text-[length:var(--app-text-xs)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             {/* 分类筛选 */}
@@ -636,7 +637,7 @@ export default function McpPage() {
               ))}
             </div>
             {filteredTemplates.length === 0 ? (
-              <p className="text-[11px] text-[var(--text-muted)] py-5 text-center">{t('mcp.emptyTemplateResult')}</p>
+              <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] py-5 text-center">{t('mcp.emptyTemplateResult')}</p>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-72 overflow-y-auto scroll-thin pr-1">
                 {filteredTemplates.map((tpl) => (
@@ -654,52 +655,52 @@ export default function McpPage() {
             )}
             {/* deveco-cli 未安装引导（模板一键添加/命令失焦时触发探测） */}
             {cliHint && (
-              <div className="mt-2 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[11px] text-[var(--warning)] break-all font-mono">
+              <div className="mt-2 px-3 py-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[length:var(--app-text-xs)] text-[var(--warning)] break-all font-mono">
                 {cliHint}
               </div>
             )}
-            <p className="text-[10px] text-[var(--text-muted)]">{t('mcp.oneClickHint')}</p>
-            {editingId && <p className="text-[10px] text-[var(--warning)] mt-0.5">{t('mcp.templateEditHint')}</p>}
-            <p className="text-[10px] text-[var(--text-muted)] mt-0.5">{t('mcp.recommendedTip')}</p>
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('mcp.oneClickHint')}</p>
+            {editingId && <p className="text-[length:var(--app-text-2xs)] text-[var(--warning)] mt-0.5">{t('mcp.templateEditHint')}</p>}
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-0.5">{t('mcp.recommendedTip')}</p>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('mcp.name')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('mcp.name')}</label>
               <input
                 placeholder="playwright"
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
-                className="w-full h-9 px-3 modern-card rounded-lg text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('mcp.command')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('mcp.command')}</label>
               <input
                 placeholder="npx @playwright/mcp@latest"
                 value={form.command}
                 onChange={(e) => setForm({ ...form, command: e.target.value })}
                 onBlur={handleCommandBlur}
-                className="w-full h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('mcp.description')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('mcp.description')}</label>
               <input
                 placeholder={t('mcp.description')}
                 value={form.description}
                 onChange={(e) => setForm({ ...form, description: e.target.value })}
-                className="w-full h-9 px-3 modern-card rounded-lg text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[11px] text-[var(--text-muted)]">{t('mcp.env')}</label>
+              <label className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('mcp.env')}</label>
               <textarea
                 placeholder={t('mcp.envPlaceholder')}
                 value={form.env}
                 onChange={(e) => setForm({ ...form, env: e.target.value })}
                 rows={Math.max(3, Math.min(6, envDefs.length + 1))}
-                className="w-full px-3 py-2 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] resize-y"
+                className="w-full px-3 py-2 modern-card rounded-lg text-[length:var(--app-text-md)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] resize-y"
               />
             </div>
           </div>
@@ -708,10 +709,10 @@ export default function McpPage() {
           {envDefs.length > 0 && (
             <div className="rounded-lg modern-card p-3 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-medium text-[var(--text-muted)]">{t('mcp.envGuideTitle')}</span>
+                <span className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)]">{t('mcp.envGuideTitle')}</span>
                 <button
                   onClick={fillEnvDefaults}
-                  className="text-[11px] text-[var(--accent)] hover:underline shrink-0"
+                  className="text-[length:var(--app-text-xs)] text-[var(--accent)] hover:underline shrink-0"
                 >
                   {t('mcp.fillDefaults')}
                 </button>
@@ -719,7 +720,7 @@ export default function McpPage() {
               {envDefs.map((d) => {
                 const configured = envObj[d.key] !== undefined && envObj[d.key] !== ''
                 return (
-                  <div key={d.key} className="flex items-baseline gap-2 text-[11px] leading-snug">
+                  <div key={d.key} className="flex items-baseline gap-2 text-[length:var(--app-text-xs)] leading-snug">
                     <span className={`font-mono shrink-0 ${configured ? 'text-[var(--success)]' : 'text-[var(--text-secondary)]'}`}>
                       {d.key}
                     </span>
@@ -743,19 +744,19 @@ export default function McpPage() {
 
       {/* 从 URL 导入（支持走系统代理） */}
       <div className="modern-card rounded-2xl p-4 mb-6 space-y-3 animate-fade-in-up">
-        <div className="text-[11px] font-medium text-[var(--text-muted)]">{t('mcp.fromUrl')}</div>
+        <div className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)]">{t('mcp.fromUrl')}</div>
         <div className="flex gap-2">
           <input
             placeholder={t('mcp.urlPlaceholder')}
             value={fetchUrl}
             onChange={(e) => setFetchUrl(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleFetch()}
-            className="flex-1 h-9 px-3 modern-card rounded-lg text-[13px] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+            className="flex-1 h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-md)] font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
           />
           <button
             onClick={handleFetch}
             disabled={!fetchUrl.trim() || fetching}
-            className="px-4 h-9 rounded-[10px] btn-primary text-[13px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+            className="px-4 h-9 rounded-[10px] btn-primary text-[length:var(--app-text-md)] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
           >
             {fetching ? t('mcp.fetching') : t('mcp.fetch')}
           </button>
@@ -767,18 +768,18 @@ export default function McpPage() {
             onChange={(e) => setFetchProxy(e.target.checked)}
             className="w-3.5 h-3.5 accent-[var(--accent)]"
           />
-          <span className="text-[12px] text-[var(--text-secondary)]">{t('mcp.useProxy')}</span>
+          <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">{t('mcp.useProxy')}</span>
         </label>
         {fetchError && <p className="text-xs text-[var(--danger)] break-all">{fetchError}</p>}
         {drafts && (
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-[var(--text-secondary)]">
+              <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">
                 {t('mcp.fetchedCount', { count: drafts.length })}
               </span>
               <button
                 onClick={addAllDrafts}
-                className="px-3 h-7 rounded-lg bg-[var(--success)] text-white text-[12px] font-medium hover:opacity-90 transition-opacity"
+                className="px-3 h-7 rounded-lg bg-[var(--success)] text-white text-[length:var(--app-text-sm)] font-medium hover:opacity-90 transition-opacity"
               >
                 {t('mcp.addAll')}
               </button>
@@ -786,9 +787,9 @@ export default function McpPage() {
             {drafts.map((d) => (
               <div key={d.name} className="flex items-center justify-between gap-3 modern-card rounded-lg px-3 py-2">
                 <div className="min-w-0">
-                  <div className="text-[13px] font-medium truncate">{d.name}</div>
-                  <div className="text-[11px] text-[var(--text-secondary)] font-mono truncate">{d.command.join(' ')}</div>
-                  {d.description && <div className="text-[11px] text-[var(--text-muted)] truncate">{d.description}</div>}
+                  <div className="text-[length:var(--app-text-md)] font-medium truncate">{d.name}</div>
+                  <div className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)] font-mono truncate">{d.command.join(' ')}</div>
+                  {d.description && <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] truncate">{d.description}</div>}
                 </div>
                 <button
                   onClick={() => addDraft(d)}
@@ -805,8 +806,8 @@ export default function McpPage() {
       <div className="space-y-3">
         {visibleServers.length === 0 && (
           <div className="modern-card rounded-lg p-4">
-            <p className="text-[var(--text-secondary)] text-sm">{t('mcp.empty')}</p>
-            <p className="text-[11px] font-medium text-[var(--text-muted)] mt-3 mb-2">{t('mcp.emptyGuideTitle')}</p>
+            <EmptyState compact icon="mcp" title={t('mcp.empty')} />
+            <p className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)] mt-3 mb-2">{t('mcp.emptyGuideTitle')}</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
               {recommendedTemplates.map((tpl) => (
                 <TemplateCard
@@ -820,10 +821,10 @@ export default function McpPage() {
                 />
               ))}
             </div>
-            <p className="text-[10px] text-[var(--text-muted)] mt-2">{t('mcp.emptyGuideHint')}</p>
+            <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-2">{t('mcp.emptyGuideHint')}</p>
           </div>
         )}
-        <p className="text-[10px] text-[var(--text-muted)]">{t('mcp.multiInstanceHint')}</p>
+        <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('mcp.multiInstanceHint')}</p>
         {visibleServers.map((s) => (
           <div key={s.id} className="modern-card rounded-lg p-4 flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -862,13 +863,13 @@ export default function McpPage() {
               {s.description && <p className="text-xs text-[var(--text-secondary)] mt-1">{s.description}</p>}
               <p className="text-xs text-[var(--text-secondary)] mt-1 font-mono break-all">{s.command}</p>
               {envKeys(s.env) && (
-                <p className="text-[10px] text-[var(--text-muted)] mt-1 font-mono break-all">
+                <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-1 font-mono break-all">
                   {t('mcp.envSummary', { env: envKeys(s.env) })}
                 </p>
               )}
-              <p className="text-[10px] text-[var(--text-muted)] mt-0.5">{t('mcp.createdAt', { time: formatTime(s.created_at) })}</p>
+              <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-0.5">{t('mcp.createdAt', { time: formatTime(s.created_at) })}</p>
               {governance[s.id] && (
-                <p className={`text-[10px] mt-1 ${governance[s.id].verification_state === 'verified' ? 'text-[var(--success)]' : governance[s.id].verification_state === 'drifted' || governance[s.id].verification_state === 'invalid' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
+                <p className={`text-[length:var(--app-text-2xs)] mt-1 ${governance[s.id].verification_state === 'verified' ? 'text-[var(--success)]' : governance[s.id].verification_state === 'drifted' || governance[s.id].verification_state === 'invalid' ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
                   扩展治理：{governance[s.id].verification_state === 'verified' ? 'Ed25519 签名有效（发布者身份未钉住）' : governance[s.id].verification_state === 'unsigned' ? '未签名' : '已隔离'}
                   {' · '}{governance[s.id].calls_per_minute}/分钟 · 连续失败 {governance[s.id].consecutive_failures}/{governance[s.id].failure_threshold}
                 </p>
@@ -882,7 +883,7 @@ export default function McpPage() {
                 </p>
               )}
               {s.authorization_state === 'configured' && s.project_id && (
-                <p className="text-[10px] text-[var(--text-muted)] mt-1">
+                <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-1">
                   {t('mcp.authorizationSummary', {
                     tools: jsonArrayText(s.allowed_tools),
                     roots: jsonArrayText(s.allowed_roots),
@@ -892,7 +893,7 @@ export default function McpPage() {
               )}
               {authEditingId === s.id && s.project_id === projectId && (
                 <div className="mt-3 p-3 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] space-y-2 max-w-2xl">
-                  <p className="text-[11px] text-[var(--warning)]">{t('mcp.authorizationHint')}</p>
+                  <p className="text-[length:var(--app-text-xs)] text-[var(--warning)]">{t('mcp.authorizationHint')}</p>
                   <input value={authForm.tools} onChange={(e) => setAuthForm({ ...authForm, tools: e.target.value })} placeholder={t('mcp.allowedToolsPlaceholder')} className="w-full h-8 px-2 rounded border border-[var(--border)] bg-transparent text-xs font-mono" />
                   <input value={authForm.roots} onChange={(e) => setAuthForm({ ...authForm, roots: e.target.value })} placeholder={t('mcp.allowedRootsPlaceholder')} className="w-full h-8 px-2 rounded border border-[var(--border)] bg-transparent text-xs font-mono" />
                   <div className="flex gap-2">
@@ -965,7 +966,7 @@ function UsageSummaryLine({ stat }: { stat: McpUsageStat }) {
   const rate = stat.call_count > 0 ? Math.round((stat.success_count / stat.call_count) * 100) : 0
   return (
     <div
-      className="mt-1.5 flex items-center gap-2 text-[10px] text-[var(--text-muted)]"
+      className="mt-1.5 flex items-center gap-2 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]"
       title={t('mcp.usageTip')}
     >
       <span className="tabular-nums">{t('mcp.calls', { n: stat.call_count })}</span>
@@ -1017,7 +1018,7 @@ function McpUsageView({
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] text-[var(--text-muted)]">
+        <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
           {projectId ? t('mcp.usageProjectHint') : t('mcp.usageGlobalHint')}
         </p>
         <button
@@ -1030,7 +1031,7 @@ function McpUsageView({
 
       {stats.length === 0 ? (
         <div className="rounded-xl border border-dashed border-[var(--border)] p-8 text-center">
-          <p className="text-[13px] text-[var(--text-muted)]">{t('mcp.usageEmpty')}</p>
+          <p className="text-[length:var(--app-text-md)] text-[var(--text-muted)]">{t('mcp.usageEmpty')}</p>
         </div>
       ) : (
         <>
@@ -1038,15 +1039,15 @@ function McpUsageView({
           <div className="grid grid-cols-3 gap-2">
             <div className="rounded-xl modern-card p-2.5 text-center">
               <div className="text-lg font-semibold tabular-nums">{totalCalls}</div>
-              <div className="text-[10px] text-[var(--text-muted)]">{t('mcp.usageTotalCalls')}</div>
+              <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('mcp.usageTotalCalls')}</div>
             </div>
             <div className="rounded-xl modern-card p-2.5 text-center">
               <div className="text-lg font-semibold tabular-nums text-[var(--success)]">{totalCalls - totalFail}</div>
-              <div className="text-[10px] text-[var(--text-muted)]">{t('mcp.usageSuccess')}</div>
+              <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('mcp.usageSuccess')}</div>
             </div>
             <div className="rounded-xl modern-card p-2.5 text-center">
               <div className="text-lg font-semibold tabular-nums text-[var(--danger)]">{totalFail}</div>
-              <div className="text-[10px] text-[var(--text-muted)]">{t('mcp.usageFailed')}</div>
+              <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('mcp.usageFailed')}</div>
             </div>
           </div>
 
@@ -1061,13 +1062,13 @@ function McpUsageView({
                   className="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-left hover:bg-[var(--bg-hover)] transition-colors"
                 >
                   <span className="flex items-center gap-2 min-w-0">
-                    <span className={`text-[11px] transition-transform ${isCollapsed ? '' : 'rotate-90'}`}>▶</span>
-                    <span className="text-[13px] font-medium truncate">{s.server_name}</span>
-                    <span className="shrink-0 text-[11px] tabular-nums text-[var(--text-muted)]">
+                    <span className={`text-[length:var(--app-text-xs)] transition-transform ${isCollapsed ? '' : 'rotate-90'}`}>▶</span>
+                    <span className="text-[length:var(--app-text-md)] font-medium truncate">{s.server_name}</span>
+                    <span className="shrink-0 text-[length:var(--app-text-xs)] tabular-nums text-[var(--text-muted)]">
                       {s.call_count}×
                     </span>
                   </span>
-                  <span className="flex items-center gap-3 shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">
+                  <span className="flex items-center gap-3 shrink-0 text-[length:var(--app-text-2xs)] tabular-nums text-[var(--text-muted)]">
                     <span className="text-[var(--success)]">{s.success_count} ✓</span>
                     {s.fail_count > 0 && <span className="text-[var(--danger)]">{s.fail_count} ✗</span>}
                     <span>{t('mcp.rate', { rate })}</span>
@@ -1081,8 +1082,8 @@ function McpUsageView({
                       return (
                         <div key={tool.tool_name} className="rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] p-2">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-[11px] font-mono truncate">{tool.tool_name}</span>
-                            <span className="shrink-0 text-[10px] tabular-nums">{tool.call_count}×</span>
+                            <span className="text-[length:var(--app-text-xs)] font-mono truncate">{tool.tool_name}</span>
+                            <span className="shrink-0 text-[length:var(--app-text-2xs)] tabular-nums">{tool.call_count}×</span>
                           </div>
                           <div className="mt-1.5 h-1 rounded-full bg-[var(--bg-hover)] overflow-hidden">
                             <div
@@ -1090,7 +1091,7 @@ function McpUsageView({
                               style={{ width: `${tRate}%` }}
                             />
                           </div>
-                          <div className="mt-1 flex items-center justify-between text-[9px] text-[var(--text-muted)]">
+                          <div className="mt-1 flex items-center justify-between text-[length:var(--app-text-micro)] text-[var(--text-muted)]">
                             <span>
                               {t('mcp.rate', { rate: tRate })} · {t('mcp.avgMs', { ms: tool.avg_duration_ms ?? '—' })}
                             </span>

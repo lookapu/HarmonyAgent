@@ -66,7 +66,7 @@ export default function SandboxCapabilityPanel() {
           <h3 id="sandbox-capability-title" className="text-sm font-medium text-[var(--text-secondary)]">
             {t('health.sandboxTitle')}
           </h3>
-          <p className="mt-1 text-[11px] text-[var(--text-muted)]">{t('health.sandboxSubtitle')}</p>
+          <p className="mt-1 text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('health.sandboxSubtitle')}</p>
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -133,16 +133,16 @@ export default function SandboxCapabilityPanel() {
                       <span
                         className={`h-2.5 w-2.5 shrink-0 rounded-full ${capability.available ? 'bg-[var(--success)]' : 'bg-[var(--text-muted)]'}`}
                       />
-                      <span className="text-[13px] font-medium text-[var(--text-primary)]">
+                      <span className="text-[length:var(--app-text-md)] font-medium text-[var(--text-primary)]">
                         {DISPLAY_NAMES[capability.backend] ?? capability.backend}
                       </span>
                     </div>
-                    <p className="mt-1 break-words pl-[18px] text-[11px] text-[var(--text-muted)]">
+                    <p className="mt-1 break-words pl-[18px] text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
                       {capability.reason ?? t('health.sandboxNoDetail')}
                     </p>
                   </div>
                   <span
-                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${capability.available ? 'bg-[var(--success)]/10 text-[var(--success)]' : 'bg-[var(--bg-hover)] text-[var(--text-muted)]'}`}
+                    className={`shrink-0 rounded-full px-2 py-0.5 text-[length:var(--app-text-2xs)] font-medium ${capability.available ? 'bg-[var(--success)]/10 text-[var(--success)]' : 'bg-[var(--bg-hover)] text-[var(--text-muted)]'}`}
                   >
                     {capability.available ? t('health.sandboxAvailable') : t('health.sandboxUnavailable')}
                   </span>
@@ -150,14 +150,14 @@ export default function SandboxCapabilityPanel() {
                 {enforced.length > 0 && (
                   <div className="mt-2 flex flex-wrap gap-1.5 pl-[18px]">
                     {enforced.map((label) => (
-                      <span key={label} className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                      <span key={label} className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[length:var(--app-text-2xs)] text-[var(--text-secondary)]">
                         {label}
                       </span>
                     ))}
                   </div>
                 )}
                 {missingResourceLimits.length > 0 && (
-                  <p className="mt-2 pl-[18px] text-[10px] text-[var(--warning)]">
+                  <p className="mt-2 pl-[18px] text-[length:var(--app-text-2xs)] text-[var(--warning)]">
                     {t('health.sandboxLimitsMissing', { limits: missingResourceLimits.join(' / ') })}
                   </p>
                 )}
@@ -172,13 +172,13 @@ export default function SandboxCapabilityPanel() {
             <span className="text-xs font-medium text-[var(--text-primary)]">
               {t('health.sandboxVerifyResult')}
             </span>
-            <span className={`text-[11px] font-medium ${boundary.passed ? 'text-[var(--success)]' : 'text-[var(--warning)]'}`}>
+            <span className={`text-[length:var(--app-text-xs)] font-medium ${boundary.passed ? 'text-[var(--success)]' : 'text-[var(--warning)]'}`}>
               {boundary.passed ? t('health.sandboxVerifyPassed') : t('health.sandboxVerifyFailed')}
             </span>
           </div>
           <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
             {boundary.checks.map((check) => (
-              <div key={check.name} className="flex items-start gap-2 text-[11px]">
+              <div key={check.name} className="flex items-start gap-2 text-[length:var(--app-text-xs)]">
                 <span className={check.passed ? 'text-[var(--success)]' : 'text-[var(--danger)]'}>
                   {check.passed ? '✓' : '✕'}
                 </span>
@@ -189,10 +189,10 @@ export default function SandboxCapabilityPanel() {
               </div>
             ))}
           </div>
-          <p className="mt-2 text-[10px] text-[var(--text-muted)]">{t('health.sandboxVerifyScope')}</p>
+          <p className="mt-2 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">{t('health.sandboxVerifyScope')}</p>
         </div>
       )}
-      <p className="mt-2 text-[11px] leading-5 text-[var(--warning)]">{t('health.sandboxBoundaryNote')}</p>
+      <p className="mt-2 text-[length:var(--app-text-xs)] leading-5 text-[var(--warning)]">{t('health.sandboxBoundaryNote')}</p>
     </section>
   )
 }

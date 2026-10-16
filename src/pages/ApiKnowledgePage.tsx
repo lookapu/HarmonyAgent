@@ -1,6 +1,7 @@
 // @ui-states: loading, empty, partial, failed, retry, permission
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
+import { EmptyState } from '../components/ui/EmptyState'
 import {
   apiKbStats,
   apiKbFilters,
@@ -16,6 +17,8 @@ import {
   apiKbRefreshDetails,
   apiKbEmbedStatus,
   apiKbEmbedIndex,
+  apiKbEmbedCancel,
+  apiKbEmbedSetEnabled,
   onDocsProgress,
   onDetailsProgress,
   onEmbedProgress,
@@ -36,12 +39,43 @@ import {
 import { Skeleton, Spinner } from '../components/ui/Spinner'
 
 type Tab = 'docs' | 'details'
-
 const PAGE_SIZE_OPTIONS = [20, 50, 100, 200]
+
+/** 语义层状态 → i18n key。与后端 `SemanticLayerState` 一一对应。 */
+const EMBED_STATE_LABEL_KEY = {
+  ready: 'apiKb.embedStateReady',
+  not_indexed: 'apiKb.embedStateNotIndexed',
+  stale_index: 'apiKb.embedStateStale',
+  partial_index: 'apiKb.embedStatePartial',
+  model_missing: 'apiKb.embedStateModelMissing',
+  disabled: 'apiKb.embedStateDisabled',
+} as const
+
+/** 语义层状态 → 徽章配色。`ready` 绿，其余都用 warning 色：
+ *  它们都不代表「能用」，其中两种（未构建 / 口径过期）**行数看起来是满的**，
+ *  唯一能让用户分辨的办法就是颜色与文案不同。
+ *  `disabled` 单独用中性灰：它不是「坏了/该修」，而是用户的主动选择，
+ *  用 warning 色会像在报一个故障。 */
+const EMBED_STATE_TONE = {
+  ready: 'bg-[var(--success)]/15 text-[var(--success)] border-[var(--success)]/40',
+  not_indexed: 'bg-[var(--warning)]/15 text-[var(--warning)] border-[var(--warning)]/40',
+  stale_index: 'bg-[var(--warning)]/15 text-[var(--warning)] border-[var(--warning)]/40',
+  partial_index: 'bg-[var(--warning)]/15 text-[var(--warning)] border-[var(--warning)]/40',
+  model_missing: 'bg-[var(--warning)]/15 text-[var(--warning)] border-[var(--warning)]/40',
+  disabled: 'bg-[var(--bg-card)] text-[var(--text-secondary)] border-[var(--border)]',
+} as const
 
 function formatTime(ts: number | null): string {
   if (!ts) return '-'
   return new Date(ts * 1000).toLocaleString()
+}
+
+/** 剩余秒数 → "约 N 分钟"。< 60s 显示秒，超过 2 小时显示小时——
+ *  一律显示分钟的话，3 小时会显示成「180 分钟」，没人读得下去。 */
+function formatEta(secs: number): string {
+  if (secs < 60) return `${Math.max(1, Math.round(secs))}s`
+  if (secs < 7200) return `${Math.round(secs / 60)}m`
+  return `${(secs / 3600).toFixed(1)}h`
 }
 
 function changeTypeColor(ct: string): string {
@@ -62,6 +96,8 @@ export default function ApiKnowledgePage() {
   const [filters, setFilters] = useState<KbFilters | null>(null)
   const [embedStatus, setEmbedStatus] = useState<EmbedStatus | null>(null)
   const [embedProgress, setEmbedProgress] = useState<RefreshProgress | null>(null)
+  const [cancelling, setCancelling] = useState(false)
+  const [togglingEmbed, setTogglingEmbed] = useState(false)
 
   const [loading, setLoading] = useState(false)
   const [docsPage, setDocsPage] = useState<DocsPage | null>(null)
@@ -139,14 +175,52 @@ export default function ApiKnowledgePage() {
 
   useEffect(() => { reload() }, [reload])
 
-  // 建索引完成：刷新状态展示（成功/失败均以事件 payload 为准）
+  // 建索引完成：刷新状态展示（成功/失败/取消均以事件 payload 为准）
   const handleEmbedDone = useCallback((p: EmbedDonePayload) => {
     setEmbedProgress(null)
-    if (!p.ok) {
+    setCancelling(false)
+    // 取消不是失败：已写入的那部分向量是有效结果，弹错误等于让用户以为白干了
+    if (!p.ok && !p.cancelled) {
       setError(p.error ?? t('apiKb.embedFailed'))
     }
-    apiKbEmbedStatus().then(setEmbedStatus).catch(() => {})
+    // 「任务已结束」是 done 事件**已经确定**的事实，先无条件落进本地状态。
+    // 原来把这件事整个押在下面那次 status 往返上，而它可能失败（`.catch(() => {})`）
+    // ——一失败卡片就继续说「建索引中」，而 done 不会来第二次 ⇒ 按钮永久禁用。
+    setEmbedStatus((s) => (s ? { ...s, running: false } : s))
+    // 再拉细节（indexed/total/state）。失败就保留上面那个「已结束」——
+    // 宁可细节停在上一轮，也不能让「还在跑」这种错误状态留在屏幕上。
+    apiKbEmbedStatus()
+      .then(setEmbedStatus)
+      .catch(() => {})
   }, [t])
+
+  // 兜底：等 done 事件来解锁「取消中…」是**唯一通路**时不安全的——
+  // emit 失败、或状态被别的路径改过，按钮就永久禁用且没有任何办法恢复。
+  // 这里用一次短轮询独立于该事件复位：一旦后端说没在跑，就解锁。
+  useEffect(() => {
+    if (!cancelling) return
+    let alive = true
+    let timer: number | undefined
+    const check = async () => {
+      try {
+        const s = await apiKbEmbedStatus()
+        if (!alive) return
+        if (!s.running) {
+          setCancelling(false)
+          setEmbedStatus(s)
+          return
+        }
+      } catch {
+        // 查不到就继续等下一次；取消本身是幂等的，不报错
+      }
+      if (alive) timer = window.setTimeout(check, 1500)
+    }
+    timer = window.setTimeout(check, 1500)
+    return () => {
+      alive = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [cancelling])
 
   // 语义索引进度/完成事件（页面生命周期内常驻监听，后台任务跨刷新周期持续）
   useEffect(() => {
@@ -171,13 +245,57 @@ export default function ApiKnowledgePage() {
     }
   }, [handleEmbedDone])
 
+  // 语义层开关（P-7 方案②）：默认关，用户主动开。
+  //
+  // ## 这里**不做乐观更新**——§6.44 的根因修复
+  //
+  // §6.44 的处理是「切换期间隐藏徽章」，那治的是**症状**（两个控件各说各话）。
+  // 根因是：乐观更新 `enabled` 时，**前端算不出 `state` 是什么**——
+  // `enabled` 变 true 之后 `state` 取决于后端要不要加载模型才知道，
+  // 于是改 `enabled` 不改 `state` 必然产生一瞬间的不自洽。
+  //
+  // **判据：乐观更新只适用于「本地能确定真值」的字段。**
+  // - `handleEmbedDone` 里 `running: false` ✅ 收到 done 事件时"任务已结束"是本地确定的。
+  // - 这里 `enabled: true` ❌ 它成立之后 `state` 是未知的 ⇒ 不能乐观更新。
+  //
+  // 所以整个 status **等后端返回后一次性替换**，任何时刻 `enabled` 与 `state`
+  // 都来自**同一次响应**，结构上不可能不同步。
+  // 代价是按钮转 1~2 秒（那 1~2 秒是模型加载，真实且不可避免），
+  // 用 `togglingEmbed` 的「处理中」明确告知——**转圈在这里是诚实的**。
+  const toggleEmbedEnabled = async (next: boolean) => {
+    if (togglingEmbed) return
+    setTogglingEmbed(true)
+    setError(null)
+    try {
+      await apiKbEmbedSetEnabled(next)
+      setEmbedStatus(await apiKbEmbedStatus())
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setTogglingEmbed(false)
+    }
+  }
+
   const startEmbed = async () => {
     setError(null)
+    setCancelling(false)
     try {
       await apiKbEmbedIndex()
       setEmbedProgress({ phase: 'checking', current: 0, total: 0, message: t('apiKb.embedStarting') })
       setEmbedStatus((s) => (s ? { ...s, running: true } : s))
     } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // 取消：20~30 分钟的任务不给出口等于让人守着。
+  // 按钮置「取消中…」且禁用，直到 done 事件把 running 翻回 false。
+  const cancelEmbed = async () => {
+    setCancelling(true)
+    try {
+      await apiKbEmbedCancel()
+    } catch (e) {
+      setCancelling(false)
       setError(String(e))
     }
   }
@@ -311,21 +429,21 @@ export default function ApiKnowledgePage() {
           <button
             onClick={() => startRefresh('docs')}
             disabled={refreshing !== null}
-            className="h-9 px-3 rounded-[10px] border border-[var(--accent)] text-[var(--accent)] text-[12px] font-medium hover:bg-[var(--accent-soft)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-9 px-3 rounded-[10px] border border-[var(--accent)] text-[var(--accent)] text-[length:var(--app-text-sm)] font-medium hover:bg-[var(--accent-soft)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {refreshing === 'docs' ? t('apiKb.refreshingDocs') : t('apiKb.refreshDocs')}
           </button>
           <button
             onClick={() => startRefresh('details')}
             disabled={refreshing !== null}
-            className="h-9 px-3 rounded-[10px] border border-[var(--accent)] text-[var(--accent)] text-[12px] font-medium hover:bg-[var(--accent-soft)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-9 px-3 rounded-[10px] border border-[var(--accent)] text-[var(--accent)] text-[length:var(--app-text-sm)] font-medium hover:bg-[var(--accent-soft)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {refreshing === 'details' ? t('apiKb.refreshingDetails') : t('apiKb.refreshDetails')}
           </button>
           <button
             onClick={handleClearAll}
             disabled={refreshing !== null}
-            className="h-9 px-3 rounded-[10px] border border-[var(--danger)]/40 text-[var(--danger)] text-[12px] font-medium hover:bg-[var(--danger)]/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-9 px-3 rounded-[10px] border border-[var(--danger)]/40 text-[var(--danger)] text-[length:var(--app-text-sm)] font-medium hover:bg-[var(--danger)]/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {t('apiKb.clearAll')}
           </button>
@@ -349,41 +467,102 @@ export default function ApiKnowledgePage() {
         <div className="modern-card rounded-xl p-3">
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="flex items-center gap-2.5 flex-wrap min-w-0">
-              <span className="text-[11px] text-[var(--text-muted)]">🧠 {t('apiKb.embedTitle')}</span>
-              <span className={`px-1.5 py-0.5 rounded border text-[10px] ${
-                embedStatus.available
-                  ? 'bg-[var(--success)]/15 text-[var(--success)] border-[var(--success)]/40'
-                  : 'bg-[var(--warning)]/15 text-[var(--warning)] border-[var(--warning)]/40'
-              }`}>
-                {embedStatus.available ? t('apiKb.embedReady') : t('apiKb.embedUnavailable')}
-              </span>
-              {embedStatus.model && (
-                <span className="text-[10px] text-[var(--text-muted)] font-mono">{embedStatus.model}</span>
+              <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">🧠 {t('apiKb.embedTitle')}</span>
+              {/* 徽章按**真实状态**上色，而不是按 `available`。
+                  `indexed === total` 盖不住「口径已过期」——那时卡片会显示
+                  「已启用 44856/44856」，而语义检索其实正在拒绝检索。
+
+                  这个 `!togglingEmbed` 守卫**现在是冗余保险，不是必需机制**：
+                  根因已在 `toggleEmbedEnabled` 修掉（不再乐观更新 `enabled`），
+                  所以切换期间显示的是**旧但自洽**的状态，本来就不会矛盾。
+                  保留它是因为万一将来有人在切换期间做局部更新，这里还能兜住。
+
+                  **为什么留着并如实标注**：§6.42.6 记过一个教训——
+                  注释里没说清"这是必需还是冗余"时，下一个人会把它当必需机制，
+                  于是不敢动真正的原因。**冗余的东西必须标明是冗余。** */}
+              {!togglingEmbed && (
+                <span className={`px-1.5 py-0.5 rounded border text-[length:var(--app-text-2xs)] ${
+                  EMBED_STATE_TONE[embedStatus.state] ?? EMBED_STATE_TONE.model_missing
+                }`}>
+                  {t(EMBED_STATE_LABEL_KEY[embedStatus.state] ?? 'apiKb.embedStateModelMissing')}
+                </span>
               )}
-              <span className="text-[11px] text-[var(--text-secondary)] font-mono">
+              {embedStatus.model && (
+                <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] font-mono">{embedStatus.model}</span>
+              )}
+              <span className="text-[length:var(--app-text-xs)] text-[var(--text-secondary)] font-mono">
                 {embedStatus.indexed}/{embedStatus.total}
               </span>
               {embedStatus.running && (
-                <span className="text-[11px] text-[var(--warning)] animate-pulse">{t('apiKb.embedRunning')}</span>
+                <span className="text-[length:var(--app-text-xs)] text-[var(--warning)] animate-pulse">{t('apiKb.embedRunning')}</span>
               )}
-              {!embedStatus.running && embedStatus.available && embedStatus.indexed < embedStatus.total && (
-                <span className="text-[11px] text-[var(--warning)]">{t('apiKb.embedStale')}</span>
-              )}
+              {/* 「有新数据待索引」那一行（`apiKb.embedStale`）已删除，**不是被搬走了，是它死了**：
+                  条件是 `state === 'ready' && indexed < total`，而 `ready` 现在按定义蕴含
+                  `indexed >= total`（行数盖不住总量一律判 `partial_index`）⇒ 两个条件互斥，
+                  永不可达。留着它就是一段"装着门面的死代码"——而且它说的那件事
+                  （行数没盖住）现在由 `partial_index` 徽章讲得更准。 */}
             </div>
-            <button
-              onClick={startEmbed}
-              disabled={!embedStatus.available || embedStatus.running || embedStatus.total === 0}
-              className="h-8 px-3 rounded-lg border border-[var(--accent)] text-[var(--accent)] text-[12px] font-medium hover:bg-[var(--accent-soft)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {embedStatus.running ? t('apiKb.embedBuilding') : t('apiKb.embedBuild')}
-            </button>
+            <div className="flex items-center gap-2">
+              {/* 语义层开关（P-7 方案②：默认关）。
+                  放在「重建索引」**之前**：它是那个按钮的前置条件，
+                  顺序反过来会让人先点一个注定被拒的按钮。 */}
+              <button
+                onClick={() => toggleEmbedEnabled(!embedStatus.enabled)}
+                disabled={togglingEmbed || embedStatus.running}
+                aria-pressed={embedStatus.enabled}
+                aria-busy={togglingEmbed}
+                className="h-8 px-3 rounded-lg border border-[var(--border-strong)] text-[var(--text-secondary)] text-[length:var(--app-text-sm)] font-medium hover:bg-[var(--bg-card)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {/* 不做乐观更新 ⇒ 切换期间 `enabled` 仍是旧值，
+                    若只靠 `disabled` 用户会以为按钮坏了 ⇒ 必须给文案。 */}
+                {togglingEmbed
+                  ? t('apiKb.embedTogglePending')
+                  : embedStatus.enabled
+                    ? t('apiKb.embedTurnOff')
+                    : t('apiKb.embedTurnOn')}
+              </button>
+              {embedStatus.running && (
+                <button
+                  onClick={cancelEmbed}
+                  disabled={cancelling}
+                  className="h-8 px-3 rounded-lg border border-[var(--border-strong)] text-[var(--text-secondary)] text-[length:var(--app-text-sm)] font-medium hover:bg-[var(--bg-card)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  {cancelling ? t('apiKb.embedCancelling') : t('apiKb.embedCancel')}
+                </button>
+              )}
+              <button
+                onClick={startEmbed}
+                // `!enabled` 也要禁用：后端 `api_kb_embed_index` 会拒绝，
+                // 按钮可点却只弹一个错误，等于让用户撞一次墙才知道前置条件
+                disabled={!embedStatus.enabled || !embedStatus.available || embedStatus.running || embedStatus.total === 0}
+                className="h-8 px-3 rounded-lg border border-[var(--accent)] text-[var(--accent)] text-[length:var(--app-text-sm)] font-medium hover:bg-[var(--accent-soft)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {embedStatus.running ? t('apiKb.embedBuilding') : t('apiKb.embedBuild')}
+              </button>
+            </div>
           </div>
+          {/* 关闭时才解释「为什么关着、开了有什么用」。
+              **这不是可选的润色**：默认关是一次**行为变更**，用户升级后第一次看到
+              只会看到「已关闭」三个字。若不解释，"我的语义搜索怎么没了"会直接变成
+              支持问题，而真正的解释（`Disabled` 的 hint）只出现在**搜索结果里**——
+              也就是用户得先踩一次坑（搜中文 0 命中）才看得到。
+              **先问「用户不知道会怎样」，再决定要不要写这句提示。** */}
+          {!embedStatus.enabled && !embedStatus.running && (
+            <p className="mt-2 text-[length:var(--app-text-2xs)] text-[var(--text-muted)] leading-relaxed">
+              {t('apiKb.embedDisabledHint')}
+            </p>
+          )}
           {embedStatus.running && embedProgress && (
             <div className="mt-2.5 space-y-1">
-              <div className="flex items-center justify-between text-[10px] text-[var(--text-muted)]">
+              <div className="flex items-center justify-between text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
                 <span className="truncate">{embedProgress.message}</span>
                 <span className="font-mono shrink-0 ml-2">
                   {embedProgress.total > 0 ? `${embedProgress.current}/${embedProgress.total}` : ''}
+                  {embedProgress.etaSecs != null && embedProgress.etaSecs > 0 && (
+                    <span className="ml-2 font-sans">
+                      {t('apiKb.embedEtaLabel')} {formatEta(embedProgress.etaSecs)}
+                    </span>
+                  )}
                 </span>
               </div>
               <div className="h-1.5 bg-[var(--bg-card)] rounded-full overflow-hidden">
@@ -404,13 +583,13 @@ export default function ApiKnowledgePage() {
       {/* Version distribution */}
       {stats && stats.versions.length > 0 && (
         <div className="modern-card rounded-xl p-3">
-          <div className="text-[11px] text-[var(--text-muted)] mb-2">{t('apiKb.versionDist')}</div>
+          <div className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] mb-2">{t('apiKb.versionDist')}</div>
           <div className="flex flex-wrap gap-2">
             {stats.versions.map((v) => (
               <button
                 key={v.version_label}
                 onClick={() => { setTab('docs'); setVersion(version === v.version_label ? '' : v.version_label); setPage(1) }}
-                className={`px-2.5 py-1 rounded-lg border text-[11px] transition-colors ${
+                className={`px-2.5 py-1 rounded-lg border text-[length:var(--app-text-xs)] transition-colors ${
                   version === v.version_label
                     ? 'tab-active border-[var(--accent)]'
                     : 'bg-[var(--bg-card)] text-[var(--text-secondary)] border-[var(--border)] hover:border-[var(--accent)]/40'
@@ -428,7 +607,7 @@ export default function ApiKnowledgePage() {
       {/* Progress */}
       {refreshing && progress && (
         <div className="bg-[var(--bg-secondary)] border border-[var(--accent)]/30 rounded-xl p-4 space-y-2">
-          <div className="flex items-center justify-between text-[12px]">
+          <div className="flex items-center justify-between text-[length:var(--app-text-sm)]">
             <span className="text-[var(--text-primary)] font-medium">{progress.phase}</span>
             <span className="text-[var(--text-muted)] font-mono">{progress.current}/{progress.total}</span>
           </div>
@@ -439,19 +618,19 @@ export default function ApiKnowledgePage() {
             />
           </div>
           {progress.message && (
-            <p className="text-[11px] text-[var(--text-muted)] truncate">{progress.message}</p>
+            <p className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] truncate">{progress.message}</p>
           )}
         </div>
       )}
 
       {error && (
-        <div className="px-3 py-2 rounded-lg border border-[var(--danger)]/40 bg-[var(--danger)]/10 text-[11px] text-[var(--danger)] break-words">
+        <div className="px-3 py-2 rounded-lg border border-[var(--danger)]/40 bg-[var(--danger)]/10 text-[length:var(--app-text-xs)] text-[var(--danger)] break-words">
           {error}
         </div>
       )}
 
       {/* Tabs */}
-      <div className="inline-flex modern-card rounded-lg p-0.5 text-[12px]">
+      <div className="inline-flex modern-card rounded-lg p-0.5 text-[length:var(--app-text-sm)]">
         <button
           onClick={() => setTab('docs')}
           className={`px-4 h-8 rounded-md transition-colors ${
@@ -479,11 +658,11 @@ export default function ApiKnowledgePage() {
               onChange={(e) => setSearchInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
               placeholder={tab === 'docs' ? t('apiKb.searchDocsPlaceholder') : t('apiKb.searchDetailsPlaceholder')}
-              className="flex-1 h-8 px-3 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              className="flex-1 h-8 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
             />
             <button
               onClick={handleSearch}
-              className="h-8 px-3 rounded-lg btn-primary text-[12px]  transition-colors"
+              className="h-8 px-3 rounded-lg btn-primary text-[length:var(--app-text-sm)]  transition-colors"
             >
               {t('apiKb.search')}
             </button>
@@ -492,7 +671,7 @@ export default function ApiKnowledgePage() {
           <select
             value={kit}
             onChange={(e) => setKit(e.target.value)}
-            className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+            className="h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
           >
             <option value="">{t('apiKb.allKits')}</option>
             {kits.map((k) => <option key={k} value={k}>{k}</option>)}
@@ -503,7 +682,7 @@ export default function ApiKnowledgePage() {
               <select
                 value={version}
                 onChange={(e) => setVersion(e.target.value)}
-                className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                className="h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
               >
                 <option value="">{t('apiKb.allVersions')}</option>
                 {filters?.versions.map((v) => <option key={v} value={v}>{v}</option>)}
@@ -511,7 +690,7 @@ export default function ApiKnowledgePage() {
               <select
                 value={changeType}
                 onChange={(e) => setChangeType(e.target.value)}
-                className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                className="h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
               >
                 <option value="">{t('apiKb.allChangeTypes')}</option>
                 <option value="added">{t('apiKb.ctAdded')}</option>
@@ -523,13 +702,13 @@ export default function ApiKnowledgePage() {
                 value={apiLevel}
                 onChange={(e) => setApiLevel(e.target.value.replace(/\D/g, ''))}
                 placeholder={t('apiKb.apiLevel')}
-                className="w-20 h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                className="w-20 h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
             </>
           )}
 
           {tab === 'details' && (
-            <label className="flex items-center gap-1.5 text-[12px] text-[var(--text-secondary)] cursor-pointer select-none">
+            <label className="flex items-center gap-1.5 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={includeDeprecated}
@@ -544,12 +723,12 @@ export default function ApiKnowledgePage() {
             value={moduleFilter}
             onChange={(e) => setModuleFilter(e.target.value)}
             placeholder={t('apiKb.moduleFilter')}
-            className="w-36 h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+            className="w-36 h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
           />
 
           <button
             onClick={handleReset}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
           >
             {t('apiKb.reset')}
           </button>
@@ -558,7 +737,7 @@ export default function ApiKnowledgePage() {
 
       {/* Action buttons */}
       <div className="flex items-center justify-between">
-        <div className="text-[12px] text-[var(--text-secondary)]">
+        <div className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">
           {t('apiKb.showingCount', {
             from: ((page - 1) * pageSize) + 1,
             to: Math.min(page * pageSize, tab === 'docs' ? (docsPage?.total ?? 0) : (detailsPage?.total ?? 0)),
@@ -569,7 +748,7 @@ export default function ApiKnowledgePage() {
           {tab === 'docs' && (
             <button
               onClick={() => setShowDocForm(true)}
-              className="h-8 px-3 rounded-lg btn-primary text-[12px]  transition-colors"
+              className="h-8 px-3 rounded-lg btn-primary text-[length:var(--app-text-sm)]  transition-colors"
             >
               + {t('apiKb.addDoc')}
             </button>
@@ -577,7 +756,7 @@ export default function ApiKnowledgePage() {
           {tab === 'details' && (
             <button
               onClick={() => { setEditingDetail(null); setShowDetailForm(true) }}
-              className="h-8 px-3 rounded-lg btn-primary text-[12px]  transition-colors"
+              className="h-8 px-3 rounded-lg btn-primary text-[length:var(--app-text-sm)]  transition-colors"
             >
               + {t('apiKb.addDetail')}
             </button>
@@ -585,7 +764,7 @@ export default function ApiKnowledgePage() {
           <select
             value={pageSize}
             onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1) }}
-            className="h-8 px-2 modern-card rounded-lg text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+            className="h-8 px-2 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
           >
             {PAGE_SIZE_OPTIONS.map((n) => <option key={n} value={n}>{n}/page</option>)}
           </select>
@@ -619,36 +798,36 @@ export default function ApiKnowledgePage() {
 
       {/* Pagination */}
       <div className="flex items-center justify-between">
-        <div className="text-[12px] text-[var(--text-muted)]">
+        <div className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">
           {t('apiKb.pageInfo', { page, total: totalPages })}
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setPage(1)}
             disabled={page <= 1}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             « {t('apiKb.first')}
           </button>
           <button
             onClick={() => setPage((p) => Math.max(1, p - 1))}
             disabled={page <= 1}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             ← {t('apiKb.prev')}
           </button>
-          <span className="text-[12px] text-[var(--text-secondary)] font-mono">{page} / {totalPages}</span>
+          <span className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)] font-mono">{page} / {totalPages}</span>
           <button
             onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
             disabled={page >= totalPages}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {t('apiKb.next')} →
           </button>
           <button
             onClick={() => setPage(totalPages)}
             disabled={page >= totalPages}
-            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="h-8 px-3 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {t('apiKb.last')} »
           </button>
@@ -700,8 +879,8 @@ export default function ApiKnowledgePage() {
 function StatCard({ label, value, small }: { label: string; value: string; small?: boolean }) {
   return (
     <div className="modern-card rounded-xl px-3 py-2.5">
-      <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wide">{label}</div>
-      <div className={`mt-1 font-semibold text-[var(--text-primary)] ${small ? 'text-[11px]' : 'text-[18px]'} truncate`} title={value}>
+      <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] uppercase tracking-wide">{label}</div>
+      <div className={`mt-1 font-semibold text-[var(--text-primary)] ${small ? 'text-[length:var(--app-text-xs)]' : 'text-[length:var(--app-text-lg)]'} truncate`} title={value}>
         {value}
       </div>
     </div>
@@ -711,11 +890,11 @@ function StatCard({ label, value, small }: { label: string; value: string; small
 function DocsTable({ items, onDelete }: { items: ApiEntry[]; onDelete: (e: ApiEntry) => void }) {
   const { t } = useTranslation()
   if (items.length === 0) {
-    return <div className="p-8 text-center text-sm text-[var(--text-secondary)]">{t('apiKb.empty')}</div>
+    return <EmptyState compact icon="terminal" title={t('apiKb.empty')} />
   }
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-[12px]">
+      <table className="w-full text-[length:var(--app-text-sm)]">
         <thead className="modern-card-b border-[var(--border)]">
           <tr className="text-left text-[var(--text-muted)]">
             <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colKit')}</th>
@@ -731,19 +910,19 @@ function DocsTable({ items, onDelete }: { items: ApiEntry[]; onDelete: (e: ApiEn
           {items.map((e, i) => (
             <tr key={i} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-card)]/50">
               <td className="px-3 py-2 text-[var(--text-secondary)] whitespace-nowrap">{e.kit}</td>
-              <td className="px-3 py-2 text-[var(--text-secondary)] whitespace-nowrap font-mono text-[11px]">{e.module ?? '-'}</td>
+              <td className="px-3 py-2 text-[var(--text-secondary)] whitespace-nowrap font-mono text-[length:var(--app-text-xs)]">{e.module ?? '-'}</td>
               <td className="px-3 py-2">
-                <div className="font-mono text-[11px] text-[var(--text-primary)] break-all line-clamp-2" title={e.declaration}>
+                <div className="font-mono text-[length:var(--app-text-xs)] text-[var(--text-primary)] break-all line-clamp-2" title={e.declaration}>
                   {e.declaration}
                 </div>
                 {e.old_declaration && (
-                  <div className="font-mono text-[10px] text-[var(--text-muted)] break-all line-through mt-0.5 line-clamp-1">
+                  <div className="font-mono text-[length:var(--app-text-2xs)] text-[var(--text-muted)] break-all line-through mt-0.5 line-clamp-1">
                     {e.old_declaration}
                   </div>
                 )}
               </td>
               <td className="px-3 py-2 whitespace-nowrap">
-                <span className={`px-1.5 py-0.5 rounded border text-[10px] ${changeTypeColor(e.change_type)}`}>
+                <span className={`px-1.5 py-0.5 rounded border text-[length:var(--app-text-2xs)] ${changeTypeColor(e.change_type)}`}>
                   {e.change_type}
                 </span>
               </td>
@@ -752,7 +931,7 @@ function DocsTable({ items, onDelete }: { items: ApiEntry[]; onDelete: (e: ApiEn
               <td className="px-3 py-2 whitespace-nowrap text-right">
                 <button
                   onClick={() => onDelete(e)}
-                  className="px-2 py-1 text-[10px] border border-[var(--danger)]/40 text-[var(--danger)] rounded hover:bg-[var(--danger)]/10 transition-colors"
+                  className="px-2 py-1 text-[length:var(--app-text-2xs)] border border-[var(--danger)]/40 text-[var(--danger)] rounded hover:bg-[var(--danger)]/10 transition-colors"
                 >
                   {t('apiKb.delete')}
                 </button>
@@ -775,11 +954,11 @@ function DetailsTable({
 }) {
   const { t } = useTranslation()
   if (items.length === 0) {
-    return <div className="p-8 text-center text-sm text-[var(--text-secondary)]">{t('apiKb.empty')}</div>
+    return <EmptyState compact icon="terminal" title={t('apiKb.empty')} />
   }
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-[12px]">
+      <table className="w-full text-[length:var(--app-text-sm)]">
         <thead className="modern-card-b border-[var(--border)]">
           <tr className="text-left text-[var(--text-muted)]">
             <th className="px-3 py-2 font-medium whitespace-nowrap">{t('apiKb.colModule')}</th>
@@ -797,12 +976,12 @@ function DetailsTable({
               className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-card)]/50 cursor-pointer"
               onClick={() => onOpen(e)}
             >
-              <td className="px-3 py-2 font-mono text-[11px] text-[var(--accent)] whitespace-nowrap">{e.module}</td>
+              <td className="px-3 py-2 font-mono text-[length:var(--app-text-xs)] text-[var(--accent)] whitespace-nowrap">{e.module}</td>
               <td className="px-3 py-2 text-[var(--text-primary)]">
                 <div className="flex items-center gap-1.5">
                   {e.title ?? e.slug}
                   {e.deprecated && (
-                    <span className="px-1 py-px rounded bg-[var(--warning)]/15 text-[var(--warning)] text-[9px] border border-[var(--warning)]/40">
+                    <span className="px-1 py-px rounded bg-[var(--warning)]/15 text-[var(--warning)] text-[length:var(--app-text-micro)] border border-[var(--warning)]/40">
                       {t('apiKb.deprecated')}
                     </span>
                   )}
@@ -814,13 +993,13 @@ function DetailsTable({
               <td className="px-3 py-2 whitespace-nowrap text-right" onClick={(ev) => ev.stopPropagation()}>
                 <button
                   onClick={() => onEdit(e)}
-                  className="px-2 py-1 mr-1 text-[10px] border border-[var(--accent)]/40 text-[var(--accent)] rounded hover:bg-[var(--accent-soft)] transition-colors"
+                  className="px-2 py-1 mr-1 text-[length:var(--app-text-2xs)] border border-[var(--accent)]/40 text-[var(--accent)] rounded hover:bg-[var(--accent-soft)] transition-colors"
                 >
                   {t('apiKb.edit')}
                 </button>
                 <button
                   onClick={() => onDelete(e)}
-                  className="px-2 py-1 text-[10px] border border-[var(--danger)]/40 text-[var(--danger)] rounded hover:bg-[var(--danger)]/10 transition-colors"
+                  className="px-2 py-1 text-[length:var(--app-text-2xs)] border border-[var(--danger)]/40 text-[var(--danger)] rounded hover:bg-[var(--danger)]/10 transition-colors"
                 >
                   {t('apiKb.delete')}
                 </button>
@@ -850,13 +1029,13 @@ function DetailDrawer({
       >
         <div className="sticky top-0 z-10 bg-[var(--bg-primary)] border-b border-[var(--border)] px-5 py-3 flex items-center justify-between">
           <div className="min-w-0">
-            <div className="font-mono text-[12px] text-[var(--accent)]">{detail.module}</div>
+            <div className="font-mono text-[length:var(--app-text-sm)] text-[var(--accent)]">{detail.module}</div>
             <h3 className="text-base font-semibold text-[var(--text-primary)] truncate">{detail.title ?? detail.slug}</h3>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={onEdit}
-              className="h-8 px-3 rounded-lg border border-[var(--accent)] text-[var(--accent)] text-[12px] hover:bg-[var(--accent-soft)] transition-colors"
+              className="h-8 px-3 rounded-lg border border-[var(--accent)] text-[var(--accent)] text-[length:var(--app-text-sm)] hover:bg-[var(--accent-soft)] transition-colors"
             >
               {t('apiKb.edit')}
             </button>
@@ -873,7 +1052,7 @@ function DetailDrawer({
           <Skeleton lines={5} label={t('apiKb.loading')} className="p-4" />
         ) : (
           <div className="p-5 space-y-4">
-            <div className="flex flex-wrap gap-2 text-[11px]">
+            <div className="flex flex-wrap gap-2 text-[length:var(--app-text-xs)]">
               {detail.kit && <Tag label={t('apiKb.colKit')} value={detail.kit} />}
               {detail.since_api_level != null && <Tag label={t('apiKb.colLevel')} value={`API ${detail.since_api_level}`} />}
               {detail.deprecated && <Tag label={t('apiKb.deprecated')} value="⚠" warn />}
@@ -883,7 +1062,7 @@ function DetailDrawer({
 
             {detail.import_snippet && (
               <Section title={t('apiKb.importSnippet')}>
-                <pre className="modern-card rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
+                <pre className="modern-card rounded-lg p-3 text-[length:var(--app-text-xs)] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
                   {detail.import_snippet}
                 </pre>
               </Section>
@@ -891,14 +1070,14 @@ function DetailDrawer({
 
             {detail.permissions && (
               <Section title={t('apiKb.permissions')}>
-                <pre className="modern-card rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
+                <pre className="modern-card rounded-lg p-3 text-[length:var(--app-text-xs)] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap">
                   {detail.permissions}
                 </pre>
               </Section>
             )}
 
             <Section title={t('apiKb.body')}>
-              <div className="modern-card rounded-lg p-3 text-[12px] text-[var(--text-primary)] whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto">
+              <div className="modern-card rounded-lg p-3 text-[length:var(--app-text-sm)] text-[var(--text-primary)] whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto">
                 {detail.body}
               </div>
             </Section>
@@ -909,32 +1088,32 @@ function DetailDrawer({
                   {detail.members.map((m, i) => (
                     <div key={i} className="modern-card rounded-lg p-2.5">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="px-1.5 py-0.5 rounded bg-[var(--bg-secondary)] text-[var(--text-muted)] text-[9px] border border-[var(--border)]">
+                        <span className="px-1.5 py-0.5 rounded bg-[var(--bg-secondary)] text-[var(--text-muted)] text-[length:var(--app-text-micro)] border border-[var(--border)]">
                           {m.kind}
                         </span>
-                        <span className="font-mono text-[12px] text-[var(--text-primary)]">{m.member_name}</span>
+                        <span className="font-mono text-[length:var(--app-text-sm)] text-[var(--text-primary)]">{m.member_name}</span>
                         {m.parent_name && (
-                          <span className="text-[10px] text-[var(--text-muted)]">← {m.parent_name}</span>
+                          <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">← {m.parent_name}</span>
                         )}
                         {m.deprecated && (
-                          <span className="px-1 py-px rounded bg-[var(--warning)]/15 text-[var(--warning)] text-[9px]">
+                          <span className="px-1 py-px rounded bg-[var(--warning)]/15 text-[var(--warning)] text-[length:var(--app-text-micro)]">
                             {t('apiKb.deprecated')}
                           </span>
                         )}
                         {m.since_api_level != null && (
-                          <span className="text-[10px] text-[var(--text-muted)] ml-auto">API {m.since_api_level}</span>
+                          <span className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] ml-auto">API {m.since_api_level}</span>
                         )}
                       </div>
                       {m.declaration && (
-                        <pre className="mt-1.5 text-[10px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-all">
+                        <pre className="mt-1.5 text-[length:var(--app-text-2xs)] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-all">
                           {m.declaration}
                         </pre>
                       )}
                       {m.description && (
-                        <p className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap">{m.description}</p>
+                        <p className="mt-1 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] whitespace-pre-wrap">{m.description}</p>
                       )}
                       {m.permission && (
-                        <p className="mt-1 text-[10px] text-[var(--warning)] font-mono break-all">🔒 {m.permission}</p>
+                        <p className="mt-1 text-[length:var(--app-text-2xs)] text-[var(--warning)] font-mono break-all">🔒 {m.permission}</p>
                       )}
                     </div>
                   ))}
@@ -944,7 +1123,7 @@ function DetailDrawer({
 
             {detail.examples && (
               <Section title={t('apiKb.examples')}>
-                <pre className="modern-card rounded-lg p-3 text-[11px] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap max-h-96 overflow-y-auto">
+                <pre className="modern-card rounded-lg p-3 text-[length:var(--app-text-xs)] font-mono text-[var(--text-primary)] overflow-x-auto whitespace-pre-wrap max-h-96 overflow-y-auto">
                   {detail.examples}
                 </pre>
               </Section>
@@ -955,11 +1134,11 @@ function DetailDrawer({
                 href={detail.source_url}
                 target="_blank"
                 rel="noreferrer"
-                className="text-[11px] text-[var(--accent)] hover:underline break-all"
+                className="text-[length:var(--app-text-xs)] text-[var(--accent)] hover:underline break-all"
               >
                 {t('apiKb.viewSource')}: {detail.source_url}
               </a>
-              <div className="text-[10px] text-[var(--text-muted)] mt-1">
+              <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] mt-1">
                 {t('apiKb.fetchedAt')}: {formatTime(detail.fetched_at)}
               </div>
             </div>
@@ -972,7 +1151,7 @@ function DetailDrawer({
 
 function Tag({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
   return (
-    <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[10px] ${
+    <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg border text-[length:var(--app-text-2xs)] ${
       warn
         ? 'bg-[var(--warning)]/15 text-[var(--warning)] border-[var(--warning)]/40'
         : 'bg-[var(--bg-card)] text-[var(--text-secondary)] border-[var(--border)]'
@@ -986,7 +1165,7 @@ function Tag({ label, value, warn }: { label: string; value: string; warn?: bool
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
-      <div className="text-[11px] font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">{title}</div>
+      <div className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">{title}</div>
       {children}
     </div>
   )
@@ -1149,7 +1328,7 @@ function DetailFormModal({
             <input className={inputCls} value={form.syscap ?? ''} onChange={(e) => setForm({ ...form, syscap: e.target.value })} />
           </Field>
           <div className="col-span-2 flex items-center gap-4">
-            <label className="flex items-center gap-1.5 text-[12px] text-[var(--text-secondary)] cursor-pointer">
+            <label className="flex items-center gap-1.5 text-[length:var(--app-text-sm)] text-[var(--text-secondary)] cursor-pointer">
               <input type="checkbox" checked={form.deprecated} onChange={(e) => setForm({ ...form, deprecated: e.target.checked })} className="w-3.5 h-3.5 accent-[var(--accent)]" />
               {t('apiKb.deprecated')}
             </label>
@@ -1184,12 +1363,12 @@ function DetailFormModal({
   )
 }
 
-const inputCls = "w-full h-9 px-3 modern-card rounded-lg text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+const inputCls = "w-full h-9 px-3 modern-card rounded-lg text-[length:var(--app-text-sm)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
 
 function Field({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
   return (
     <div className="space-y-1">
-      <label className="block text-[11px] text-[var(--text-muted)]">
+      <label className="block text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
         {label}{required && <span className="text-[var(--danger)] ml-0.5">*</span>}
       </label>
       {children}
@@ -1220,14 +1399,14 @@ function ModalActions({ onClose, onSave, saving, saveLabel }: { onClose: () => v
     <div className="flex justify-end gap-2 mt-5 pt-4 border-t border-[var(--border)]">
       <button
         onClick={onClose}
-        className="h-9 px-4 rounded-lg border border-[var(--border)] text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+        className="h-9 px-4 rounded-lg border border-[var(--border)] text-[length:var(--app-text-sm)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
       >
         {t('apiKb.cancel')}
       </button>
       <button
         onClick={onSave}
         disabled={saving}
-        className="h-9 px-4 rounded-lg btn-primary text-[12px]  disabled:opacity-50 transition-colors"
+        className="h-9 px-4 rounded-lg btn-primary text-[length:var(--app-text-sm)]  disabled:opacity-50 transition-colors"
       >
         {saving ? '...' : saveLabel}
       </button>

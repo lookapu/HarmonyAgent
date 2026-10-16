@@ -161,6 +161,8 @@ export interface RefreshProgress {
   current: number
   total: number
   message: string
+  /** 预计剩余秒数（仅语义索引进度有；样本不足时后端不下发） */
+  etaSecs?: number
 }
 
 export interface DiffRefreshReport {
@@ -186,9 +188,34 @@ export interface KbFilters {
 
 // ───────────────────────── 语义向量索引 ─────────────────────────
 
+/**
+ * 语义层真实状态。
+ *
+ * **为什么不能只看 `available/indexed/total`**：`indexed === total` 恰恰**盖住**了
+ * 「行数满但编码口径已变」这一种 —— 而这正是升级后 / 种子库场景下
+ * `vector_search` 正在**拒绝检索**的原因。卡片说就绪、功能是关的，就是这么来的。
+ *
+ * `partial_index` 是后来加的第五态：建到一半被取消/中断。**只验口径指纹也判不出它**
+ * （半成品同样是当前口径产出的），必须数行数——而 `indexed/total` 本来就在返回里，
+ * 却没被任何一处用来做判定。
+ *
+ * `disabled` 是 P-7 方案②加的第六态：用户主动关掉了语义层。
+ * 它回答的是「**为什么不做**」，其余五态回答「**为什么不能做**」——
+ * 混用就会在关着的时候骗用户去建一个已经存在的索引。
+ */
+export type EmbedState = 'ready' | 'not_indexed' | 'stale_index' | 'partial_index' | 'model_missing' | 'disabled'
+
 export interface EmbedStatus {
-  /** 语义模型是否可用（未启用 embedding feature 或模型文件缺失均为 false） */
+  /**
+   * 语义模型是否可用（未启用 embedding feature、模型文件缺失、
+   * **或语义层开关已关闭**均为 false）
+   */
   available: boolean
+  /**
+   * 语义层是否参与检索（**默认 false**）。
+   * 与 `available` 分开：`available` 答「模型在不在」，`enabled` 答「用户要不要它」。
+   */
+  enabled: boolean
   model: string | null
   /** 已索引条数 */
   indexed: number
@@ -196,6 +223,8 @@ export interface EmbedStatus {
   total: number
   /** 是否有建索引任务在后台运行 */
   running: boolean
+  /** 语义层真实状态（后端 `SemanticLayerState` 的跨语言稳定 key） */
+  state: EmbedState
 }
 
 export interface EmbedDonePayload {
@@ -204,6 +233,8 @@ export interface EmbedDonePayload {
   skipped?: number
   elapsed?: number
   error?: string
+  /** 用户主动取消（此时 `ok` 仍为 true——已完成的部分是有效结果） */
+  cancelled?: boolean
 }
 
 // ───────────────────────── 调用封装 ─────────────────────────
@@ -244,6 +275,19 @@ export const apiKbRefreshDetails = () =>
 export const apiKbEmbedStatus = () => invokeWithError<EmbedStatus>('api_kb_embed_status')
 
 export const apiKbEmbedIndex = () => invokeWithError<void>('api_kb_embed_index')
+
+/** 取消正在运行的语义索引任务（幂等：没在跑也返回成功） */
+export const apiKbEmbedCancel = () => invokeWithError<void>('api_kb_embed_cancel')
+
+/**
+ * 语义层是否参与检索。**默认 false**（P-7 方案②）。
+ * `EmbedStatus.enabled` 已经带了这个值，本函数用于只想读开关、不想拉整份状态的地方。
+ */
+export const apiKbEmbedEnabled = () => invokeWithError<boolean>('api_kb_embed_enabled')
+
+/** 写语义层开关（幂等）。开启只是允许参与检索，能否真用仍由状态判定决定。 */
+export const apiKbEmbedSetEnabled = (enabled: boolean) =>
+  invokeWithError<boolean>('api_kb_embed_set_enabled', { enabled })
 
 // ───────────────────────── 进度监听 ─────────────────────────
 

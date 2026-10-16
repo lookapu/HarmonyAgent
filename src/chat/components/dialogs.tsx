@@ -42,7 +42,7 @@ export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: str
           <button
             key={r}
             onClick={() => setReason(r)}
-            className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${reason === r ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger)]/10' : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'}`}
+            className={`px-2.5 py-1 rounded-lg text-[length:var(--app-text-xs)] border transition-colors ${reason === r ? 'border-[var(--danger)] text-[var(--danger)] bg-[var(--danger)]/10' : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'}`}
           >
             {r}
           </button>
@@ -53,7 +53,7 @@ export function FeedbackDialog({ onSubmit, onCancel }: { onSubmit: (reason?: str
         onChange={(e) => setReason(e.target.value)}
         placeholder={t('home.feedbackPlaceholder')}
         rows={3}
-        className="mt-3 w-full resize-none rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-muted)]"
+        className="mt-3 w-full resize-none rounded-lg modern-card border-[var(--border)] px-3 py-2 text-[length:var(--app-text-sm)] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-muted)]"
       />
     </Modal>
   )
@@ -76,7 +76,7 @@ export function VersionDiffDialog({
   if (!selected) {
     return (
       <Modal open onClose={onClose} size="lg">
-        <p className="text-[12px] text-[var(--text-muted)]">{t('home.noVersions')}</p>
+        <p className="text-[length:var(--app-text-sm)] text-[var(--text-muted)]">{t('home.noVersions')}</p>
         <Button variant="primary" size="md" className="mt-3" onClick={onClose}>
           {t('home.close')}
         </Button>
@@ -103,16 +103,16 @@ export function VersionDiffDialog({
             <button
               key={v.id}
               onClick={() => setSelected(v)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${selected.id === v.id ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]' : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'}`}
+              className={`px-2.5 py-1 rounded-lg text-[length:var(--app-text-xs)] border transition-colors ${selected.id === v.id ? 'border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]' : 'border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--text-muted)]'}`}
             >
               {t('home.versionLabel', { n: new Date(v.created_at * 1000).toLocaleString() })}
             </button>
           ))}
-          <span className="px-2.5 py-1 rounded-lg text-[11px] border border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]">
+          <span className="px-2.5 py-1 rounded-lg text-[length:var(--app-text-xs)] border border-[var(--accent)] text-[var(--accent)] bg-[var(--accent-soft)]">
             {t('home.versionCurrent')}
           </span>
         </div>
-        <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-xl modern-card border-[var(--border)] p-3 text-[12px] leading-relaxed whitespace-pre-wrap break-words">
+        <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-xl modern-card border-[var(--border)] p-3 text-[length:var(--app-text-sm)] leading-relaxed whitespace-pre-wrap break-words">
           {changes.map((ch, i) => {
             const cls = ch.added
               ? 'bg-[var(--success)]/15 text-[var(--success)]'
@@ -126,7 +126,7 @@ export function VersionDiffDialog({
             )
           })}
         </div>
-        <div className="mt-3 flex shrink-0 items-center gap-3 text-[10px] text-[var(--text-muted)]">
+        <div className="mt-3 flex shrink-0 items-center gap-3 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
           <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[var(--success)]/50" />{t('home.diffAdded')}</span>
           <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[var(--danger)]/50" />{t('home.diffRemoved')}</span>
           <span className="ml-auto">{t('home.diffHint')}</span>
@@ -176,17 +176,17 @@ export function MemoryDraftDialog({
     >
       <div className="space-y-2.5">
         <div className="flex items-center gap-2">
-          <span className="text-[11px] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryTitle')}</span>
-          <span className="flex-1 text-[13px] font-medium">{draft.title}</span>
+          <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryTitle')}</span>
+          <span className="flex-1 text-[length:var(--app-text-md)] font-medium">{draft.title}</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-[11px] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryCategory')}</span>
-          <span className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] text-[11px]">
+          <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)] shrink-0 w-14">{t('home.memoryCategory')}</span>
+          <span className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] text-[length:var(--app-text-xs)]">
             {categories.find(([v]) => v === draft.category)?.[1] ?? draft.category}
           </span>
         </div>
         <div className="rounded-xl modern-card border-[var(--border)] p-3 max-h-52 overflow-y-auto">
-          <p className="text-[12px] leading-relaxed text-[var(--text-primary)] whitespace-pre-wrap">{draft.content}</p>
+          <p className="text-[length:var(--app-text-sm)] leading-relaxed text-[var(--text-primary)] whitespace-pre-wrap">{draft.content}</p>
         </div>
       </div>
     </Modal>
@@ -249,7 +249,7 @@ export function EditMessageDialog({
         value={value}
         onChange={(e) => setValue(e.target.value)}
         rows={6}
-        className="w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed"
+        className="w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[length:var(--app-text-md)] leading-relaxed"
         placeholder={t('home.editMessagePlaceholder')}
       />
     </Modal>
@@ -334,7 +334,7 @@ export function RulesDialog({
         <div className="flex items-center gap-1 bg-[var(--bg-card)] rounded-lg p-1 w-fit">
           <button
             onClick={() => setTab('global')}
-            className={`h-7 px-3 rounded-md text-[12px] font-medium transition-colors ${
+            className={`h-7 px-3 rounded-md text-[length:var(--app-text-sm)] font-medium transition-colors ${
               tab === 'global' ? 'tab-active' : 'tab-inactive'
             }`}
           >
@@ -342,7 +342,7 @@ export function RulesDialog({
           </button>
           <button
             onClick={() => setTab('project')}
-            className={`h-7 px-3 rounded-md text-[12px] font-medium transition-colors ${
+            className={`h-7 px-3 rounded-md text-[length:var(--app-text-sm)] font-medium transition-colors ${
               tab === 'project' ? 'tab-active' : 'tab-inactive'
             }`}
           >
@@ -351,12 +351,12 @@ export function RulesDialog({
         </div>
         {/* 模板选择下拉：按 category 分组，点击进入确认模式 */}
         <div className="mt-3 modern-card rounded-lg p-2 max-h-[120px] overflow-y-auto">
-          <p className="text-[10.5px] font-medium text-[var(--text-muted)] px-1.5 py-1 uppercase tracking-wider">
+          <p className="text-[length:var(--app-text-xs)] font-medium text-[var(--text-muted)] px-1.5 py-1 uppercase tracking-wider">
             {t('home.ruleTemplate')}
           </p>
           {groupedTemplates.map(([cat, items]) => (
             <div key={cat} className="mt-1">
-              <p className="text-[10px] text-[var(--text-muted)] px-1.5 py-0.5">
+              <p className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)] px-1.5 py-0.5">
                 {t(`home.ruleTemplateCategory.${cat}`)}
               </p>
               <div className="flex flex-wrap gap-1 px-1">
@@ -367,7 +367,7 @@ export function RulesDialog({
                     // tp.i18nKey 本身不带 home. 前缀，但译文是平铺在 home 对象里的
                     // 带点键（home."ruleTemplate.xxx"），漏前缀会直接把 key 渲染给用户
                     title={t(`home.${tp.i18nKey}.desc`)}
-                    className="px-2 py-0.5 rounded-md text-[11px] bg-[var(--bg-card)] text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] border border-[var(--border)] transition-colors"
+                    className="px-2 py-0.5 rounded-md text-[length:var(--app-text-xs)] bg-[var(--bg-card)] text-[var(--text-secondary)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent)] border border-[var(--border)] transition-colors"
                   >
                     {t(`home.${tp.i18nKey}`)}
                   </button>
@@ -380,7 +380,7 @@ export function RulesDialog({
           value={tab === 'global' ? globalText : projectText}
           onChange={(e) => (tab === 'global' ? setGlobalText(e.target.value) : setProjectText(e.target.value))}
           rows={14}
-          className="mt-3 w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[13px] leading-relaxed font-mono"
+          className="mt-3 w-full resize-y rounded-xl modern-card border-[var(--border)] focus:border-[var(--accent)] outline-none p-3 text-[length:var(--app-text-md)] leading-relaxed font-mono"
           placeholder={
             tab === 'global'
               ? t('home.rulesGlobalPlaceholder')
@@ -389,7 +389,7 @@ export function RulesDialog({
         />
         {/* 底部行是「左提示 + 右按钮」，不是 Modal footer 的纯右对齐，故留在正文里 */}
         <div className="mt-3 flex items-center justify-between gap-3">
-          <span className="text-[11px] text-[var(--text-muted)]">{t('home.rulesInjectHint')}</span>
+          <span className="text-[length:var(--app-text-xs)] text-[var(--text-muted)]">{t('home.rulesInjectHint')}</span>
           <div className="flex shrink-0 items-center gap-2">
             <Button variant="secondary" size="md" onClick={onClose}>
               {t('home.cancel')}
@@ -434,7 +434,7 @@ export function RulesDialog({
             </>
           }
         >
-          <p className="text-[12px] text-[var(--text-secondary)]">
+          <p className="text-[length:var(--app-text-sm)] text-[var(--text-secondary)]">
             {t(`home.${pendingTemplate.i18nKey}`)} — {t('home.ruleTemplateConfirmBody')}
           </p>
         </Modal>

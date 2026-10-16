@@ -4343,22 +4343,45 @@ async fn get_diagnostics(project_key: &str) -> Result<String, String> {
     Ok(s)
 }
 
-/// todo_write：维护任务清单（merge 按 id 合并，否则整体替换），并推送前端展示
-async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {
-    // 容错：模型偶尔把数组直接当顶层参数（漏了 todos 包装）——自动包装，避免一次参数小错中断任务
-    let arr = args["todos"]
-        .as_array()
-        .or_else(|| args.as_array())
-        .ok_or(
-            "todo_write 需要参数 {\"todos\":[{\"id\":\"<标识>\",\"content\":\"<任务>\",\"status\":\"pending|in_progress|done\"}],\"merge\":true}",
-        )?;
+/// 解析 todo_write 的 todos 数组。返回 (有效项, 被丢弃项的标识)。
+///
+/// 抽成纯函数是为了能脱离 `ToolCtx` 单独验证——下面那条「只传变化项」的行为
+/// 修的就是一处**静默丢数据**，静默缺陷必须有自测钉住，否则下一个人重构
+/// 很容易把它改回去。
+///
+/// `render_hint`（`agent::todo`）明确教模型「merge=true **只传变化项**」，也就是
+/// 只带 `{id, status}` 不带 `content`。原先这里对空 content 一律 `continue`，
+/// 于是**整条状态变更被静默丢弃**，随后 `unchanged` 判成 true，工具回
+/// 「内容与上次完全相同」——本机实测（会话 047424ea）：模型把 5 项全标 done，
+/// 工具回「已完成 0，进行中 0，待处理 9」，三方自相矛盾，模型却以为清单已更新。
+/// **被文档化的正确用法，恰好是静默失效的用法。**
+///
+/// 现在 merge 模式下按 id 从 `before` 继承 content；继承不到（确实是新项）才丢弃，
+/// 并把标识回报给模型——那种项没有 content 本来就没有意义，但**不能悄悄地不处理**。
+fn parse_todo_items(
+    arr: &[Value],
+    merge: bool,
+    before: &[crate::agent::todo::TodoItem],
+) -> (Vec<crate::agent::todo::TodoItem>, Vec<String>) {
     let mut items = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     for (i, t) in arr.iter().take(30).enumerate() {
         let id = t["id"].as_str().unwrap_or("").trim().to_string();
-        let content: String = t["content"].as_str().unwrap_or("").trim().chars().take(200).collect();
-        if content.is_empty() {
+        let raw_content = t["content"].as_str().unwrap_or("").trim();
+        let content: String = if !raw_content.is_empty() {
+            raw_content.chars().take(200).collect()
+        } else if merge {
+            match before.iter().find(|old| old.id == id) {
+                Some(old) => old.content.clone(),
+                None => {
+                    dropped.push(if id.is_empty() { format!("#{}", i + 1) } else { id.clone() });
+                    continue;
+                }
+            }
+        } else {
+            dropped.push(if id.is_empty() { format!("#{}", i + 1) } else { id.clone() });
             continue;
-        }
+        };
         // 缺省自动分配稳定 id：内容作 id 的替代（同一任务内容不变则合并路径稳定）
         let id = if id.is_empty() {
             format!("t{}", i + 1)
@@ -4373,6 +4396,17 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
         .to_string();
         items.push(crate::agent::todo::TodoItem { id, content, status });
     }
+    (items, dropped)
+}
+
+/// todo_write：维护任务清单（merge 按 id 合并，否则整体替换），并推送前端展示
+async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result<String, String> {    // 容错：模型偶尔把数组直接当顶层参数（漏了 todos 包装）——自动包装，避免一次参数小错中断任务
+    let arr = args["todos"]
+        .as_array()
+        .or_else(|| args.as_array())
+        .ok_or(
+            "todo_write 需要参数 {\"todos\":[{\"id\":\"<标识>\",\"content\":\"<任务>\",\"status\":\"pending|in_progress|done\"}],\"merge\":true}",
+        )?;
     let merge = args["merge"].as_bool().unwrap_or(false);
     // 项目级共享：提供 project 参数时清单挂在项目键下（跨会话同一份），否则挂会话键
     let project = args["project"]
@@ -4382,7 +4416,9 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
     let key = project
         .map(crate::agent::todo::project_key)
         .unwrap_or_else(|| ctx.conversation_id.clone());
+    // 必须在解析前取：merge 模式要按 id 从现清单继承 content。
     let before = crate::agent::todo::get(&key);
+    let (items, dropped) = parse_todo_items(arr, merge, &before);
     let todos = if merge {
         crate::agent::todo::merge(&key, items)
     } else {
@@ -4439,6 +4475,16 @@ async fn todo_write(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Resu
     };
     if let Some(p) = project {
         out.push_str(&format!("\n（项目级共享模式：同一项目其他会话可读写同一份清单）\n{}", crate::agent::todo::project_digest(p)));
+    }
+    // 丢弃项必须出声：静默丢弃正是本缺陷的成因，模型看不见就以为更新成功了。
+    // merge 模式下这只应出现在「拿未知 id 只传 status」的错误调用里。
+    if !dropped.is_empty() {
+        out.push_str(&format!(
+            "\n（已忽略 {} 项：{} —— 这些项没有 content 且在现清单中找不到同 id，无法创建；\
+             新增任务请同时给出 content）",
+            dropped.len(),
+            dropped.join("、")
+        ));
     }
     Ok(out)
 }
@@ -4642,15 +4688,23 @@ async fn ask_user(args: &Value, ctx: &crate::agent::exec_ctx::ToolCtx) -> Result
 pub(crate) fn resolve_in_roots(roots: &[String], raw: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(raw);
     if p.is_absolute() {
-        let full = std::fs::canonicalize(&p)
-            .map_err(|e| format!("路径不存在或不可访问: {}（{e}）", p.display()))?;
+        // 错误消息一律先过 normalize_path：`\\?\` 是 Windows 长路径的内部形式，
+        // 对用户零价值、对模型是噪声（本机实测会话 047424ea：read_file 报出
+        // `\\?\I:\SNS\harmony-sns\entry\module.json5`，模型无从把它与别的路径对上）。
+        // 本函数返回的 PathBuf 本来就已经 normalize 过，所以**只有消息**需要处理。
+        let full = std::fs::canonicalize(&p).map_err(|e| {
+            format!("路径不存在或不可访问: {}（{e}）", normalize_path(&p.to_string_lossy()))
+        })?;
         let allowed = roots.iter().any(|r| {
             std::fs::canonicalize(r)
                 .map(|rc| crate::utils::path::path_within(&full, &rc))
                 .unwrap_or(false)
         });
         if !allowed {
-            return Err(format!("路径超出项目目录范围，拒绝访问: {}", full.display()));
+            return Err(format!(
+                "路径超出项目目录范围，拒绝访问: {}",
+                normalize_path(&full.to_string_lossy())
+            ));
         }
         return Ok(PathBuf::from(normalize_path(&full.to_string_lossy())));
     }
@@ -4667,15 +4721,20 @@ pub(crate) fn resolve_in_roots(roots: &[String], raw: &str) -> Result<PathBuf, S
                 return Ok(PathBuf::from(normalize_path(&full.to_string_lossy())));
             }
             Ok(_) => {} // .. 越界，尝试下一根
-            Err(e) => candidates.push(format!("{}（{e}）", candidate.display())),
+            Err(e) => candidates.push(format!(
+                "{}（{e}）",
+                normalize_path(&candidate.to_string_lossy())
+            )),
         }
     }
     if candidates.is_empty() {
         Err(format!(
             "路径不存在或不可访问: {}",
-            Path::new(roots.first().map(String::as_str).unwrap_or("."))
-                .join(&p)
-                .display()
+            normalize_path(
+                &Path::new(roots.first().map(String::as_str).unwrap_or("."))
+                    .join(&p)
+                    .to_string_lossy()
+            )
         ))
     } else {
         Err(format!("路径不存在或不可访问:\n{}", candidates.join("\n")))
@@ -5143,6 +5202,111 @@ pub(crate) fn smart_decode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归钉子：会话 047424ea 里模型把 5 项全标 done，工具回
+    /// 「已完成 0，进行中 0，待处理 9」。根因是这 5 项**都没带 content**，
+    /// 而解析器对空 content 一律 continue。`render_hint` 恰恰教的是
+    /// 「merge=true 只传变化项」，所以这是被文档化用法在静默失效。
+    #[test]
+    fn merge_inherits_content_for_status_only_items() {
+        use crate::agent::todo::TodoItem;
+        let before = vec![
+            TodoItem { id: "approved-plan-1".into(), content: "读取工程结构".into(), status: "pending".into() },
+            TodoItem { id: "approved-plan-2".into(), content: "列出模块".into(), status: "pending".into() },
+        ];
+        // 原样复现真实入参：只有 id + status，没有 content
+        let arr: Vec<Value> = serde_json::json!([
+            {"id": "approved-plan-1", "status": "done"},
+            {"id": "approved-plan-2", "status": "in_progress"},
+        ]).as_array().unwrap().clone();
+        let (items, dropped) = parse_todo_items(&arr, true, &before);
+        assert!(dropped.is_empty(), "已有 id 的项不该被丢弃：{dropped:?}");
+        assert_eq!(items.len(), 2, "状态变更必须真的落到 items 上");
+        assert_eq!(items[0].id, "approved-plan-1");
+        assert_eq!(items[0].status, "done");
+        assert_eq!(items[0].content, "读取工程结构", "content 要从现清单继承");
+        assert_eq!(items[1].status, "in_progress");
+        assert_eq!(items[1].content, "列出模块");
+    }
+
+    /// 反向：未知 id 且没有 content 的项必须**被丢弃且被点名**，
+    /// 不能静默消失（静默丢弃正是本缺陷的成因）。
+    #[test]
+    fn unknown_id_without_content_is_reported_not_swallowed() {
+        let before = vec![crate::agent::todo::TodoItem {
+            id: "a".into(), content: "任务 a".into(), status: "pending".into(),
+        }];
+        let arr: Vec<Value> = serde_json::json!([
+            {"id": "a", "status": "done"},
+            {"id": "ghost", "status": "done"},
+        ]).as_array().unwrap().clone();
+        let (items, dropped) = parse_todo_items(&arr, true, &before);
+        assert_eq!(items.len(), 1);
+        assert_eq!(dropped, vec!["ghost".to_string()], "丢弃项必须回报标识");
+    }
+
+    /// replace 模式（merge=false）没有「现清单」可继承，缺 content 仍应丢弃——
+    /// 那是真正的新项，本次改动不能顺手把它变成继承（那会造出空任务）。
+    #[test]
+    fn replace_mode_still_requires_content() {
+        let before = vec![crate::agent::todo::TodoItem {
+            id: "a".into(), content: "任务 a".into(), status: "pending".into(),
+        }];
+        let arr: Vec<Value> = serde_json::json!([{"id": "a", "status": "done"}])
+            .as_array().unwrap().clone();
+        let (items, dropped) = parse_todo_items(&arr, false, &before);
+        assert!(items.is_empty());
+        assert_eq!(dropped, vec!["a".to_string()]);
+    }
+
+    /// 既有行为不能被这次改动碰坏：正常带 content 的项照旧，id 缺省照旧补 t{n}。
+    #[test]
+    fn normal_items_and_id_default_are_unchanged() {
+        let arr: Vec<Value> = serde_json::json!([
+            {"content": "第一件事", "status": "done"},
+            {"id": "x", "content": "第二件事"},
+        ]).as_array().unwrap().clone();
+        let (items, dropped) = parse_todo_items(&arr, false, &[]);
+        assert!(dropped.is_empty());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "t1", "缺省 id 仍按位置补");
+        assert_eq!(items[0].status, "done");
+        assert_eq!(items[1].id, "x");
+        assert_eq!(items[1].status, "pending", "缺省 status 仍是 pending");
+    }
+
+    /// 回归钉子（会话 047424ea）：read_file 的 not_found 消息里带出了
+    /// `\\?\I:\SNS\harmony-sns\entry\module.json5`。那是 Windows 长路径的内部形式，
+    /// 对用户零价值、对模型是噪声。本函数返回的 PathBuf 早就 normalize 过了，
+    /// 唯独**错误消息**没走那一步。
+    #[test]
+    fn path_error_messages_never_leak_verbatim_prefix() {
+        // 绝对路径 + 不存在 ⇒ 走 canonicalize 失败分支
+        let missing = r"\\?\Z:\definitely-not-here\a.ets";
+        let err = resolve_in_roots(&[], missing).unwrap_err();
+        assert!(!err.contains(r"\\?\"), "错误消息泄露了 verbatim 前缀：{err}");
+        assert!(err.contains("路径不存在或不可访问"), "{err}");
+
+        // 相对路径 + 根不存在 ⇒ 走 candidates 分支
+        let err = resolve_in_roots(&[r"\\?\Z:\no-such-root".to_string()], "a.ets").unwrap_err();
+        assert!(!err.contains(r"\\?\"), "错误消息泄露了 verbatim 前缀：{err}");
+    }
+
+    /// 反向：真正存在的路径仍要正常解析，不能因为多了一次 normalize 而失效。
+    #[test]
+    fn normalize_in_error_path_does_not_break_resolution() {
+        let dir = std::env::temp_dir().join(format!("dv-resolve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"ok").unwrap();
+        let root = normalize_path(&std::fs::canonicalize(&dir).unwrap().to_string_lossy());
+        // 用 from_ref 而不是 &[root.clone()]：后者是 clippy::cloned_ref_to_slice_refs
+        // 的典型形状，而门禁按「唯一告警数 ≤57」卡，多一条新类型就阻断。
+        let got = resolve_in_roots(std::slice::from_ref(&root), "a.txt").unwrap();
+        assert!(got.is_file());
+        assert!(!got.to_string_lossy().starts_with(r"\\?\"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn repo_query_classifies_path_symbol_concept() {

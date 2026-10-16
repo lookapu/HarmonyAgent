@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::db::{models::{EndpointDef, Provider}, queries, DbState};
 use crate::services::{config_service, key_store};
+use crate::services::licensing::{self, Capability};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateProviderInput {
@@ -319,6 +320,13 @@ pub fn update_provider(db: State<DbState>, id: String, input: UpdateProviderInpu
     if let Some(mode) = input.auto_pool_mode {
         if !(0..=2).contains(&mode) {
             return Err("auto_pool_mode 仅支持 0/1/2".into());
+        }
+        // 只在「开启」时过网关，关闭（mode == 0）永远放行。
+        // 理由：档位可以被降级，而**降级之后必须还关得掉**——
+        // 若关也要 Pro，Pro 用户降级就会永久卡在开着的多池上，只能改数据库自救。
+        // 同一个不对称在 check-warnings 的基线门禁上也是同一个道理。
+        if mode != 0 {
+            licensing::check(&conn, Capability::MultiProviderPool)?;
         }
         provider.auto_pool_mode = mode;
     }

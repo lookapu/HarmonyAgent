@@ -7,6 +7,1551 @@
 
 ---
 
+## Unreleased — Batch 24: overturning my own root cause from the previous batch (2026-10-02)
+
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86** (migration 086 added: dropping the write-only `api_details.members` column).
+
+This batch started from an already-decided product choice (index only the latest
+version, dedupe by natural key). **Pre-implementation verification showed that
+decision rested on a false premise**, so implementation was paused and the real
+cause was investigated first. What was found is considerably worse than the
+original problem — and it overturned the root cause this same codebase recorded
+in the previous batch.
+
+### First, a retraction: the 72.2% vector collision was never a versioning problem
+
+| Item | Assumed | Measured |
+|---|---:|---:|
+| distinct `doc_text` | 18,506 | **38,566** (text dedup saves only **14.0%**) |
+| remaining 20,060 **distinct texts** with byte-identical vectors | version duplicates | **the tokenizer collapses every camelCase API name into `[UNK]`** |
+
+The decisive evidence is one pair of numbers lining up:
+**distinct token sequences = 18,506 = distinct vectors**. Rows with the same token
+sequence necessarily get byte-identical vectors, so collisions are **100%
+explained by tokenization**.
+
+A reference implementation (numpy + torch) **reproduced the stored vectors to
+1.1e-06** (cosine 0.9999998) and reproduced the same collisions — so the model
+weights, the candle inference path, the indexing code and the database are all
+innocent.
+
+> Lesson: `version_label` genuinely does not participate in encoding, and 20,057
+> rows concentrated under one version label looked exactly like the culprit — but
+> **the denominator was never printed**. The same "duplicate" symptom has two
+> completely different causes, and only one explanation happened to fit.
+> **Separate "identical text" from "different text, identical vector"**: the former
+> is data redundancy, only the latter is an encoding defect.
+
+### Root cause: one flag against an all-lowercase vocabulary
+
+`tokenizer.json` ships `lowercase: false`, but its vocabulary is **entirely
+lowercase** (`get`∈V while `Get`∉V, `kit`∈V while `Kit`∉V). Every camelCase
+identifier therefore collapses into a single `[UNK]`:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Rows containing `[UNK]` | **100%** (44,856 / 44,856) | **0%** |
+| `[UNK]` share of 965,066 tokens | **24.8%** | **0.0%** |
+| Non-empty API names collapsing entirely to `[UNK]` | **27,433 / 31,812 (86.2%)** | 0 |
+| Largest collision group | **538 rows** | **24 rows** |
+
+**The fix lives in source, not in the model file** — `src-tauri/resources/` is
+gitignored, so editing the resource would not be committable and would be lost on
+every CI build.
+
+### Changing the encoding requires changing how "did the encoding change?" is decided
+
+The old idempotence guard compared **row counts only** (`indexed >= total`), so a
+tokenizer change with an unchanged row count would **skip the rebuild** — queries
+encoded the new way against vectors encoded the old way, which is **worse than not
+fixing it at all**.
+
+An **index fingerprint** was added (`api_docs_meta.embedding_index_fingerprint`):
+the source-level encoding-schema constants plus the **content** sha256 of the three
+model files (not mtime). It is computed once at model load and cached, because this
+is a search hot path. The guard now requires "row count sufficient **and**
+fingerprint matching", and a missing fingerprint also forces a rebuild.
+`vector_search` validates the same fingerprint before encoding the query and
+degrades to keyword-only on mismatch.
+
+### A third defect, uncovered along the way: a correctness bug that is shipping
+
+This one is more serious than the other two because it is not a quality problem.
+By unioning the two result lists, a document present **only** in the vector list
+with no literal keyword match could outrank the BM25 #1 (vector #1 = 1/61, exactly
+tying keyword #1 = 1/61), and ties were broken by `HashMap` iteration order, which
+**differs per process**. Ties are not an edge case: **67.8% of queries have a
+top-1/top-2 cosine gap of exactly zero**.
+
+**Three contract changes (all narrowings, not new knobs)**:
+
+- **When keyword hits exist**, that set is authoritative: the vector layer reorders
+  within it and never introduces new documents. "Semantic but no literal match" is
+  deliberately not enabled in that case.
+- **When there are zero keyword hits**, vector hits are let through.
+- **Ties break on ascending `doc_id`**, so identical input always yields identical output.
+
+### Measured along the way: the keyword layer recalls **nothing** for semantic queries
+
+To judge whether the vector layer is worth keeping, you first need to know how good
+the keyword layer is — and nobody had measured it. Measured with the **production
+code itself** (`harmony_api_diff::search` + `relevance::Bm25Index`; `cargo test`
+does not enable the `embedding` feature, so the vector block is compiled out and
+what gets measured is exactly the production keyword-only path):
+
+| Query type | Keyword recall | Target rank |
+|---|---:|---:|
+| **Semantic / Chinese** (15 queries) | **0 rows (15/15)** | not recalled |
+| `getWindowProperties` | 1 row | **rank 1** |
+| `createWindow` | 6 rows | **rank 1** |
+| `getBundleInfo` | 8 rows | **rank 1** |
+
+Recall is `LIKE '%keyword%'` on literal substrings, and rows whose `declaration`
+contains a non-ASCII character number **0 / 44,856**. **The keyword layer is a
+reliable workhorse for exact identifiers (top1 3/3); it recalls nothing at all for
+semantic queries.**
+
+**This also exposed and fixed a regression from this same batch**: the first
+narrowing filtered vector hits unconditionally, collapsing semantic search from
+"50 results" to "**0 results**" — worse than before. The rule is now "a weak
+signal is used only when there is no strong one", with no magic constants in either
+direction. It also **overturns the "drop the vector layer, keep BM25" option**,
+which would have driven Chinese semantic search to exactly zero.
+
+### A zero-result search is no longer an unexplained dead end
+
+When a keyword query matches nothing, the output used to say only
+"共找到 0 条匹配（知识库总量 44,856 条）". Since Chinese / descriptive keywords are
+**guaranteed** to miss at the keyword layer (table above), that was a high-frequency
+dead end. The output now carries the **actual semantic-layer state plus what to do
+next**:
+
+| State | What the hint says |
+|---|---|
+| Ready | the semantic layer did not match either — try an exact API name or narrow the filters |
+| Not indexed | build the index (about 20–30 min the first time) to enable semantic search |
+| **Stale index** | vectors from before the upgrade or from the seed are not comparable — rebuild required |
+| Local model unavailable | this run is keyword-only — use an exact API name for Chinese keywords |
+
+The state is computed **from the database only, without loading the model** —
+answering "why did nothing match" should not cost 1–2s of loading 91MB of weights.
+The state enum and the degradation check inside `vector_search` **share one
+function**, so the log line and the user-visible hint can never disagree.
+
+### Stated honestly: fixing tokenization alone leaves search largely unusable
+
+15 realistic developer queries (every target API verified to exist in the DB first):
+
+| | Before | After |
+|---|---:|---:|
+| top1 | **0 / 15** | 1 / 15 |
+| top10 | 1 / 15 | **3 / 15** |
+
+The English query `get window properties` jumps from beyond rank 20 to rank 1;
+Chinese queries still mostly fail. The cause is a **model/corpus mismatch**: the
+model is a Chinese sentence encoder while the corpus is **100% ASCII**
+(`declaration` rows containing non-ASCII characters = **0 / 44,856**) and consists of
+English TypeScript signatures. Upstream was verified: `do_lower_case: false` and
+`num_hidden_layers: 4` are **both official settings**, so the model files were not
+corrupted. Whether to keep investing in the vector layer is now tracked as
+product decision P-7.
+
+### One change rejected by measurement (never landed in code)
+
+After the tokenizer fix, 6,385 rows (14.2%) still shared a token sequence with
+another row. "Fall back to `class_name` when `api_name` is empty" looked right:
+`class_name` covers **99.9%** of rows, and 99.8% of the 13,044 rows with an empty
+`api_name` have one. **The proxy metric did improve** — distinct sequences
+38,471 → **41,939**, largest collision group 24 → **5**.
+
+**But end-to-end over 15 queries, top1 fell from 1/15 to 0/15 and top10 from 3/15
+to 2/15**, and the one query that actually worked, `get window properties`,
+**dropped from rank 1 to rank 17**. The query side has no `class_name` to match
+against, so the extra tokens are pure noise.
+
+**Acting on the distinct-sequence count alone would have made the product worse.**
+"More diverse outputs" and "more accurate results" are not the same thing, and only
+the first one is easy to measure and looks good. Tracked in the rejected table with
+all numbers attached.
+
+### The semantic index card now tells the truth, and a 20–30 minute job is predictable and cancellable
+
+The card previously reported only `available / indexed / total`. So **every user who
+upgraded saw "Ready 44856/44856"** — and `indexed === total` is exactly the case that
+**hides** "the row count is full but the encoding pipeline changed", while
+`vector_search` is in fact **refusing to search** because the fingerprint does not
+match. **The card claimed readiness while the feature was off.**
+
+| | Before | Now |
+|---|---|---|
+| State display | two states (ready / unavailable); a stale index was invisible | **four states** (ready / not indexed / stale index / model unavailable), each with its own wording and tone |
+| 20–30 minute progress | only `1234/44856`, which **conveys no duration at all** | shows an **ETA** (and gives **none** when the sample is too small, rather than a wild number) |
+| Cancel | none | **yes** (checked at the top of each batch, so at most one more batch, about 3–5 seconds) |
+| After cancelling | — | cancelling is **not a failure**: vectors already written are valid, so no red error is shown |
+
+The ETA is a pure function (it takes `elapsed_secs`, not `Instant`, so its self-test
+needs no `sleep`). **No ETA before the first batch**: 128 rows takes a few seconds on
+CPU, and linear extrapolation would then say "3 seconds left" — the exact opposite of
+the real 20–30 minutes, which is worse than saying nothing.
+
+### The card above was still lying, in a fifth case
+
+After turning the card into four states, **the new predicate itself was never
+reviewed** — and it missed exactly the case created by the cancel button added in the
+same change.
+
+`Ready` checked only "fingerprint matches" and **never counted rows**, while the
+fingerprint was written **unconditionally** after the loop — including on the path
+that `break`s out on cancel. Together: cancel a build at 5,000/44,856 and the card
+shows **green "Ready"** while the semantic layer covers 11% of the library. A Chinese
+query still returns nothing, and the zero-result hint then says "the semantic layer
+**is ready** but nothing matched" — **which is the wrong reason**.
+
+Worse, this is not only cosmetic: `vector_search` **reuses the same function** to
+decide whether to degrade, so the half-built vectors are **not rejected** and take
+part in retrieval as if they were complete.
+
+The cause is not two small slips: **one fact was judged independently by two functions
+with different criteria.** `should_skip_index` requires "row count sufficient **and**
+fingerprint matching"; the state predicate required only the latter. One says
+"rebuild", the other says "ready".
+
+The fix is two independent lines of defence:
+
+- The predicate checks **row coverage first**: `n < total` yields a new fifth state
+  `partial_index` ("index incomplete"). It must run before the fingerprint check,
+  because "not finished" is more upstream than "wrong scheme".
+- **No fingerprint is written on cancel** — a fingerprint means "this scheme is fully
+  indexed", and writing one vouches for a build that never finished.
+
+Half-built indexes were deliberately **not** folded into "stale index": that state's
+reason ("not produced by the current encoding scheme") does not hold for a partial
+build, whose real risk is "semantic search looks like it is working while only a few
+entries are covered". **Two situations with different reasons must not share one state.**
+
+The same round also removed three **unrecoverable dead states** (not flickers):
+
+| Defect | Consequence |
+|---|---|
+| The running flag was cleared **after** broadcasting done | A window exists where the card stays "indexing" forever, and done is never sent a second time ⇒ the button stays disabled permanently |
+| "Cancelling…" was only reset by the done event | If the event never arrives the button stays disabled with no way out |
+| "Finished" relied entirely on one status round-trip whose failure was silently swallowed | If the refresh fails the card keeps claiming "indexing" |
+
+"**Order is a contract, not a style choice**": state and announcement must have a
+deterministic order, otherwise the two drift, and what they drift into is a dead state
+rather than a flicker. The invariant now asserted is "**receiving done ⇒ running is
+already false**".
+
+Also removed a stretch of **dead code**: "new data not indexed" was gated on
+`state === 'ready' && indexed < total`, and `ready` now implies `indexed >= total` by
+definition ⇒ unreachable. It and its orphaned i18n key are gone (net key count
+unchanged).
+
+Finally, a third instance of "**a comment describing something the code does not do**":
+both the state predicate and its call site claimed "reads the DB only, does not load
+the model" — **which is not true**. Deciding `Ready`/`StaleIndex` needs the model
+fingerprint, and the global encoder is a lazily-initialised `OnceLock`, so **the first
+call really does read 91MB of weights** (about 1–2 seconds). The result is unaffected
+(it is only slower once), but those two comments would lead someone to assume this path
+is always free.
+
+### Semantic search now defaults to off, behind an explicit switch (P-7 option ②)
+
+The previous rounds made the semantic layer **correct**, but it was **still on by
+default**. What the measurements support: exact identifiers — the dominant use in an
+IDE — go through the keyword layer at top-1 **3/3** for free, while the vector layer
+is top-1 1/15 with a median rank above 20, and costs a **178.9MB** vector table
+(measured on the seed database: 91.9MB of net data, but SQLite page occupancy
+nearly doubles it), 91MB shipped with the installer, and a 20–30 minute first build.
+The **3/15 it does win on
+Chinese queries is its only value** (the keyword layer returns nothing at all), so it
+is not removed — it simply **does not pay that cost unless asked**.
+
+The switch lives in the `settings` table and has three hard constraints:
+
+- **Defaults to off** (fail-closed): a missing or unrecognised value counts as off.
+  The reverse would make every upgrade enable it, which is exactly what ② removes.
+- **The state check short-circuits first**: `semantic_layer_state`,
+  `vector_search`, and — importantly — `api_kb_embed_status`, which **runs as soon as
+  the page opens**, all check the switch before touching the vector table and only
+  load the model last. With the switch off, **those 91MB of weights are never read**
+  even once. Calling `global_embedder()` unconditionally in the status call would have
+  made ② a decoration.
+- **"Rebuild index" has a precondition**: with the switch off the backend refuses to
+  build (otherwise a 20–30 minute build could be triggered for nothing, and the result
+  would not even be used), and the frontend button is disabled to match.
+
+A sixth state `disabled` was added: with the switch off the index may well be
+complete, so reporting `ready` would be a lie (the feature is off) and reporting
+`not_indexed` would be a different lie (it would send the user to build an index that
+already exists). This state answers "**why we are not doing it**"; the other five
+answer "**why it cannot be done**". Its badge is neutral grey — off is a deliberate
+choice, not a fault, and a warning colour would read like a breakage.
+
+**Negative verification caught a fake-green self-test of my own**: the first test for
+the switch only asserted "the result is `Disabled`". Injecting a mutation that moved
+the switch check to *after* the table read left the suite **fully green** — because
+**behaviour and benefit are different things**: with the check moved later it still
+returns `Disabled`, it just performs a few extra COUNTs. **Asserting a return value
+cannot detect an early return.** The fix was a distinguishable check: create only the
+`settings` table and deliberately omit the vector tables, so an early return yields
+`Disabled` while a late one yields `NotIndexed` — "the table is missing" becomes a
+probe for "was the table read at all". M1 then went red immediately. A second mutation
+(M3) guards fail-closed, and a reverse check (M2, wording only must stay green) proves
+the suite is not failing indiscriminately.
+
+### Reviewing the switch: the same mistake I had just criticised, on the same card
+
+The optimistic update was not reviewed after it was written. A reverse review found
+two defects.
+
+**① The switch and the state disagreed.** The optimistic update changes `enabled`
+but not `state`, and the two are coupled (`state` is computed *given* `enabled`).
+So the card simultaneously showed "switch: on" and "badge: off", **for one to two
+seconds** — and that is not network latency: the status call that follows an enable
+really does load 91MB of weights.
+
+The **shape** is the same as "the card claimed readiness while the feature was off":
+a conclusion is shown during a window where the state is still undetermined. Here
+the two controls simply disagree instead of the backend lying.
+
+### The fix above treated the symptom; this round removes the cause
+
+Rendering no badge was **hiding** the contradiction. The cause was that the optimistic
+update set `enabled` without being able to compute `state` — whether `state` becomes
+`not_indexed` or `ready` depends on whether the backend has to load the model, and
+**the frontend cannot know that in advance**. So "changed A but not B" was not a
+mistake; it was a guaranteed consequence of that approach.
+
+**Rule: optimistic updates only apply to fields whose true value the client can
+determine locally.**
+
+| Field | Can the client determine it? | Optimistic? |
+|---|---|---|
+| `running: false` (on receiving `done`) | **Yes** — the event *is* the evidence that the task ended | ✅ |
+| `enabled: true` (on clicking the switch) | **No** — what `state` becomes afterwards is unknown | ❌ |
+
+So the unjustified optimistic update is removed: the whole status is replaced only
+after the response arrives, so `enabled` and `state` always come from **the same
+response** and cannot disagree **structurally**. The cost is a button that spins for
+one to two seconds (that is the model load — real and unavoidable), announced as
+"Working…".
+
+> **When a rule keeps causing problems and is hard to guard, first ask "can the
+> offending shape be made to not exist", not "how can it be detected".** The earlier
+> round spent a whole section on which predicate should guard it; the right move was
+> to delete the cause — **zero maintenance, and breaking it becomes impossible**.
+
+The badge guard added in the earlier round is kept, but its comment now says
+**"redundant insurance, not a required mechanism"** — redundant things must be marked
+as redundant, otherwise they block whoever later wants to fix the actual cause.
+
+This round's predicate ("does an optimistic update touch `enabled`?") is statically
+decidable and needs no JSX parsing, and was verified in the right order:
+**first confirm it produces non-empty output on the real source** (which rules out
+"always green"), then inject the old shape to confirm it goes red, then restore and
+compare sha256. 6/6.
+
+**② "Off by default" had no explanation.** The card said only "Off". The real
+explanation appears only in search results, i.e. the user has to trip over it first
+(a Chinese query returning nothing). Defaulting a feature to off is a **behaviour
+change**, and one that is not announced becomes a support ticket. A one-line
+explanation is now shown at the bottom of the card, **only while it is off**.
+
+Together these give one rule: **whenever a capability or an optimistic update is
+added, ask what the interface is saying during the window where the state is
+undetermined.** This is by far the most frequent defect shape in this project — an
+order of magnitude above a forgotten null check, because **it looks fine**.
+
+### P-7 decision: ship ②, defer ①
+
+P-7 had been sitting in the ledger as "awaiting a decision" with four options
+(① switch models / ② default off behind a switch / ③ remove entirely /
+④ repurpose as a size optimisation). All four are product judgements a gate
+cannot make. Now that ② has landed, the entry is **closed**.
+
+Every reason is a measurement, not a preference:
+
+- **The dominant IDE use is already served**: exact identifiers go through the
+  keyword layer at top-1 **3/3** for free; the vector layer is top-1 1/15.
+- **② has already been paid for**: the fingerprint, partial-index refusal and
+  short-circuit problems are all fixed. **① starts over from zero** — a new model
+  means re-encoding all 44,856 rows, buying the model again, and passing the
+  licence gate again.
+- **The 3/15 it does win on Chinese is available on demand**: the switch turns it
+  on; it does not have to ship enabled.
+- **Stripping the seed vectors saves 178.9MB, while ① moves the other way**: it
+  puts the vectors back into the installer and adds another model on top.
+
+**Conditions to revisit ① (decidable; all three must hold)**:
+
+1. A **real query** exists that the keyword layer scores 0 hits on while the
+   semantic layer has the target in its top 10;
+2. **≥3 of ≥15 real search terms** fall into that class;
+3. A multilingual / code embedding model under **BSD-3, MIT or Apache-2** is
+   available to vendor.
+
+Also recorded is one **rejected** restart condition, because it looked the most
+convincing of them all: "watch user feedback after release". But
+`usage_events_enabled` is **off by default** (a missing key counts as off) and
+the telemetry `EVENT_NAMES` allowlist contains **no search events at all** — so
+**there is no data to watch**. A criterion that cannot be evaluated must not go
+into the ledger, or six months later someone will read it as "someone already
+measured this".
+
+### Release prerequisite
+
+The vectors inside the seed knowledge base
+(`src-tauri/resources/seed/knowledge.db`) were produced by **a different machine under a
+different encoding scheme**, and `api_docs_meta` has **no fingerprint key** — so after
+import they are always judged `stale_index` and refused. **Not a single row is ever
+usable**, and semantic search now defaults to off, which makes them a pure loss.
+
+Measured: `DROP TABLE api_docs_embeddings` + `VACUUM` shrinks the seed from
+**272.6 MB to 93.7 MB** (the vector table occupies **178.9 MB, 65.6%**).
+> `44,856 × 2048B = 91.9MB` is the **net data**, not the disk footprint — SQLite page
+> fragmentation and overflow pages nearly double it. The "91.8MB" figure in earlier
+> documents was wrong and has been corrected everywhere.
+
+**How to run it**: `python scripts/strip-seed-bloat.py --apply`
+(reports only by default; `--apply` takes a backup first and rolls back if the
+self-check fails. **`VACUUM` is mandatory** — `DROP TABLE` alone does not shrink the
+file, so omitting it yields the false conclusion "nothing was saved").
+The seed lives under `.gitignore`, so it is **not version-controlled**: this is a
+release prerequisite rather than a code change.
+
+**Verified end to end**: real stripped artifact → the same 85 production migrations →
+`import_into` ⇒ 59,102 rows imported, `api_docs` 44,856, vectors **0**, no errors ⇒
+**no code change is required**.
+
+### Verification
+
+Self-tests **net +10** (2 removed because they encoded the now-retracted contract,
+12 added) · `cargo test` **1227 passed / 0 failed / 10 ignored** (baseline 1213) ·
+`embedding` module self-tests **22** (+1: switch short-circuit / fail-closed) ·
+clippy **no new warnings** · clean compile with the `embedding` feature ·
+`tsc` clean · gates **36/36** · negative verification **21/21** (12 + 9) ·
+IPC **319 → 321** (+2 switch commands) · i18n zh/en in sync.
+
+This round's negative verification **checked both directions**: removing the row-count
+criterion must turn the test red, **and it must be that specific test** that goes red
+(otherwise "the gate works" and "it fails indiscriminately" are indistinguishable);
+changing only the hint wording must stay green (the reverse proof).
+
+**Negative verification caught a fake-green self-test of my own**: the
+"ties are reproducible" test's input contained **no ties at all** (failing to
+construct a tie is silent and green), so it still passed after removing the
+tie-break key. The fix was to construct the tie correctly and to **assert that the
+tie actually exists first**. A companion test asserting tie *order* only failed 50%
+of the time, so the two were merged — **a test that only catches a mutation half the
+time is itself a flake hazard**.
+
+### Wrap-up: after signing off, two more findings in my own output (2026-10-08)
+
+The previous batch's output was a **decision**. Re-checking the ledger afterwards found
+two problems — **one of which I had written in the previous batch, the other far older
+and considerably worse.**
+
+#### 1. Signing off left **two `### P-6` headings, the older one with nothing under it
+
+```markdown
+### P-6 语义检索要不要**版本感知**（第二十三批提出，**数据已备好，等拍板**）
+
+### P-6 语义检索要不要**版本感知**（第二十三批提出 → **第二十四批撤回重开**）
+
+> **第二十四批结论：这条的前提被推翻了，原拍板已作废，不要按它实现。**
+```
+
+When the entry was reopened, the action was to **add a new heading** carrying the new
+status, and the **old heading stayed where it was with nothing under it**.
+
+1. The ledger header declares "**6** product decisions pending" while the file contains
+   **7** `### P-` headings ⇒ **the stated number and the fact disagree, and nothing
+   anywhere goes red**;
+2. Someone scanning the ledger stops at "awaiting a decision" and **never reaches
+   "the original decision is void — do not implement it"** — and that half is the
+   dangerous part.
+
+**An empty heading is not a formatting nit; it truncates a warning.** A ledger is
+valuable because readers act on it, and **readers do not read twice**: the heading is
+the entire basis for deciding whether to open the section. A heading that says
+"awaiting a decision" tells the reader this is settled — just settled the wrong way.
+
+#### 2. New rule "`##`/`###` must have a body", mutation-verified 5/5
+
+What is judged is the **structure** (is there a body up to the next heading at the
+same or a higher level), **not "duplicate heading"** — the latter lets "two headings
+of the same name, each with a body" pass, which is just as bad.
+
+| Boundary | Cost of getting it wrong | Mutation result (real corpus + synthetic) |
+|---|---|---|
+| A `####` sub-heading is not a body | becomes "empty if the next line is a heading" | **63 false positives on the real corpus** |
+| `##` inside a fenced code block is not a heading | any pasted command containing `#` becomes a section | **4 false positives on the real corpus** + self-test goes red |
+| H1 is excluded (`#` followed by `##` is normal structure) | CHANGELOG structure judged empty wholesale | real corpus **0**, **carried by the synthetic case only** |
+
+The middle row is this batch's prettiest piece of **self-reference**: the four false
+positives that appear once fence awareness is removed are **all example blocks that
+document this very defect** — one each in `CHANGELOG.md`, `CHANGELOG.en.md`,
+`docs/TECH_DEBT.md` and `docs/UI_REFINEMENT_PLAN.md`, each inside a ` ```markdown `
+fence containing those two `### P-6` lines. **The habitual way of writing this defect
+into a document is exactly the shape this rule is meant to catch.**
+
+The third row is **labelled honestly as "carried by the synthetic case only"**: every
+H1 in the current documents happens to have a body, so it guards nothing on the real
+corpus today — it guards against the shape **appearing later**. Not described as
+"also held by the real corpus".
+
+#### Side note: **when an ad-hoc command reports "nothing changed", suspect the command first**
+
+Those 4 false positives were **not detected the first time**. The mutation was run
+as a PowerShell `python -c @"…"@`, and it printed "fence awareness removed: 0 items" —
+while removing fence awareness **obviously cannot** have no effect. The real cause:
+the `\"```\"` escaping inside the here-string **did not match**, so `.replace()` was a
+**no-op** and both versions were byte-identical — hence 0 in both.
+
+> **"The mutation did nothing" has two explanations: the guard is decorative, or my
+> mutation never applied.** The second is far more common and far more dangerous — it
+> leads to writing a **load-bearing** guard up as "measured: not load-bearing" and then
+> deleting it. **Rule: an ad-hoc mutation must first assert that it actually changed
+> something.** This is now a hard check in
+> `scripts/verify-empty-sections-rule.py`: the anchor must occur exactly once and
+> `mutated != original`, otherwise it fails outright — and it reports **both** the
+> real corpus and the synthetic cases, because reporting only one of them yields a
+> skewed conclusion.
+
+`check-docs.py` self-tests **11 → 15**.
+
+#### 3. Following that thread: **the gate has been red on Chinese Windows all along**
+
+While updating the ledger's gate table (`check-docs.py` 11 → 15),
+`check-self-test-counts.py` reported 6 failures. The first reaction was "I mistyped
+the number" — but **`docs` was not among the failures**, so 15 had been accepted.
+The real cause:
+
+```python
+r = subprocess.run([...], capture_output=True, cwd=REPO)          # no env
+return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
+```
+
+The child gate's stdout is a **pipe**, and Python writes it using the locale —
+**GBK** on Chinese Windows; the parent decodes as **UTF-8** ⇒ mojibake ⇒ the count
+cannot be parsed ⇒ **6 gates go red at once**. A real A/B:
+
+| Environment | Exit code |
+|---|---:|
+| `PYTHONIOENCODING` unset | **1** (false red, 6 items) |
+| `PYTHONIOENCODING=utf-8` | **0** |
+
+**Why nobody noticed**: CI is Linux/UTF-8 and always green; locally most people run it
+through `deveco-verify-all.py`, and **that harness injects the variable into its
+children** — its own comment reads "so an encoding problem can never masquerade as a
+broken gate". **The same patch was applied to the harness, not to the gate.**
+
+Fix: inject `env={**os.environ, "PYTHONIOENCODING": "utf-8"}` into the spawn.
+Mutation check: removing that line drops this machine straight back to exit 1;
+sha256 identical after restore. Self-tests **14 → 15** (one new end-to-end real run;
+⚠️ that case **only has discriminating power on a non-UTF-8 locale**, stated as such).
+
+> **Fixing "where the symptom appears" is not enough — ask "what made it appear".**
+> Here the symptom is in the parse result; the cause is a spawn without an environment.
+> And: **a defect that only reproduces on one machine most likely has its cause in that
+> machine's environment.** `CI green` only means "no problem on the kind of machine CI is".
+
+#### 4. Clearing numbers that were guaranteed to drift, plus three corrupted bytes
+
+The Q-08 evidence lines in `docs/ROADMAP.md` / `ROADMAP.en.md` carry 8 concrete
+numbers (tools 201 / migrations 77 / IPC 298 / …). Measured, **all eight are stale**
+(real values 204 / 85 / 321 / 41 / 64 / 19 / 58 / 36), and `check-docs.py`
+**does not check numbers inside ROADMAP**.
+
+The handling is not "update them to the new values" but **delete the numbers and keep
+only the category names** — updating merely postpones the same drift by one batch.
+
+> **A number that no gate verifies should not appear in the form of a fact.**
+> Either give it a criterion, or demote it to descriptive wording. The middle ground
+> (an example that looks like a fact) is the worst option.
+
+Also repaired three **corrupted UTF-8 Chinese characters** in
+`docs/UI_REFINEMENT_PLAN.md` (`存档` / `发现` / `需要用正则`). **The Edit tool cannot
+help here**: that character is not a stand-in produced by a failed decode but a **literal
+`U+FFFD` character (`EF BF BD`)**, the file itself is **perfectly valid UTF-8 with not a
+single invalid byte**, so **Edit can match and replace it directly**. The one time I
+believed "Edit cannot match it" was because I had written the **same string into both
+`old_string` and `new_string`**. **Verify "is the file actually valid UTF-8" before
+concluding that a tool cannot do it.**
+
+#### Verification for this batch
+
+`check-docs.py` self-tests **15** (+4) · `check-self-test-counts.py` self-tests
+**15** (+1) · mutation injection **5/5** · encoding-fix mutation **3/3** ·
+gates **36/36**.
+
+**Zero product-code changes** — two gate scripts and four documents. But one of those
+affects **every Windows developer**: it left that gate permanently failing on their
+own machine, and **a failing gate is the kind that gets turned off**.
+
+### Deleting a write-only column: 19.7 MB saved, with zero functional change
+
+The ledger recorded: "`api_details.members` and `api_members` differ on 9 rows;
+**deleting `members` would leave those pages missing 49 members**". Going to find out
+*where the page's member count actually comes from* showed **that premise was wrong** —
+**no read path goes through that column at all**:
+
+| Read at | Actually reads |
+|---|---|
+| The member-count column in the knowledge-base list | `SELECT COUNT(*) FROM api_members` |
+| The member list on the detail page | `FROM api_members WHERE detail_slug=?1` |
+| Sub-items matched by Agent search | `FROM api_members` |
+| Frontend rendering | the backend responses from the three above |
+| Diagnostic bundle export | **does not contain the `api_details` table at all** |
+
+The manual "create detail" path is even more telling: it writes a literal `'[]'` into
+`members` — **it never wrote any data there at all**.
+
+⇒ Those 9 rows are a **symptom, not a disease**: two writers with different dedup rules,
+and because nothing reads it, the divergence **can never surface** — type-check, lint,
+tests, build and the size gate are **all green**.
+
+| Item | Value |
+|---|---:|
+| `api_details` rows / of those `members` non-`'[]'` | 681 / **681 (all)** |
+| `SUM(LENGTH(members))` net data | 15.2 MB |
+| **Actual disk cost** (copy → DROP COLUMN → VACUUM → compare `page_count`) | **21.9 MB** |
+| Recovered by the "VACUUM only, no drop" control | 2.1 MB |
+| ⇒ **net gain** | **19.7 MB** |
+
+The previous release was already bitten by this once (91.9 MB net vs **178.9 MB** actual),
+so this time the measurement did **not** go through `SUM(LENGTH())`, and it added a
+"VACUUM only" control group.
+
+#### What actually blocked it was not the data — it was one `SELECT *`
+
+`services/seed.rs` used `INSERT OR IGNORE INTO main.<t> SELECT * FROM seed.<t>`.
+`SELECT *` expands on the **seed** side while the insert proceeds **positionally** ⇒
+both sides must have identical column counts *and order*. An old seed database still
+carrying that column while the main one no longer has it ⇒ first launch reports
+`table main.api_details has N columns but M values were supplied`, inside a transaction
+⇒ **the whole import rolls back** ⇒ **a new user's knowledge base comes up empty**.
+
+**Measured first to confirm this was a latent landmine, not an already-firing one**:
+comparing the four tables column by column, the migrated main database and the real seed
+database have **identical column names and order**.
+
+And **the same trap had already been hit in this very file**: `api_docs_embeddings` was
+pulled out and hand-remapped, with a comment explaining why — but that **fixed the
+symptom on that one table and left the `SELECT *` cause in place**, so it was free to
+reappear on the next table.
+
+The fix is not a hardcoded column list (that expires with the next migration) but a
+**runtime intersection** (`shared_columns()`): a new seed missing a column inserts one
+fewer; an old seed lacking a newly added column has it skipped.
+**Neither side's schema changes can blow this up anymore.**
+
+**End to end**: real seed (**with** the column) → real 86-migration main database
+(**without** it) ⇒ import succeeds, `api_docs/api_details/api_members` =
+**44,856 / 681 / 13,606**, second import **0** (idempotent). The temporary test was
+removed byte-for-byte afterwards (this project adds no tests).
+
+#### The release script now strips a second thing, and is renamed to match
+
+`strip-seed-vectors.py` → **`strip-seed-bloat.py`** (it now strips the vector table *and*
+the `members` column, so "vectors" in the old name became a lie). Measured on the factory
+seed: **272.6 MB → 74.0 MB (198.6 MB / 73% saved)**; `--self-test` passes **4/4** on a
+real copy.
+
+Still **report-only by default**, requires `--apply`, backs up first, and rolls back if
+the self-check fails — **that discipline does not relax just because it now strips one
+more thing**. A `--vectors-only` escape hatch was added: on SQLite < 3.35 (no
+`DROP COLUMN`) it strips only the vector table and **says so**, because the leftover
+column affects nothing functionally — it only costs space.
+
+**How to run it**: `python scripts/strip-seed-bloat.py --apply`
+
+#### New gate 16: characters that got written as damage
+
+Another corrupted character surfaced while writing the docs, so: is this a one-off or a
+class? **A class**, and no criterion guarded it.
+
+First, the conclusion recorded by the previous release is overturned: "that character is
+a stand-in produced by a failed decode, so Edit cannot match it and it can only be
+replaced at the byte level". **That is wrong**: what sits at the damaged position is a
+**literal `U+FFFD` character (`EF BF BD`)**; the file itself is **perfectly valid, with
+not one invalid byte**, and **Edit can match and replace it directly**. The one time I
+believed "Edit cannot match it", the reason was that **I had written the same string into
+both `old_string` and `new_string`**.
+
+| | Behaviour |
+|---|---|
+| File size / line numbers | **unchanged** |
+| `tsc` / `eslint` / `cargo` / `vitest` | **all green** |
+| `decode("utf-8")` | **does not raise** |
+| Actual consequence | one character is gone, usually from **the most semantically load-bearing position** |
+
+New gate `scripts/check-encoding-damage.py` flags any line containing a literal `U+FFFD`;
+self-tests **6/6**. One scan surfaced **8 historical corruptions** (docs, scripts and
+source comments) — all fixed.
+
+Two boundaries, both found by measurement: **deliberate use must be allowed**
+(`MISSING = "<U+FFFD>缺键"` in `check-i18n-wording.py` is a **sentinel value** whose whole
+job is to be unable to collide with a real translation — "fixing" it would break a working
+mechanism); and **never write that character literally in docs** — always write the six
+letters `U+FFFD`. Three explanatory notes I wrote myself were consequently flagged as
+damage: **the gate classified its own documentation as a defect**, which only a convention
+can prevent — not a bigger allowlist.
+
+The first version used `rglob` and took **56 seconds** per run (`rglob` filters *after*
+walking, so the vendored `references/` tree was traversed in full). Switching to
+`os.walk` with in-traversal pruning brought it to **1 second**. The mutation was **re-run
+after the change**: clean baseline → injection goes red and names the file → sha256
+identical after restore → green again, **5/5**.
+
+#### Verification for this batch
+
+Migrations **85 → 86** · `cargo build` clean · `cargo test --lib services::seed` **5/5**
+(including the temporary end-to-end, since removed) ·
+`strip-seed-bloat.py --self-test` **4/4** · `check-encoding-damage.py` self-tests **6/6**
++ mutation **5/5** · document-drift gate and self-test-count gate both green ·
+gates **36/36**.
+
+**This is the project's first batch that deletes code**: the net effect is another
+**19.7 MB** off the seed database, with **zero functional change** for the user — because
+nothing ever read that column.
+
+---
+
+## Unreleased — Batch 23: the sample size of the census is itself a finding (2026-10-02)
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+This batch **changes no product behaviour** — one comment and one test that pins it.
+The census process itself, however, produced the hardest data of this batch.
+
+### First, a retraction: the entire database holds 1 conversation
+
+| Table | Rows |
+|---|---:|
+| `conversations` | **1** |
+| `tool_runs` | 25 |
+| `api_docs_embeddings` | 44,856 |
+
+The 273.8MB is almost entirely factory seed data; actual usage traces are
+**1 conversation and 27 messages**. Every "historical statistic" from the previous
+two batches must therefore be downgraded — "100% of `contribution_state` is
+`no_direct_acceptance_evidence`", "the guard fires on 64% of calls", "placeholder
+mistakes 3/3" — **all of them have their denominator inside the same conversation**.
+
+**They are still real defects, but nothing shows they are systemic.**
+
+> Print the denominator before quoting any ratio. "3/3 = 100%" and "3/1,000,000"
+> look identical in wording and differ by six orders of magnitude in meaning.
+> **Sample size is not a footnote; it is part of the conclusion.**
+
+### The conclusion that does have a denominator: 72.2% of vectors are byte-identical
+
+| Item | Value |
+|---|---:|
+| Vector rows | 44,856 |
+| **Unique vectors** (sha256 dedup) | **18,506** |
+| Rows in duplicate groups | **32,381 (72.2%)** |
+| Duplicate groups / largest | 6,031 / **538** |
+
+Root cause: `services/embedding.rs::doc_text` builds the encoded text from only four
+fields; `version_label` / `dts_file` / `api_level` **do not participate**, while the
+same declaration repeats across dozens of versions. Over 400 random queries,
+**67.8% have a top-1/top-2 cosine gap of exactly 0**.
+
+**"Which version of an API does the user get when they search?" has no answer today** —
+they get an arbitrary member of the tied group.
+
+### Quantisation rejected, with numbers (saving 65MB is tempting, and wrong)
+
+Self-retrieval on the real vectors: int8 saves 75.0% and f16 50.0% in size, but
+top-1 agreement with f32 is only **46.7% / 45.3%**. That looks unacceptable —
+**but the f16 round-trip error is only `1e-4`, while adding `σ=1e-3` noise to the
+query vector changes the #1 result `0/150` of the time.**
+
+Put together, the conclusion changes: **the tied items were exactly equal to begin
+with**; quantisation merely shuffles them. So the fix moves from "shrink the payload"
+to "make tied items distinguishable" — which is a product decision (P-6), not debt.
+**Recorded in the "rejected" table with every number**, so the next batch need not
+redo the experiment over 44,856 vectors.
+
+### Fixed: a comment describing something the code does not do
+
+`doc_text`'s comment said "+ change notes", yet the function has **no `change_type`
+parameter**. `cargo test` / `tsc` / clippy are all green — because a comment is not
+code. And that is exactly what **hid the finding above**: `version_label` is likewise
+absent from the encoded text.
+
+**The fix is not just editing the comment** (that only means "right this time").
+A new self-test pins "which four fields, in what order, how empty fields are
+placeheld" with **exact string equality**; adding, removing or reordering any field
+turns it red.
+
+### Another one: `members` is not a redundant copy, it is a sync inconsistency
+
+15.2MB of `api_details.members` matches `api_members` on 672/681 rows, but **9 rows
+disagree and the JSON side always has more** (`js-apis-rpc` 265 vs 216, 49 missing
+from the table). **It cannot be handled as "drop the redundant column"** — doing that
+would leave those pages short of 49 members. Which side is authoritative has to be
+decided first (logged as T-12).
+
+### Verification
+
++1 self-test · `cargo test` **1213 passed / 0 failed / 10 ignored** (baseline 1212) ·
+clippy **57/57 with no new warnings** · `tsc` clean · gates **36/36**.
+
+---
+
+## Unreleased — Batch 22: overturning two of my own entries from the previous batch (2026-10-02)
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+The previous batch closed with three ledger entries (T-8 / T-9 / T-10). This batch went
+to act on them and found that **two of the three diagnoses were wrong** — which is
+where the real value of this batch lies.
+
+### "The arguments were discarded" was false: the audit layer faithfully recorded what the model sent
+
+The previous batch saw `tool_runs.input_json` holding the literal string `"JSON参数"`
+and recorded it as "failed calls discard their arguments — a forensic black hole".
+Tracing it all the way to the write site:
+
+`chat.rs:2556` → `tool_audit_payload` → tries `serde_json::from_str` first and only
+falls back to `redact_text` (**verbatim**) — while the upstream `parse_tool_calls`
+performs **no placeholder substitution whatsoever**.
+
+**So `input_json` is exactly the string the model actually sent. Nothing was lost.**
+
+> "Believed to be discarded" and "faithfully recorded" are identical at the exit code.
+> Judgement-style reasoning flips here: a datum that *looks* like a bug can only be
+> classified by **tracing to the write site and asking who writes it**.
+
+The real defect lies elsewhere, and is **more worth fixing than the original claim**:
+the system prompt writes the format as `【TOOL|tool|JSON参数】` in 5 places, and the
+model **sent `JSON参数` verbatim as the arguments**; meanwhile the validator reported
+`parse error at line 1 column 1` — **saying a row/column to "you sent a placeholder"
+says nothing at all**. The consequence is worse than "wrong arguments":
+**once the error message is useless, the model's self-diagnosis is necessarily wrong
+too** (it concluded, in the observed run, "I wrote multi-line JSON / backslash escaping").
+
+A placeholder now returns `placeholder_argument`, naming it explicitly ("that is the
+placeholder from the prompt") with a copyable JSON example. **Parameter text is never
+echoed back** (to avoid re-spreading sensitive data).
+
+### Also fixed: path error messages no longer leak `\\?\`
+
+The path `resolve_in_roots` returns was already normalised; **only the error message**
+used a bare `display()`, so `\\?\I:\SNS\harmony-sns\entry\module.json5` landed in the
+model's context verbatim. The same file already had `normalize_path` (with three
+comments explaining why it is mandatory) — this one call site simply missed it.
+
+### The session-metadata entry splits in two: half is not a defect, half lacks prerequisites
+
+- **`conversations.model_id` is not a defect.** It carries **user-binding** semantics;
+  NULL correctly means "the user never bound one", and the model actually used is
+  **already recorded per message** in `messages.model`. Writing a "last used" value
+  **would overwrite the user's explicit binding**.
+- **`system_prompt_version` is a genuinely dead column** (read in 6 places, written in
+  0), but **it must not be filled in ad hoc**: there is no version constant anywhere in
+  the codebase, and the system prompt has no single assembly point. Inventing a version
+  number now means **inventing a digit with no process behind it** — it would look
+  authoritative yet stand for no real run, **which is worse than NULL**. The three
+  questions that must be answered first are written into the ledger.
+
+### Verification
+
+- **+5 self-tests** (3 protocol, 2 tools), `cargo test` **1212 passed / 0 failed / 10 ignored**,
+  `tsc` clean, clippy **57/57 with no new warnings**, gates **36/36**
+- **Negative verification 6/6**, both ends checked for both defects
+- One of those self-tests **binds the placeholder detector and the prompt's actual
+  wording in both directions** — "the prompt changed but the word list did not" would
+  silently drop that shape back to "line 1 column 1".
+  **Comment conventions never fail, so a test has to guard this.**
+
+> **The real output of this batch is not "two more bugs fixed" — it is that a ledger
+> decays too.** A confidently written *wrong* entry is more dangerous than no entry,
+> because the next batch **skips suspicion** and cites it. So ledger entries have to be
+> able to carry "this one was later overturned, and why". T-9 / T-10 keep their
+> corrections instead of being deleted, for exactly that reason.
+
+---
+
+## Unreleased — Batch 21: auditing the code through one of our own recorded sessions (2026-10-02)
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+This batch is not a UI batch. It started from reviewing a session the app recorded
+**about itself** (`047424ea`, project `I:\SNS\harmony-sns`, whose entire question was
+the 9 characters "现在项目什么情况？"). The conclusion: **the worst problem was not the
+model — it was the execution kernel.**
+
+### The quality score reported 100 on zero criteria, and rendered it green
+
+That session produced `{"score":100,"acceptance_passed":true,"evidence_criteria":0}`,
+and the Cost page's quality-score tile turned it **green** — while all 21 of its tool
+calls carried `contribution_state=no_direct_acceptance_evidence`. **It was never
+judged even once.**
+
+Four layers, each individually "correct":
+
+1. The goal contains none of change/build/test/deploy/commit/push ⇒ the contract
+   generates **0 criteria**
+2. `passed: blockers.is_empty()` over an **empty** set ⇒ always `true`
+3. The score starts at 100 and only subtracts for `passed` / `exhausted` /
+   `remediation` — **there is no term for "criteria is empty"** ⇒ `score = 100`
+4. It is accumulated unconditionally into `average_quality_score`, and
+   `scoreTone(>=90)` paints it green
+
+The deepest layer: `false_completion_count`, the one metric dedicated to catching
+false greens, tests for `passed == Some(false)` — and an unjudged run has
+`passed == Some(true)`, so it **can structurally never reach that counter**. The
+detector for false greens cannot see empty criteria, because to it empty criteria
+and a real pass are **indistinguishable**.
+
+**The fix is deliberately not flipping `passed` to false** — that would make **every
+pure Q&A conversation unable to ever finish**, and "pure Q&A: give an accurate and
+complete answer" is already the contract's own fallback for empty criteria. So the
+kernel now **records "never judged" explicitly**: `RunQualitySnapshot` gains
+`criteria_declared` / `unscored` (`schema_version` 1 → 2), an unjudged run's `score`
+is pinned to 0 (**0 so that a downstream consumer who forgets to check the flag
+displays "untrustworthy" rather than "perfect"**), the dashboard **excludes** those
+runs from the average, and the Cost page shows `—` rather than `0.0` when nothing
+was ever judged (the latter reads as "quality is terrible", the opposite of the
+truth).
+
+**No criterion was fabricated for pure Q&A** — inventing "the answer cites tool
+evidence" would be building a tautology.
+
+### `todo_write` silently dropped state changes: the documented usage was the broken one
+
+The model marked 5 items `done`; the tool replied "0 done, 0 in progress, 9 pending"
+— it said it would change, the tool said nothing changed, and the tool's own tally
+said everything was still pending.
+
+Two pieces of code contradict each other: `agent::todo::render_hint` injects a system
+hint every turn telling the model to "mark items done with `todo_write`
+(**merge=true, changed items only**)" — i.e. `{id, status}` with **no `content`** —
+while the parser in `tools/mod.rs` **discards anything without content**.
+**The documented correct usage was exactly the silently failing usage.**
+
+Parsing is now a pure function: in merge mode `content` is inherited from the current
+list by `id`; only genuinely unknown items are dropped, and dropped ids are now
+**reported back to the model** — silent dropping is the cause of this defect.
+
+### Three more things investigated but deliberately **not** fixed
+
+Registered in `docs/TECH_DEBT.md` (T-8/T-9/T-10) so the next batch need not
+rediscover them:
+
+| | measured |
+|---|---|
+| **The stall guard only warns, it never escalates** | It fired **16 times** in one run (calls 10 → 25); the model changed strategy **zero** times |
+| **Budget is denominated in rounds while cost is incurred in bytes** | A 9-character question burned **209825 input tokens / 167 s**; tools accounted for only **2.2%** of wall time |
+| **Failed calls discard their arguments** | 3 schema failures stored the literal string `"JSON参数"` in `input_json` — a forensic black hole |
+
+### Verification
+
+- **+6 self-tests** (2 quality-score, 4 todo), full `cargo test` green, `tsc` clean,
+  clippy **57/57 with no new warnings**
+- **Negative verification 6/6**, both ends checked for both defects
+- The negative verification surfaced a **third** same-shaped trap: `shutil.copy2`
+  **preserves mtime**, so after restoring, the source looked *older* than the
+  injected build and **cargo skipped recompilation** — byte-level restore verified,
+  yet the injected binary was still what ran. Fixed with `os.utime(path, None)`:
+  **byte-level clean ≠ behaviour-level clean**
+
+---
+
+## Unreleased — Batch 20: splitting the 2351-line device panels (2026-10-01)
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+The ledger entry "the device panels' internals have never been surveyed" sat unanswered
+from §6.14 until this batch. Filling it in immediately surfaced something more important,
+which then got fixed.
+
+### Writing `lazy()` three times does not create three chunks
+
+The Home page lazy-loads three panels, like this:
+
+```ts
+const DevicesPanel = lazy(() => import('.../devicePanels').then((m) => ({ default: m.DevicesPanel })))
+const AnalyzePanel  = lazy(() => import('.../devicePanels').then((m) => ({ default: m.AnalyzePanel })))
+const SymbolsPanel  = lazy(() => import('.../devicePanels').then((m) => ({ default: m.SymbolsPanel })))
+```
+
+All three point at **the same module**. And the bundler emits only **one** chunk for
+repeated `import()` of the same module — the output was a single 63.6KB
+`devicePanels-*.js`. So those three "lazy" declarations only deferred **one big blob**:
+**opening the device panel downloaded the analysis panel and the symbols panel too.**
+
+**Code splitting happens at module boundaries, not at call sites.**
+
+### Survey result: the three panels have zero cross-references
+
+| Inside the old file | Lines | Depends on |
+|---|---:|---|
+| Devices panel | 954 | the perf card and its own detail-row formatter only |
+| Project analysis panel | 781 | fully self-contained |
+| Symbols panel | 460 | its own kind table and colour helper only |
+| Perf card | 47 | **nothing at all** (pure props + inline SVG) |
+
+That answer was **counted**, not guessed — and it is itself the reason it was worth doing:
+zero cross-references means the move **required changing not a single line of logic**.
+
+### What the split bought
+
+| | Before | After (bytes fetched when opening that panel) |
+|---|---:|---|
+| Devices | 63.6KB | **28.0KB** (-56%) |
+| Project analysis | 63.6KB | **24.4KB** (-62%) |
+| Symbols | 63.6KB | **13.0KB** (-80%) |
+
+Chunk count **137 → 140**.
+
+**The entry bundle did not shrink by a single byte** (564.4KB / 575KB) — these panels were
+already lazy and never counted against the first-paint budget. What shrank is **the payload
+fetched on interaction**. Do not read "split a big file" as "freed first-paint budget".
+
+### A criterion that had been blocking two debts for several batches
+
+Both the device-panels debt and the chat-state debt said "unlocked once we have a
+component-level rendering test net". This batch showed that **the criterion conflates
+two different things**:
+
+| | Does it change **behaviour**? | Behaviour net needed? |
+|---|---|---|
+| What a component-level rendering test net catches | extracting a reducer / changing effect deps / changing stream timing | **yes** |
+| Moving code verbatim into another file | **no** — the rendered result is unchanged by definition | **no** |
+
+The only ways moving code can go wrong are **not moving it all / moving it into the wrong
+file / dropping an import** — and all three are caught dead by a **segment-by-segment
+content-equivalence proof**, without rendering anything. This batch's proof: all 6 original
+code segments appear **verbatim** in their target files, and the overall line **multiset**
+is identical.
+
+**A green type-check only proves the types line up — it cannot prove a single line was not
+dropped.** One silently-deleted JSX line can pass everything when there is no rendering
+test at all. Hence two criteria that cover both directions: the type-check catches missing
+imports, the linter catches extra ones, and the content-equivalence proof catches
+"not everything moved".
+
+### Fixes
+
+- Devices panel, device detail-row formatter, project analysis panel, symbols panel and
+  perf card are now separate files; `PerfCard` imports nothing
+- **No change** to first-paint layout, interaction or visuals (a pure move, proven equivalent)
+
+### New gate #15: lazy imports must actually be lazy
+
+The "three `lazy()` calls pointing at one module" defect described above is **silent** —
+type-check, lint, tests, build and the bundle-size gate are **all green**, because
+"the same module" is neither a type nor a semantic error; it simply **does not split**.
+So if someone merges the panels back into one file, or adds a fourth `lazy()` pointing
+back at a shared module, **CI will not react at all** while the user quietly downloads more.
+
+The new gate catches the two cases that are **objectively no-ops**:
+
+1. The lazy target does not resolve to a real file → the panel **never appears**,
+   and no existing gate reports anything
+2. The lazy target is already reached by a **static** `import` → it is already in the
+   first-paint bundle, so `lazy()` saves no bytes and just adds a Suspense layer
+
+Current state: 24 lazy imports (19 pages + 5 panels), plus two occurrences of `lazy(`
+that exist **only inside comments** — the gate tells the two apart.
+
+**What this gate deliberately does not check:** "N `lazy()` calls should be N distinct
+modules". Several components sharing one lazily-loaded module is a **legitimate** pattern.
+And merging the three panels back into a single file is semantically correct — that is a
+gap between *intent* and *fact*, which only code review can catch.
+
+---
+
+## Unreleased — Batch 19: closing out the remaining ledger (2026-10-01)
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+This batch finished the last four items on the ledger together: two technical debts
+(T-6 / T-7), one content debt (C-3), and one half-doable technical debt (T-4).
+**Exactly one user-visible interface change** — see "Website colour" below.
+
+### i18n dead-key cleanup: 83 keys removed, but only after the evidence tool existed
+
+Batch 18 found two keys with no literal reference, and **deliberately did not delete
+them**: a literal search cannot prove a key is dead. This batch built the evidence
+tool first (`scripts/audit_i18n_refs.py`), with **four criteria, none optional**:
+
+1. Fully-qualified **literal** references
+2. **Template literal prefixes** — unenumerated families are covered conservatively
+   by prefix (better to miss a candidate than to wrongly declare one dead)
+3. **String/variable concatenation** — must be registered, and reconciled with the
+   code in **both** directions
+4. i18next **plural forms** — `_one`/`_other` get separate protection, because they
+   are *never* referenced by a literal
+
+Criterion 3 is the reason this tool exists at all: one extra unregistered
+`t(<bare variable>)` makes it **exit 2**. An unconditional "list of dead keys" is
+**dangerous** once dynamic key lookup exists — it reports live keys as dead, and
+**reporting a valid resource as dead is more misleading than missing one**.
+
+The tool walked into four traps of its own (all written into its docstring):
+Tailwind class names containing `0.5` / `1.5` broke the "any dot means an i18n prefix"
+criterion and misjudged 248 keys; the single-letter prefix in `a${Date.now()}` is an ID
+prefix, not an i18n prefix; ternaries and interpolation objects were misread as dynamic
+outlets; and unprotected plural keys would have deleted four keys still in use.
+
+Result: **2339 keys per file → 83 provably dead → 2256 keys, zero candidates**.
+After the deletion `tsc` / `vitest` / all 34 acceptance checks stay green — nothing
+referenced them. The audit also reports `dangling` (referenced by code, absent from
+i18n) = **0**, which is the *positive* evidence that no live key was harmed.
+
+### Contract 6 proved its own worth, in the wild
+
+Re-running the i18n gate after the deletion reported **4 stale explanation entries**:
+"关闭", "切换模型", "重试", "默认模型". When batch 18 wrote the "no stale entries"
+contract these were still hypothetical; this batch they fired for real.
+**Left for the next batch, they would have been four unread lines in a table.**
+
+### Two mislabelled Chinese strings — one of them was *hiding* an English drift
+
+- `cost.retry`: "重试" → "重试次数" (six other keys in this repo use "重试" as an **action**)
+- `provider.models`: "默认模型" → "模型"
+
+The second fix immediately **uncovered a real conflict group that it had been masking**:
+`provider.models` is a **collection label** (`Models`), while `cost.model` /
+`cost.evalModel` are **table column headers** (`Model`) — they are *supposed* to differ.
+**A wrong Chinese string is not just "imprecise translation"; it keeps another
+group's English drift invisible for as long as it stays there.**
+
+### Website colour: one new token split out (the only interface change this batch)
+
+`check-website.py` gained contracts 12–14: contrast (WCAG computed in pure Python),
+focus must be visible, and focus order must not use a positive `tabindex`.
+**axe-core was not introduced** — it is MPL-2.0 (file-level copyleft), outside the
+licence gate's allow-list; and contrast on a static site is **pure arithmetic**.
+Pulling in a file-level copyleft dependency for one square root is wildly
+disproportionate to the benefit.
+
+Contract 12 caught a real defect the moment it went live: white text on
+`--site-accent` (#2f81f7) reaches only **3.75:1**; and darkening #2f81f7 enough for
+white text drops it to 4.06:1 against the dark background, so links fail too.
+**When one token has to serve both roles, one of them is guaranteed to fail** — so
+`--site-accent-solid` (the surface that carries white text) was split out from
+`--site-accent` (the colour drawn on top), and the primary button plus the skip link
+now use the former.
+
+### Motion tokens: only the half that is numerically identical
+
+`--app-motion-fast` *is* `0.12s`, so `0.12s → var(--app-motion-fast)` is pure
+convergence with **zero visual change**; five declarations were converted. Everything
+else was left alone — which bucket `0.15s` belongs to is a **visual decision**, and the
+38 `animation` lines (`spin 0.8s` / `shimmer 1.5s`) are **second-scale** loops: swapping
+`0.8s` for `--app-motion-slow` (0.25s) would spin the spinner 3× faster.
+**New finding:** what is needed is a **second token family** (loop / emphasis), not a
+wider version of the existing three.
+
+### A flaky test failure, fixed
+
+Four `services::seed` tests intermittently failed 3/4 (and passed when run alone) with
+`table api_docs already exists`. The temp directory name contains the pid, while the
+`seed.db` cleanup was written **only at the end** — so as soon as the process is
+interrupted that cleanup line never runs, and pids get reused. All four tests now
+delete first, *then* create. Negative verification is 19/19 with a real control group:
+with the fix removed the run must fail; with it restored it must pass three times running.
+
+---
+
+## Unreleased — i18n wording convergence: "reviewed by hand" becomes "zero unexplained" (2026-10-01)
+
+The last remaining content debt from §6.30 was "review those 49 i18n wording groups".
+This batch actually finished it.
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+**The criterion changed: not "same Chinese must mean same English", but
+"do these two keys refer to the same thing in the same screen"**
+
+Button vs state, diff legend vs action, panel vs table column, collection vs item —
+these **are supposed to differ**. Chinese over-sharing is a **data-organisation**
+problem, not an English-wording one; flattening them only puts two identical
+labels on one screen pointing at two different numbers.
+
+Three changes in the first draft were **overturned by evidence** once the call sites
+were dug out:
+
+- `repro.title` should **not** be shortened — the established pattern for page titles
+  across this repo is "short nav, longer page title" (Cost / Cost Tracking,
+  MCP / MCP Servers are the same shape)
+- `config.telemetry` should **not** become Title Case — it is a settings row label
+  (sentence case), while `usage.title` is a page title (Title Case).
+  Changing it would contradict the rule unified in batch 16
+- `home.detailRam` should **not** become "Memory" — `home.devicePerfMem` is a
+  **percentage** PerfCard, `home.detailRam` is a **GB capacity** row. Two different quantities
+
+**chat vs conversation: originally a product decision, the evidence answered it**
+
+The two words sit in the same sentence — `"No conversations yet. Click New Chat to start"` —
+while the sidebar header says `Conversations` and the same context menu says
+`Pin chat` / `Archive chat` / `Delete chat`. Repo-wide `conversation` : `chat` = 50 : 22.
+
+But most of those 22 `chat` keys are **not drift** and are left alone:
+`Send to chat` (verb phrase), `Chat settings`, `in the chat area`,
+`neither chat nor tools` — those are the "chat area / chatting" sense, and
+"Send to conversation" is ungrammatical.
+
+**36 keys changed**, all by targeted per-key replacement
+(**top-level section + leaf key + old value, anchored uniquely inside the section**):
+
+| Segment | Keys | Content |
+|---|---:|---|
+| A real drift | 6 | Confirm delete? / Deleted / Save failed / success rate / call count / referenced file |
+| B chat → conversation | 7 | Conversation menu + reproduction-bundle page |
+| C audit family consistency | 3 | Three `home.auditLabel*` keys that lacked an object |
+| D ellipsis | 13 | The busy-state semantic cluster's `...` → `…` (U+2026); `sk-...` is literal dots and is kept |
+| E second round | 7 | **Groups missed in the first round**: current / switch model / refresh / retry / read failed |
+
+Segment E is the most instructive: after fixing 29 keys, re-running the audit found
+7 more real drift. The miss was treating "casing is inconsistent" as a settled
+conclusion from a previous batch — which substitutes **an already-false summary for
+per-key checking**. Summaries expire; per-key checks do not.
+
+**Gate 13, `check-i18n-wording.py`, grows from 4 contracts to 7**
+
+Batch 16's gate **admitted in its own docstring** that the 49 reworded groups still
+slipped through and the list was "reviewed by hand". The new contracts here are:
+**every difference must be able to state why it differs.**
+
+| Contract | Content |
+|---|---|
+| 5 | Every group with differing English must have a written reason in `scripts/i18n-wording-explained.json` |
+| 6 | The table must have **no stale entries** (an entry left after a group is fixed pretends it was explained) |
+| 7 | Ellipsis must be U+2026; the allowlist only takes literal dots, and **a stale allowlist entry is also red** |
+
+All 38 groups carry a written reason — **0 unexplained, 0 stale**
+(`different-slot` 26 / `different-thing` 10 / `dead-key` 1 / `zh-side` 1).
+
+This does **not** contradict batch 16's "rejected: hard-gate the reworded groups" —
+what was rejected was **hard-coding a single unified answer**, not gating at all.
+Hard-coding forces out the answer that is wrong for its position; requiring a reason
+only surfaces "this hasn't been thought through yet".
+
+**Three pitfalls hit along the way**
+
+1. **Two classification implementations each skipping differently**: the audit reported
+   50 groups, the gate 49; the difference was a group containing an i18next plural key.
+   The root cause was not a miscount — the **gate skipped it, the audit did not**.
+   The audit now imports the gate's `classify_groups()`; the numbers no longer diverge
+2. **An anchor can silently not exist**: the negative validation injected into
+   `'"common.loading": "Loading…"'`, but en.json is nested and the top-level section
+   name is on another line, so it matched **0 places** — the injection became a no-op
+   while the **exit code stayed red**, which looks like a passing validation
+3. **Broken config ≠ broken gate**: when the explained table was malformed the gate
+   raised `JSONDecodeError` — the exit code was still red (CI would block) but the
+   message named neither the file nor the fix. It is now `ExplainedTableError` with
+   **exit 2**, distinct from "wording drift" (exit 1)
+
+**Validation**: negative validation **31/31** (5 groups) · gate self-test **19/19** ·
+full acceptance **34/34** (14 gates + 14 self-tests + tsc + eslint + vitest 211 +
+cargo 1201 + build).
+
+**Still needs a product decision** (not guessed, logged in `docs/TECH_DEBT.md`):
+the zh/en wording of `cost.retry` · a likely mislabelled Chinese string on
+`provider.models` · cleanup of two dead keys.
+
+---
+
+## Unreleased — Wrap-up: website semantics, gate 14, debt ledger (2026-10-01)
+
+This batch is about **wrapping up**, not opening a new front. Every P0/P1/P2 item
+in §2 is now either shipped or explicitly rejected.
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+**Website semantic accessibility (folded into `check-website.py`, contract 11)**
+
+- Five rules: `<html lang>` required · **exactly one `<h1>`** · no heading-level
+  jumps · icon-only `<a>`/`<button>` need an accessible name · `<a>`/`<button>`
+  may not be entirely empty
+- **No second HTML parser was written**: `check-a11y.py`'s criteria are
+  React-specific regexes, while `check-website.py` already has an `html.parser`
+  instance. A second one would be a second implementation — and two
+  implementations always diverge the moment only one of them is edited, with no
+  check catching the half that drifted
+- Self-test 24 → **33**, negative verification 10 → **15/15**. The real site passes first try
+
+**The 14th gate: `check-self-test-counts.py` (a gate about gates)**
+
+- The ledger table "how many self-test cases does each of the 14 gates have"
+  **can only be written by hand**. Measured: **9 of 13 produce no readable
+  number** — they only print "all passed". Hands err, and the error is invisible
+  in the exit code
+- The fix is **not** to rewrite 13 working self-tests to satisfy a document;
+  it is to automate the cross-check. This gate runs every self-test on each CI
+  pass and compares line by line against the ledger — and **fails if a new gate
+  was never registered there** ("ledger is missing N gates wired into CI")
+- While writing the parser I hit two "it looks like it's reading, but it reads
+  less" bugs: `m.groups() == 2` compares a tuple to an int and is always false
+  (`ui-states`' 9 became 5), and `\S*?` cannot cross a space (`licenses`' 26
+  became 7). **Neither turns the exit code red**
+- Self-test 14/14 + negative verification 4/4
+
+**New `docs/TECH_DEBT.md`: the single registry of what is still owed**
+
+- Items scattered across a dozen "next batch" sections are collected into one
+  table: **6 tech debts / 2 content debts / 3 product decisions / 5 rejected
+  items** (including the condition under which each rejected item may be reopened)
+- Along the way, several long-copied stale numbers were corrected:
+  `ConfigPage.tsx` 1148 → **665** lines; the `chatSlice.ts` path moved from
+  `src/stores/` to **`src/stores/slices/`** (the old path **does not exist** and
+  was referenced five times); i18n duplicate keys "zh 5 / en 4" → **120 / 0 / 49**
+
+**One methodology note**
+
+- **"Green again after restore" does not mean "the file is back to normal"** —
+  a gate only judges what it cares about. A dedicated residue check was added:
+  16 probes (injection markers plus the content that should be present), each asserted
+- Same family as "the injection must actually take effect": **both ends of a
+  negative run need checking** — the start ("did the injection land?") and the
+  end ("did the restore clean up?")
+
+---
+
+## Unreleased — Gates 12 & 13: website boundary and i18n wording consistency (2026-10-01)
+
+This batch adds no features. It closes two outstanding gaps: **places where
+something can break without any check noticing.**
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+**The 12th gate: `check-website.py`**
+
+- All 11 previous gates scan **only `src/` and `docs/`**, while the website is the
+  first thing a user sees: a dead link, a missing image, an anchor pointing nowhere,
+  or somebody adding a CDN reference — none of it trips a single check
+- The most important of the 10 contracts is that **resources must not be remote**:
+  the site has to open on intranet machines, a CDN outage means a blank page, and a
+  blank page is worse than an ugly one. **`<a href>` is exempt** — outbound links
+  are what a web page is for
+- Self-test 24/24 + negative verification 10/10
+
+**Real gap it caught in the site**
+
+- `meta.description` had an **empty `content`** (bad for SEO, and it was marked as a
+  slot awaiting text). The gate caught it; a placeholder is now in place
+
+**The 13th gate: `check-i18n-wording.py`**
+
+- i18n wording drift is **purely visual**: no compile error, no test failure, nothing
+  reports it. A user just sees `Copy Path` in one place and `Copy path` in another
+- A fresh survey splits it three ways: 120 groups identical (normal — a nav item and
+  a page title *should* share a sentence) / **14 groups differing only in case,
+  31 keys** (mechanically decidable) / **49 groups using a different word, 149 keys**
+  (needs human judgment)
+- The 14 groups are now unified to sentence case. The choice came from **two
+  independent rules that agree**: file-wide word frequency settled 6 of them (every
+  winner came out sentence case), and the remaining 8 were settled by scope — they
+  are in-widget labels, not panel titles
+- The 49 different-word groups are **not gated**: `Delete` (a button) versus `Removed`
+  (a diff statistic) should differ by position, and a hard rule would only force a
+  single "right answer" that is wrong half the time. Full list in
+  `docs/I18N_WORDING_AUDIT.md`
+- Self-test 8/8 + negative verification 6/6
+
+**How the i18n file was changed**
+
+Per-key string replacement, **not** a full JSON rewrite. The diff is **14 lines**;
+2325 keys are byte-for-byte untouched. Two traps along the way: the file stores
+*nested* keys, so matching against a flattened path never lands; and one leaf key
+appears twice, so anchoring on the leaf alone edits the wrong place. The correct
+approach anchors on leaf **plus** old value, and reports rather than edits when the
+match count is not exactly one.
+
+**A new way a self-test can silently fail**
+
+- The self-test once reported "**24/25**" while printing **no FAIL line at all** —
+  red exit code, no visible cause. The total had been over-counted by one
+- **A counting criterion that miscounts does not error**; it just prints a number
+  that looks like the gate is broken. The fix is a guard assertion that makes the
+  tally report itself, and the guard is then itself covered by the negative run
+- The same mistake happened twice in one day, which makes it the **default failure
+  mode of this kind of script**: any script printing "N/N" needs that guard
+
+---
+
+## Unreleased — Website skeleton (P2-5, content pending) (2026-10-01)
+
+The last of the three commercialization items. This batch ships **structure only,
+not a single word of copy** — the text is filled in later, and every slot is left
+as a placeholder carrying a `data-fill` key.
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+**New: `website/` standalone static site**
+
+- Single-page landing skeleton: header nav / hero / feature cards / screenshots /
+  downloads / FAQ / footer, with responsive layout and light-dark support in place
+- **No build step, no third-party CDN.** System font stack, inline SVG icons — the
+  site has to open on offline and intranet machines, and a CDN outage means a
+  blank page
+- Assets wired up: `screenshots/01` and `07` are copied into the site directory and
+  used in the hero and the screenshot section
+- Every fill-in slot carries a `data-fill="section.field"` key; the conventions live
+  in `website/README.md`. Attributes rather than Chinese placeholder text, so that
+  filling content in bulk never has to parse prose — and never silently breaks
+  when the prose is edited
+
+**Fully isolated from the desktop app**
+
+- The site does **not** take part in `npm run build`. `src/index.css` gained
+  `@source not "../website"`: Tailwind v4's automatic scanning works per file
+  rather than per extension, so without it the site's class names end up in the
+  desktop bundle
+- Styles do not share the app's `--app-*` tokens and use `--site-*` instead. A theme
+  change on the desktop side silently rewriting the website is pure downside when
+  the two have completely different audiences
+
+**Fixed along the way**
+
+- Two "currently **68** migrations" counts in the Chinese and English READMEs — the
+  gate's pattern is "个迁" while the text says "个**顺序**迁移", so the check never
+  matched and the number has drifted since the second batch. **Numbers outside the
+  criteria expire silently**
+- `check-docs.py` now derives its self-test case count by scanning its own source
+  (the docs previously said 12 cases while the real number was 11, and nothing
+  reported it)
+
+---
+
+## Unreleased — License tier model (P2-2) and the 11th entitlement-boundary gate (2026-10-01)
+
+Positioning: write down *what the free tier gets and what Pro adds* as a **model**
+first, payment second. This batch does not touch payments — the outermost shell of
+the commercialization path is built now, checkout goes in last.
+
+This release does not change the scale: the `TOOL_SPECS` to **204**, the migration count reaches **85**.
+
+**New: license tiers (local tiering, no payment)**
+
+- Three tiers Free / Pro / Team, five capability switches: multi-provider pool,
+  team sharing, eval reports, LAN collaboration, audit trail
+- The free tier is **fully functional locally**: sessions, builds, deploys, indexing,
+  and diagnostic bundles all work. Only collaboration features and the Agent quota
+  are limited (CNY 50/month budget · 200 runs · 2000 tool calls)
+- Pro/Team set **no local ceiling**. Real cost belongs on the server; hardcoding a
+  number in the client only gives people the false impression that a limit is in
+  effect, which is worse than no limit at all
+- The tier is stored in the local `settings` table and `set_license_tier` has no
+  payment step. To go production, swap `current_tier` to read a server-signed
+  entitlement — no other code has to change
+
+**Capability gating governs "who may switch a feature on", never "who may switch it off"**
+
+- All 11 gated entry points go through the `licensing::check()` gateway.
+  `auto_pool_mode == 0` is **always allowed** — blocking the "off" path would trap
+  a downgraded user with the pool stuck on and no in-app way out
+- Three deliberate exemptions: `get_lan_server_status` and `get_lan_ips` are
+  read-only local state that the license and LAN pages need in order to show
+  "this feature requires Team" instead of an error; `revoke_lan_token` is a
+  **closing action, not an opening one** — gating it would mean tokens already
+  handed out can never be taken back after a downgrade
+- Quotas reuse the existing `agent_quota_usage` counter. A second counter is bound
+  to drift from real usage, and a drifted quota system lets over-limit users through
+
+**New: license page `/license`**
+
+- Shows the current tier's entitlements, quota usage (used / limit / breached) and history
+- All six UI states are covered: loading, empty, partial, failed, retry, permission
+
+**The 11th gate: `check-entitlement-gate.py`**
+
+- 7 contracts: gated commands must pass the gateway, gated services must not be
+  called directly, tier comparisons may only appear in `licensing.rs`, every
+  capability enum member must be present in the matrix, the free tier must not
+  contain collaboration features, the downgrade direction must not be blocked,
+  and the frontend must not keep its own copy of the matrix
+- Self-test 8/8 + negative verification 14/14 (including one end-to-end case:
+  making the gateway always allow makes the Rust tests fail immediately)
+- "The free tier must not contain collaboration features" is a product decision that
+  **only a gate can pin down** — if code changes it quietly there is no compile
+  error, just complaints on the first day of commercialization
+
+**Fixed along the way**
+
+- 16 count drifts across the Chinese and English README / ARCHITECTURE. Two of them
+  (`68 sequential migrations`, `309 IPC registration entry points`) were outside the
+  gate's pattern coverage entirely — **numbers outside the criteria expire silently**,
+  and "ran the gate and everything was green" would never have caught them
+
+---
+
+## Unreleased — One-click diagnostic bundle export (P2-3) and the 10th privacy-boundary gate (2026-10-01)
+
+Positioning: a support path users are **willing to send to a stranger**. It is the
+exact opposite of the existing "Export backup" — a backup *is* your data; a
+diagnostic bundle contains no user content at all.
+
+No scale change in this batch: the `TOOL_SPECS` to **204**, the
+migration count reaches **85**.
+
+**New: one-click diagnostic bundle**
+
+- Settings → Data gains a dedicated "Diagnostic support" block with a
+  **preview → export** two-step flow. The preview lists every file that will be
+  written, its size, and how many records each error source contributed.
+  On export the backend verifies the digest of "what you previewed" against
+  "what gets written" and refuses on mismatch
+- Contents: app version / host / database schema version and row **counts only**
+  + recent task, model-request, tool, agent-run failures and SLO alerts
+  + a tail of device-side hilog. The bundle's own `README.txt` states what is
+  **not** included
+- Errors come from 5 sources (`task_runs` / `request_logs` / `tool_runs` /
+  `agent_runs` / `agent_alerts`) plus the device runtime-log ring buffer. Each
+  source is capped; when a cap is hit the preview **says so explicitly**
+
+**Privacy boundary (the point of this batch)**
+
+- The bundle never SELECTs user-content columns: conversation titles and message
+  bodies, task goals, tool inputs/outputs, project names, conversation IDs and
+  provider names are all excluded. `provider_id` survives only as a boolean
+- Error text is the single free-text exit and passes three stages: secret and
+  identity-pattern redaction → path redaction → **user-content landmark
+  comparison**. Landmarks come from task goals / conversation titles / project
+  names / recent user messages; a hit replaces the whole field with a placeholder
+- **The landmark stage was forced in by the end-to-end tests.** Pattern redaction
+  stops secrets and paths, but it cannot stop "the runtime copied the user's
+  text into the error message" — arbitrary user text matches no sensitive
+  pattern. That is a boundary of redaction, not a sloppy implementation
+- Gate and tests cover different halves: the **gate guards outlet structure**
+  (which columns are selected, through which accessor) and the **tests guard
+  predicate effectiveness** (whether redaction and comparison actually hold).
+  The boundary is written into the script's docstring rather than glossed over
+
+**10th gate: `check-diagnostic-boundary.py`**
+
+- Three tiers: **A forbidden** (user-content columns, never selected in any
+  scope) / **B restricted** (error-text columns only via `row.clean(...)`,
+  `provider_id` only via `row.present(...)`) / **C free**
+- Judged **per function scope**: reading `messages.content` inside
+  `collect_landmarks` is the defence, reading the same column inside `collect`
+  is the hole — the criteria must tell those two apart for an identical SELECT
+- 44/44 self-tests + 12/12 negative validations (including 1 end-to-end: neutering
+  the landmark predicate makes the Rust test report the leak)
+- Wired into CI with the same blocking power as the other nine gates
+
+**Also fixed along the way**
+
+- The second, private copy of path redaction in `reproduction_bundle.rs` moved
+  into `utils::redact`; both sides now share one implementation (a copy drifts:
+  missing one regex is a silent leak)
+- Fixed 1 undefined CSS token introduced in this batch's UI (`--bg-subtle`, which
+  the browser silently discards), 15 count drifts across README/ARCHITECTURE,
+  and 2 new clippy warnings
+
+---
+
+---
+
 ## v2.3.0 — Verdict-Blindness Fixes, Tighter Acceptance and Eval Rules, Rebuilt Huawei Docs Fetch (2026-10-01)
 
 Positioning: the core of this release is a dedicated audit of "**the report says everything is
@@ -147,6 +1692,64 @@ below). Also included: the rebuilt Huawei docs fetch pipeline and backfilled API
 - The tool protocol (`ToolResultV2`) is unchanged in this release. The new `missing_artifacts` field
   on `OutcomeInfo` is an optional addition that older readers ignore, so it is not a breaking
   change.
+
+**UI refinement and commercialization push (this round)**
+
+- Fixed 6 CSS variables that were **never defined** (`--bg-muted` / `--bg-tertiary` / `--info` /
+  `--muted` / `--danger-border`, 16 references failing silently), and added `check-css-vars.py`
+  to block them permanently.
+- Collapsed 15 arbitrary font sizes into a 7-step ladder — and **actually wired the ladder up**:
+  1238 places had been written as literals, so the ladder was decoration. Interface text size
+  is now adjustable from Config, scaling 1299 token references and 375 Tailwind named sizes together.
+- Rewrote the settings page from a bare JSON textarea into three sections. Investigation showed
+  `deveco.jsonc` is **not** this app's settings (they live in localStorage), so edits there did
+  nothing — a more fundamental problem than being hard to use.
+- Added a three-step first-run guide, unified empty states onto `EmptyState`, brought the command
+  palette up to combobox semantics, and added three-tier `prefers-reduced-motion` degradation.
+- `Home` chunk 703.0 → **416.3KB**: productizing the sourcemap attribution showed the real weight
+  was the pinyin dictionaries (286KB packaged, 30.7% of the chunk), which are now lazy-loaded.
+  The bundle budget is tightened from 750KB to **440KB** accordingly.
+- **Added local usage stats** (P2-1): off by default, local SQLite only, no upload path anywhere,
+  event names restricted to a whitelist. Adds the `usage_events` table, bringing the database
+  migration count reaches **85**, with 39 `commands/` modules, 313 Tauri IPC entry points and
+  17 React pages. The tool count remains `TOOL_SPECS` to **204** (no Agent tools added or removed
+  in this round).
+- **Added About / license page** (P2-4): ships `LICENSE` (MIT) and establishes the license
+  boundary of all 724 components (692 permissive / 26 notice / 5 copyleft, all MPL-2.0
+  introduced by Tauri / 1 unknown) — **no GPL, AGPL or SSPL**. `/about` can export
+  `NOTICE.txt`.
+- **Density and typography now finished** (P1-4): at the default 1100×720 window the
+  conversation list shows **7 rows instead of 6 (+16.7%)**, and row height goes
+  50.09px → **45.09px, uniform across all rows**. The half that previously could not be
+  verified (spacing) now has a measurement net and a gate.
+- **Ninth gate, `check-density.py`**: the judge is "the number of fully visible rows must
+  not fall below the committed value", split into a contract layer (both platforms) and a
+  measurement layer (windows-latest re-measures on the spot). **Zero new dependencies** —
+  it drives the system Edge over CDP using Node 22's built-in `WebSocket`, deliberately
+  avoiding Playwright/Puppeteer.
+- **The CSS-variable gate gained its other half**: it previously only checked "referenced
+  but not defined"; it now also checks "**defined but never consumed**" — equally silent,
+  since the line sits in `index.css` in plain sight and the next reader assumes it works.
+  Six dead tokens were deleted, three of them **duplicate names with byte-identical values**
+  (`--success-500` = `--success`, in both dark and light), and one had an **invalid CSS value**.
+  Another 16 are recorded in an allowlist that carries a reason per entry, and **an entry
+  goes red once it is no longer needed**.
+- 8 Python gates added in total (CSS variables / font sizes / empty states / a11y /
+  telemetry contract / licenses / density / gate self-tests in CI).
+
+**Several "the number was right but meaningless" problems fixed in this round** (none of
+them raise an error, and neither grep nor a screenshot can see them):
+
+- The message list is virtualized, so the number of entries in the DOM is **not** the
+  total (30 messages mount only 5). The total is now reported by the app itself, and the
+  probe only checks "total ≥ mounted".
+- A session row's short-ID badge is `opacity-0` by default (completely invisible) yet
+  still reserved about 29px of horizontal space. As soon as an archive badge appeared it
+  pushed that line to wrap, doubling the row height from 50px to 66.5px.
+- Every one of the 40 fake conversations in the measurement fixture was stamped a year
+  ago, so all of them triggered the "cleanup?" badge — the baseline was measuring the
+  **worst case, not the typical case**. The measurement clock is now frozen, and a gate
+  requires the fixture to cover 4 time groups plus both archive-badge states.
 
 ## v2.2.0 — Structure-First Navigation, Multi-Language Write Gates, and a Trustworthy Execution Kernel (2026-09-15)
 

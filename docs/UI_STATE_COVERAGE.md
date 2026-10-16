@@ -48,11 +48,12 @@
 - `scripts/check-ui-states.py`：扫描 `src/pages/*.tsx`，校验声明存在性、状态名合法性、声明与代码证据一致性；支持 `--self-test` 合成样例回归与 `--report` 审计报告。
 - CI：`quality.yml` Frontend 步骤运行该脚本，任一页面未声明或不一致即阻断合并。
 
-## 现状审计矩阵（2026-08-22）
+## 现状审计矩阵（2026-08-22 首轮；2026-10-01 新增 UsagePage 与 AboutPage）
 
 | 页面 | loading | empty | partial | failed | retry | permission |
 |---|---|---|---|---|---|---|
 | ApiKnowledgePage | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| AboutPage | ✓ | – | – | ✓ | – | – |
 | ConfigPage | ✓ | – | – | ✓ | ✓ | – |
 | CostPage | ✓ | ✓ | ✓ | ✓ | ✓ | – |
 | HealthPage | ✓ | – | – | ✓ | ✓ | – |
@@ -60,6 +61,7 @@
 | KnowledgePage | ✓ | ✓ | – | ✓ | – | – |
 | LanPage | delegated（状态由 LanPanel/LanTokenPanel 承载） | | | | | |
 | LimitsPage | ✓ | ✓ | – | ✓ | – | – |
+| LicensePage | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | McpPage | ✓ | ✓ | – | ✓ | ✓ | – |
 | OhpmPage | ✓ | ✓ | – | – | ✓ | – |
 | ProvidersPage | – | ✓ | – | ✓ | ✓ | – |
@@ -67,10 +69,14 @@
 | ReproductionBundlesPage | ✓ | ✓ | – | ✓ | ✓ | – |
 | SkillsPage | ✓ | ✓ | – | ✓ | ✓ | ✓ |
 | TeamSharingPage | ✓ | ✓ | – | ✓ | ✓ | – |
+| UsagePage | ✓ | ✓ | – | ✓ | ✓ | – |
 | VersionsPage | ✓ | ✓ | – | ✓ | – | – |
 
 说明：
 
 - 审计依据为声明与代码证据一致性校验（门禁脚本），"–" 表示该页面当前未声明/未实现该状态。
+- **矩阵必须覆盖 `src/pages/*.tsx` 的每个页面**（`*.test.tsx` 除外），由 `scripts/check-ui-states.py` 校验。
+  这条是补上的：矩阵原先纯手写、无任何门禁盯着，于是 P2-1 新增 UsagePage 时它被静默漏掉——
+  读者拿它回答「某页有没有 permission 态」时会得到「表里没这一行」而不是「没有」。
 - 已知改进方向（不阻塞门禁）：OhpmPage 的失败处理目前以 catch 静默降级为主，建议补充失败提示与重试入口；ProvidersPage 缺少显式 loading 态；KnowledgePage 与 LimitsPage 建议补重试入口。
 - 门禁保证"新增与修改"不再出现未声明的状态盲区；存量缺口按上述方向渐进补齐。

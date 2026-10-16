@@ -6,6 +6,7 @@ import { getSystemProxy } from '../api/update'
 import { getItem, setItem } from '../utils/storage'
 import { STORAGE_KEYS } from '../constants'
 import { Skeleton } from '../components/ui/Spinner'
+import { EmptyState } from '../components/ui/EmptyState'
 
 export default function VersionsPage() {
   const { t } = useTranslation()
@@ -121,7 +122,7 @@ export default function VersionsPage() {
       ) : (
         <div className="space-y-2 max-h-96 overflow-y-auto">
           {versions.length === 0 && !fetchError && (
-            <p className="text-sm text-[var(--text-secondary)]">{t('version.empty')}</p>
+            <EmptyState compact icon="package" title={t('version.empty')} />
           )}
           {versions.map((v) => (
             <div

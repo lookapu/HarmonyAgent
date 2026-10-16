@@ -38,14 +38,144 @@ jobs:
       # 避免 README/ARCHITECTURE 等文档中的数字、链接与实现脱节。
       - name: Documentation drift check (Q-08)
         run: python scripts/check-docs.py
+      # `npm run lint -- --max-warnings 0` 在 npm 10 上会被拆成 `eslint . 0`：
+      # `--max-warnings` 被 npm 自己吃掉，`0` 剩下变成一个文件名 pattern，
+      # 于是这一步恒定报 "No files matching the pattern \"0\"" 失败——
+      # 也就是说**这一条 CI 门禁一直没真正跑过 eslint**。直接用 npx。
       - name: Frontend lint
-        run: npm run lint -- --max-warnings 0
+        run: npx eslint . --max-warnings 0
       # Q-04：UI 状态覆盖门禁。每个页面必须头部声明 @ui-states 且声明与代码证据一致，
       # 新增/修改页面未声明或状态覆盖不一致时阻断合并（见 docs/UI_STATE_COVERAGE.md）。
       - name: UI state coverage gate (Q-04)
         run: python scripts/check-ui-states.py
+      # 自定义属性未定义时浏览器**静默作废**整条声明——没有构建错误、没有测试失败，
+      # 只有用户看到「hover 没反应」。本项目真实踩过：--bg-muted / --bg-tertiary /
+      # --info / --muted / --danger-border 共 6 个 token、16 处引用全部静默失效，
+      # 其中一处让上下文预算条的 archive 段恒为 0 宽、一处让「未下载」状态点不显示。
+      - name: CSS variable gate
+        run: python scripts/check-css-vars.py
+      # 字号是全库出现最多的视觉决策，也是最容易漂移的（一度 15 种任意字号并存）。
+      # 允许值从 src/index.css 的 --app-text-* 阶梯解析，不在本脚本里另抄一份。
+      - name: Font size ladder gate
+        run: python scripts/check-font-sizes.py
+      # 空态是用户「什么都没看到」时唯一看到的东西，也是唯一告诉他下一步的机会。
+      # 2026-10-01 普查：16 个页面 11 处空态各写各的，其中 6 处「暂无 X」后没有任何下一步。
+      # 例外白名单按文件锚定（表格单元格 / 带标题的章节 / 通知下拉），理由写在脚本里。
+      - name: Empty state consistency gate
+        run: python scripts/check-empty-state.py
+      # 可访问性缺陷与死 CSS token 同族：「代码看起来做了，读屏里什么都没有」。
+      # 图标按钮无可见文字时必须有 aria-label；role= 必须成套（tab↔tablist/tabpanel、
+      # option↔listbox）。只管语义存在性，不含对比度与焦点顺序（那需要真浏览器 + axe）。
+      - name: A11y baseline gate
+        run: python scripts/check-a11y.py
+      # 埋点事件名在前后端 + i18n + IPC 四方各存一份。漂移的后果是**静默**的：
+      # 前端多一个事件名 → 后端抛 InvalidParameterName，而正常路径吞掉错误 →
+      # 面板上少一行，**没有任何地方报错**。构建期那道门就是为此存在。
+      - name: Telemetry contract gate
+        run: python scripts/check-telemetry-contract.py
+      # 第三方许可：清单必须与 lockfile 一致；非宽松依赖必须有带 reason/obligation
+      # 的显式豁免；GPL 系硬阻断。门禁不能自己重写 SPDX 解析——
+      # 那样会把 `MIT OR Apache-2.0 OR LGPL` 里的 LGPL 误当成强制 copyleft
+      # （本项目真实踩过：生成器判对、门禁判错，门禁比真源还严）。
+      - name: Third-party license gate
+        run: python scripts/check-licenses.py
+      # P1-4 的验收网。判据是「1100×720 下多显示约 N 行会话」这个**可计数**的量，
+      # 不是像素 diff：字体渲染跨机器不一致，像素阈值只能调宽到失去意义，
+      # 而二进制基线进 git 又是一堆不可读的 diff。
+      # 门禁分两层，缺一不可：
+      #   - 契约层（两个平台都跑）：基线自洽 + 目标不得高于实测 + 定位点齐全 +
+      #     fixture 字段与 src/api/project.ts 对账 + fixture 形态覆盖
+      #   - 数字层（只在 windows-latest 跑）：现场量一次，与入库目标对照
+      # 数字层只在 Windows 跑，因为 runner 预装 Edge，而字体渲染本就跨浏览器不同；
+      # 放在两个平台各判一次等于给自己制造天天红的假回归。
+      - name: Layout density gate (contract)
+        run: python scripts/check-density.py
+      # 诊断包隐私边界（P2-3）。这是**唯一一道后果不可逆的门禁**：
+      # 其余门禁挂掉是界面难看或构建失败，这一道挂掉是用户内容进了
+      # 一个准备发给客服的 zip，而泄漏是静默的——用户全程没有察觉。
+      # 门禁管「出口结构」（哪些列被 SELECT、经哪个访问器取用），
+      # Rust 端到端测试管「谓词有效」（脱敏与地标比对真的挡住了没有），
+      # 两道网各管一段，互不替代。
+      - name: Diagnostic bundle privacy gate (P2-3)
+        run: python scripts/check-diagnostic-boundary.py
+      # 授权分级边界（P2-2）。分级模型真正的风险不是「档位定错」，
+      # 而是**有人绕过网关**——失效的表现是免费用户能用上 Pro 功能，
+      # 那种 bug 要到有人投诉「我白嫖了」才会被发现。
+      - name: Entitlement gate (P2-2)
+        run: python scripts/check-entitlement-gate.py
+      # 官网边界（P2-5）。前面十一道门禁**全部只扫 src/ 与 docs/**，
+      # 而 website/ 是用户第一眼看到的东西——链接失效、图片 404、导航锚点指空、
+      # 有人加一行 CDN 引用，这些都不会让任何检查报红。
+      # 「资源不得走外链」钉的是离线可用：官网要在内网机器上能打开，
+      # CDN 一挂就白屏，而白屏比丑糟得多。`<a href>` 不受限——外链是网页的本职。
+      - name: Website boundary gate (P2-5)
+        run: python scripts/check-website.py
+      # i18n 措辞一致性。漂移的症状是**纯视觉**的：没有编译错误、没有测试失败、
+      # 没有任何地方报错，用户只是看到同一个词一会儿写 Copy Path 一会儿写 Copy path，
+      # 于是怀疑这界面是不是没做完。
+      # 只硬拦「仅大小写不同」这一档；Delete/Removed 这类换了词的**不拦**——
+      # 它们需要上下文判断，硬拦只会逼人编一个对的位置是错的统一答案。
+      - name: i18n wording consistency gate
+        run: python scripts/check-i18n-wording.py
+      # 懒加载必须真的懒。2026-10-01 真实踩到过一个**静默**缺陷：
+      # Home.tsx 里三块面板各写一行 lazy(() => import('.../devicePanels'))，
+      # 看着是「分别懒加载」，而打包器对**同一模块**的多次 import() 只产出一个 chunk
+      # （63.6KB）——于是那三行 lazy 全部白写，打开任一面板都把另外两块一起下载。
+      # 那个缺陷 tsc / eslint / vitest / build / 体积门禁**全绿**：
+      # 「同一个模块」在类型和语义上都没错，只是没分包。
+      # 本门只拦**客观为空操作**的两种：目标路径拼不出文件、目标已被静态 import 触达。
+      # 「N 行 lazy 应当是 N 个不同模块」**不判**——多个组件共用一个懒加载模块是合法写法。
+      - name: Lazy import effectiveness gate
+        run: python scripts/check-lazy-graph.py
+      # 门禁自测条数表必须与真源一致。这道门是**门禁的门禁**：
+      # 台账里那张「13 道门各多少条自测」的表只能靠人抄，而本项目已经被这件事咬过三次
+      # （i18n 的「zh 5/en 4」抄了六遍六遍都错、docs 的「12 条」实际 11、
+      #  某门输出「24/25」却一条 FAIL 都没打印）。
+      # 不去改 13 个门禁的输出格式去迁就文档——那代价与风险都更大；
+      # 正确的做法是让**核对自动化**。
+      - name: Gate self-test count audit
+        run: python scripts/check-self-test-counts.py
+      # 第 16 道门禁：长中文经工具写入时会偶发把一个汉字写成字面 `U+FFFD`。
+      # 它**完全静默**——文件仍是合法 UTF-8、长度与行号都不变、类型检查与 lint 全绿，
+      # 只有一个字没了，而它常常恰好在语义最关键的位置（主/辅、存/档、需/要）。
+      # 2026-10-08 立：一次扫出 8 处历史损坏，分布在文档、脚本与源码注释里。
+      - name: Encoding damage check
+        run: python scripts/check-encoding-damage.py
+      # 门禁**自身**的合成样例回归。七道门禁的判据都被逐步调宽/调窄过
+      # （本项目真实发生过：多行 EmptyState 被误判、role 跨文件统计构造不出失败、
+      # 给字号加缩放包装后解析正则全线失效、CHANGELOG 历史段旧数字被当成漂移）。
+      # 判据一旦被改坏，门禁会「永远绿」——那比没有检查更糟，因为它让人以为
+      # 这一类问题有人管。故自测与门禁同等阻断力。2026-10-01 补上 check-ui-states
+      # 与 check-docs 两组：它们判定面最宽（扫全库），却此前只有本地跑。
+      - name: Gate self-tests
+        run: |
+          python scripts/check-css-vars.py --self-test
+          python scripts/check-font-sizes.py --self-test
+          python scripts/check-empty-state.py --self-test
+          python scripts/check-a11y.py --self-test
+          python scripts/check-ui-states.py --self-test
+          python scripts/check-docs.py --self-test
+          python scripts/check-telemetry-contract.py --self-test
+          python scripts/check-licenses.py --self-test
+          python scripts/check-density.py --self-test
+          python scripts/check-diagnostic-boundary.py --self-test
+          python scripts/check-entitlement-gate.py --self-test
+          python scripts/check-website.py --self-test
+          python scripts/check-i18n-wording.py --self-test
+          python scripts/check-lazy-graph.py --self-test
+          python scripts/check-self-test-counts.py --self-test
+          python scripts/check-encoding-damage.py --self-test
       - name: Frontend production build
         run: npm run build
+      # 密度门禁的数字层：**必须在 build 之后**——探针是从 dist/ 起静态服务的，
+      # 放在 build 之前会因为找不到 dist/index.html 而失败。
+      # 只在 windows-latest 跑：runner 预装 Edge，而字体渲染本就跨浏览器不同，
+      # 两个平台各判一次等于给自己制造天天红的假回归。
+      - name: Layout density gate (measure, windows only)
+        if: matrix.os == 'windows-latest'
+        run: |
+          node scripts/layout-probe.mjs --json-out target/layout-fresh.json
+          python scripts/check-density.py --fresh target/layout-fresh.json
       - name: Rust tests
         env:
           # Windows 测试线程默认 2MB 栈：compose→run_tool 链在 debug 模式栈帧需求 2~3MB，

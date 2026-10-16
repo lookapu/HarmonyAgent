@@ -1,0 +1,61 @@
+{
+  "$comment": [
+    "非宽松第三方依赖的**显式豁免清单**。scripts/check-licenses.py 只允许这里出现过的项。",
+    "每加一条必须写 reason：这是给法务和未来的人看的「为什么可以放行」，不是备注。",
+    "删条目 = 门禁报红，这是刻意的：移除豁免必须是一个显式动作。",
+    "",
+    "tier 取值：copyleft（MPL-2.0 及更严）/ unknown（无可判定 SPDX 标识）",
+    "lastReviewed 由 check-licenses.py 校验存在性，不校验日期新鲜度——",
+    "  自动判定「多久该复审」没有意义，只有真做过复审的人才知道。"
+  ],
+  "entries": [
+    {
+      "ecosystem": "cargo",
+      "name": "cssparser",
+      "tier": "copyleft",
+      "reason": "MPL-2.0 文件级 copyleft。经 dom_query → tauri-utils → **tauri** 引入，非本项目直接选型；除非替换 Tauri，否则无法移除。",
+      "obligation": "分发时需附带其许可文本；本项目若**修改过**这些文件，修改后的文件须以 MPL-2.0 开放。",
+      "lastReviewed": "2026-10-01"
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "cssparser-macros",
+      "tier": "copyleft",
+      "reason": "cssparser 的过程宏宏包，同一条引入链。",
+      "obligation": "同 cssparser。",
+      "lastReviewed": "2026-10-01"
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "dtoa-short",
+      "tier": "copyleft",
+      "reason": "cssparser 的依赖，同一条引入链。",
+      "obligation": "同 cssparser。",
+      "lastReviewed": "2026-10-01"
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "option-ext",
+      "tier": "copyleft",
+      "reason": "MPL-2.0。经 dirs-sys → dirs → **tauri** 引入。",
+      "obligation": "同 cssparser。",
+      "lastReviewed": "2026-10-01"
+    },
+    {
+      "ecosystem": "cargo",
+      "name": "selectors",
+      "tier": "copyleft",
+      "reason": "MPL-2.0。经 dom_query → tauri-utils → **tauri** 引入。",
+      "obligation": "同 cssparser。",
+      "lastReviewed": "2026-10-01"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "@ohos/hvigor",
+      "tier": "unknown",
+      "reason": "华为包声明 SEE LICENSE IN LICENSE.txt，但实际分发的是 **NOTICE.txt**（包内不存在 LICENSE.txt），无 SPDX 标识，故无法静态判定。该 NOTICE 内容为 Node.js 18 各组件的版权清单（Intel/BSD、OpenSSL、V8、zlib、Chromium/BSD 等，均为宽松许可）。",
+      "obligation": "商用分发前**需人工确认** Huawei 的实际授权条款。About 页已标注为「非 SPDX 标识」。",
+      "lastReviewed": "2026-10-01"
+    }
+  ]
+}
