@@ -141,6 +141,13 @@ jobs:
       # 2026-10-08 立：一次扫出 8 处历史损坏，分布在文档、脚本与源码注释里。
       - name: Encoding damage check
         run: python scripts/check-encoding-damage.py
+      # 第 17 道门禁：i18n 词库里同名键写两次，**先出现的那条永远不会显示**
+      # （JSON 解析保留最后一个）。实测两词库共 9 处，全在 `home` 块内。
+      # 它**完全静默**——词库是合法 JSON，tsc/eslint/vitest/build 全绿，
+      # 而 check-i18n-wording.py 也看不见它：那道门用裸 json.loads，
+      # 解析器已经替它把重复键丢掉了。两者互补而非重叠。
+      - name: i18n duplicate key gate
+        run: python scripts/check-i18n-dupe-keys.py
       # 门禁**自身**的合成样例回归。七道门禁的判据都被逐步调宽/调窄过
       # （本项目真实发生过：多行 EmptyState 被误判、role 跨文件统计构造不出失败、
       # 给字号加缩放包装后解析正则全线失效、CHANGELOG 历史段旧数字被当成漂移）。
@@ -165,6 +172,7 @@ jobs:
           python scripts/check-lazy-graph.py --self-test
           python scripts/check-self-test-counts.py --self-test
           python scripts/check-encoding-damage.py --self-test
+          python scripts/check-i18n-dupe-keys.py --self-test
       - name: Frontend production build
         run: npm run build
       # 密度门禁的数字层：**必须在 build 之后**——探针是从 dist/ 起静态服务的，

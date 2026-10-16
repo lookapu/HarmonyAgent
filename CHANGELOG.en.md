@@ -781,6 +781,112 @@ be an engineering judgement; it would be making a product decision on the user's
 `task_guard` self-tests **7** (+3) · mutations **5/5** · full `cargo test` ·
 `check-i18n-wording.py` green · gates **38/38**.
 
+### **9 keys written twice** in the translation files; the first copy can never display (gate 17)
+
+JSON permits duplicate keys, and `JSON.parse` / Python `json` / `serde_json`
+**all keep the last one and silently drop the earlier ones**. Measured:
+**5** in `zh.json`, **4** in `en.json` — **all inside the top-level `home` block**.
+
+#### How silent it is — **the other i18n gate cannot see it either**
+
+`tsc` / `eslint` / `vitest` / `build` all green is routine.
+The notable part is `check-i18n-wording.py`: all three of its parse sites
+(lines 183 / 512 / 513) call bare `json.loads(raw)` —
+**the parser has already thrown the duplicate keys away for it**.
+
+⇒ The two i18n gates are **complementary, not overlapping**: one covers duplicate
+keys, the other covers wording, and **neither can find the other's blind spot**.
+
+#### "Whether to delete" and "which one to keep" are two different questions
+
+Only the last value is ever used at runtime, so **deleting the shadowed copy is a
+zero-behaviour-change edit** regardless of which wording is correct; but **which
+one should stay** is a wording decision.
+
+| Category | Count | This batch |
+|---|---:|---|
+| Both copies **textually identical** | 4 | **Deleted** (not even a wording question) |
+| The two copies **differ** | 5 | Whitelisted, logged as content debt **C-4** for a human |
+
+Collapsing this into "duplicate keys are just cruft, delete them" would have made
+5 wording decisions on the user's behalf.
+
+`home.forkFromHere` has an extra layer: **the Chinese changed and the English did
+not**. The two `zh` values differ ("从这里分叉" / "从此派生会话") while both `en`
+values are identical and both are literal translations of the *old* Chinese
+⇒ the current Chinese string **has no counterpart in English**.
+`check-i18n-wording.py` structurally cannot catch this: it compares casing and
+word substitutions, and translations of the same key are *supposed* to differ.
+
+#### How "zero behaviour change" was proven
+
+Not by "I don't think it affects anything", but by flattening both files before and
+after and comparing **every key and value**: **2268** leaf keys per file, all
+identical, two lines shorter each. That also shows **deleting duplicates changes no
+number derived from the translation files**.
+
+#### New gate 17 — `scripts/check-i18n-dupe-keys.py`
+
+The criterion covers duplicate keys **within the same object** only —
+the same key name in *different* blocks is fine (`searching` legitimately exists in
+`home`, `nav` and `perf`). Misjudging that turns a gate into noise,
+and **the fate of noise is a whitelist**.
+
+Self-tests **13/13**, mutations **8/8** (sha256-verified restore each time, green baseline):
+
+| Mutation | Real source | Self-test | Load-bearing |
+|---|---|---|---|
+| Only flags keys seen 3+ times | red | red | **Real source** |
+| Top-level objects only, no recursion | red | red | **Real source** |
+| Cross-object same-name also counts | red | red | **Real source** |
+| Whitelist filter inverted | red | red | **Real source** |
+| Whitelist emptied | red | red | **Real source** |
+| Whitelist carries one extra, non-existent key | red | green | **Real source** |
+| Value comparison not normalised | green | red | Synthetic only |
+| No longer reports stale whitelist entries | green | red | Synthetic only |
+
+The two **"synthetic only"** rows are called out honestly: the real source has no
+duplicate whose value is an object (so key-order normalisation is untested by real
+data), and no stale whitelist entry currently exists to report.
+
+#### A real hole found during reverse review: a whitelist can turn from exemption into vulnerability
+
+The first version only blocked duplicate keys that were **not** whitelisted.
+But if someone fixes `zh.json`'s `home.timeline` and forgets to remove the whitelist
+entry, then **any future duplicate at that same key is silently allowed** —
+the whitelist has turned from an exemption into a hole, and **nothing reports it**.
+
+⇒ The whitelist has to stay aligned with the real source in **both** directions:
+unregistered duplicates must be blocked, and **stale entries must be blocked too**.
+Adding that check also gave the criterion itself a **second net**: after M1 / M3
+weakened the criterion, the real source flipped from green to red — and the reason it
+went red was **not** "the duplicate wasn't detected" but **"the five registered
+duplicates can no longer be found"**.
+
+> The self-test caught a bug of mine: the sentinel used a `tuple` to preserve
+> key order, so normalising a value made `json.dumps` serialise objects as
+> **arrays**, pushing key order back into the "same value" decision.
+> "Same value" has to be defined first: **equality by content or by spelling?**
+> By spelling, `{"x":1,"y":2}` and `{"y":2,"x":1}` become two different sentences,
+> though they are the same value in JSON semantics.
+> The same run also caught **my test case being wrong** (I had treated "unregistered"
+> as "stale") — the criterion was right, the expectation was wrong, and both had to
+> change.
+
+#### Also corrected a number that **never existed**
+
+The ledger's "i18n keys **2119**" is checked by **no gate at all**. Replaying
+history under the same counting rule, the closest values are **2120** and **2118**,
+both from 2026-09-15 — **2119 never existed**. It was not a stale value, it was a
+**mistyped** one. Replaced with **2268**, the value `check-i18n-wording.py` reports.
+
+#### Verification for this batch
+
+New gate self-tests **13/13** · real-source mutations **8/8** ·
+`check-self-test-counts.py` reports "17 gates match the ledger" ·
+`check-i18n-wording.py` green (2268 keys / 0 unexplained conflicts) ·
+`check-docs.py` green · gates **40/40**.
+
 ---
 
 ## Unreleased — Batch 23: the sample size of the census is itself a finding (2026-10-02)
