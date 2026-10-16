@@ -6,6 +6,132 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 30: the 20th gate (frontend/backend IPC reconciliation) — which reported a false all-green on its very first run (2026-10-16)
+
+This batch changes no product behaviour — it adds one gate and four documents.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### The same problem on a different surface
+
+Gate 18 checks that i18n keys referenced by the frontend exist in the translation
+files. Tauri IPC is **structurally identical**, except the two ends are TypeScript
+and Rust:
+
+- every frontend call goes through the two wrappers in `src/api/invoke.ts`
+  (`invokeWithError` / `invokeSafe`), which end up at
+  `@tauri-apps/api/core`'s `invoke(cmd)`;
+- the backend registers commands in `lib.rs`'s `tauri::generate_handler![ ... ]`,
+  measured at **334** entries.
+
+The first argument of `invoke` is a **string** ⇒ renaming or deleting a backend
+command does **not** break the frontend build; it only fails with
+`command not found` once a user reaches that screen. And `check-docs.py` only
+counts the entries — it never compares names.
+
+### The probe failed first: regex cannot handle nested generics
+
+The first-draft probe reported "12 registered but never invoked". Grepping two of
+them by hand:
+
+```
+src/api/project.ts:703:  invokeWithError<Record<string, ScopedCounts>>('project_scoped_counts')
+src/api/project.ts:1014: invokeWithError<Array<[string, string]>>('list_tool_groups')
+```
+
+**Both are called.** `<[^>]*>` stops at the first `>` inside
+`Record<string, ScopedCounts>>`, swallowing the whole call.
+
+⚠️ This is the **second** appearance of batch 27's "hand-rolled lexer ate the real
+references": **a hand-written parser necessarily breaks on nested structures, and
+the way it breaks is silent under-reporting**, which is indistinguishable from
+"really absent" in any report. Batch 27's conclusion (the repo already ships a
+TypeScript parser — use it) was right; what was wrong is that I did not apply it
+this time. Switching to `ts.createSourceFile`: **325** frontend commands,
+**0** dynamic call sites.
+
+### The gate reported a false all-green on its first run
+
+```
+$ node scripts/check-ipc-commands.mjs
+IPC commands aligned: frontend invokes 0 commands, all registered in generate_handler! (backend registers 334)
+$ echo $?
+0
+```
+
+Root cause: in `import { invoke as tauriInvoke }`, `el.name` is **tauriInvoke**
+and `el.propertyName` is **invoke**; I compared the wrong one ⇒ the derived
+wrapper set came out **empty** ⇒ not a single call was collected ⇒ "zero missing"
+⇒ all green. And I *had* written a "registered list parsed to 0 entries ⇒ red"
+guard at the time — **I just only wrote it on the registry side.**
+
+> **A check with N parse steps needs its zero guard N times over.**
+> An empty `calls` can equally mean an empty `wrappers`, not "the frontend really
+> doesn't call anything."
+> ⚠️ Only the self-test can catch this: a human reading "frontend invokes 0
+> commands" just assumes "oh, the frontend doesn't call anything".
+
+### Four criteria
+
+`scripts/check-ipc-commands.mjs`:
+
+| # | Criterion | Direction |
+|---|---|---|
+| 1 | Frontend calls ⊆ backend registrations | **red** (the only direction that cannot produce false positives) |
+| 2 | Entry-point closure: `invoke` from `@tauri-apps/api/core` may only be imported by `src/api/invoke.ts` | **red** (guards the gate itself: the wrapper list is *derived* from there) |
+| 3 | A command name must not be registered twice | **red** (a duplicate makes `invoke` hit only the last one) |
+| 4 | Registered but never invoked by the frontend | **report only** (`--report-unused`) |
+
+The empirical basis for criterion 2: across the whole repo, only
+`src/api/invoke.ts` actually binds `invoke` from `@tauri-apps/api/core`; the
+other three sites only take `convertFileSrc`.
+
+### The 9 "registered but never invoked" — verified not to be a bug
+
+All 9 live in `commands::reliability::` (the list/get/claim/retry half of the
+scheduler queue and the DAG). From "the underlying function has zero production
+callers" I inferred that **tasks were being enqueued but never claimed** —
+**reading the code overturned that**:
+
+- `scheduler::register_active` (production path, called from
+  `commands/chat.rs:4849`) performs the claim **in place** right after
+  `enqueue`, with a concurrency-key-guarded `UPDATE`
+  (`scheduler.rs:280-296`);
+- `scheduler::claim_next` is the **pull-based API for an external worker to poll**
+  the shared queue — and the desktop app is single-worker, so there is nothing
+  polling it.
+
+⇒ They are "built, tested, not yet wired into the UI" operational surface.
+Whether to delete them is a **product judgement**, so criterion 4 reports only.
+
+> "The function has zero callers" has at least four explanations: genuinely dead /
+> reached via reflection or a macro / used only by tests (so still not deletable) /
+> **superseded by another path with the same name**. A statistical signal is a
+> lead, not a conclusion.
+
+### Mutations 6/6: 5 load-bearing on real source + 1 reverse evidence
+
+N1 frontend invokes a command the backend does not have · N2 backend drops a
+registration the frontend still calls · N3 bypassing the wrapper to import
+core.invoke directly · N4 the same command name registered twice · N6 the wrapper
+list failing to derive ⇒ all five go red. N5 writing the command name as a
+variable ⇒ **exit 0 plus an explanation**.
+
+N5 caught a **contract/implementation mismatch**: the docstring said "does not
+fail the build", while the code pushed that message into `problems` and exited 1.
+While fixing it, the self-test blocked me from over-correcting — a dynamic call
+only turns "nothing found missing" into an **upper bound**; it must **not**
+suppress a genuinely missing command that is statically visible.
+
+> **An upper bound must never swallow a fact.** The correct output is
+> "N problems seen, plus M places I cannot see" — not "0 problems".
+
+### Verification
+
+New gate self-test **16/16** · mutations **5 load-bearing on real source + 1
+reverse evidence** · `check-self-test-counts.py` reports "**20** gates match the
+ledger" · `check-docs.py` green · gates **46/46**
+(20 gates + 20 self-tests + tsc + eslint + vitest + build + bundle + cargo).
+
 ## Unreleased — Batch 29: the first gate on the Rust backend, plus one false premise that nearly became a contract (2026-10-16)
 
 This batch changes no product behaviour — it adds one gate and three documents.

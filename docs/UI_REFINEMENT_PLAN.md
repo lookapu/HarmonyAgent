@@ -4887,4 +4887,111 @@ if files != registered:      # 两个计数
 `check-self-test-counts.py` 报「**19** 道门的台账数字与真源一致」·
 `check-docs.py` 绿 · 全量门禁 **44/44**。
 
+### 6.57 第三十批：第 20 道门禁 —— 前后端 IPC 命令对账（2026-10-16）
+
+#### 6.57.1 起点：同一类问题的另一个面
+
+第 18 道门禁管「前端引用的 i18n 键必须在词库里存在」。
+Tauri IPC 是**完全同构**的问题，只是这次两端是 TypeScript 与 Rust：
+
+- 前端所有调用都走 `src/api/invoke.ts` 的两个封装（`invokeWithError` / `invokeSafe`），
+  最终落到 `@tauri-apps/api/core` 的 `invoke(cmd)`；
+- 后端命令注册在 `lib.rs` 的 `tauri::generate_handler![ ... ]`，实测 **334** 条。
+
+`invoke` 的第一个参数是**字符串**，所以后端改名或删命令，
+**前端不会编译报错**；只在用户点到那个界面上才 `command not found`。
+而 `check-docs.py` 只数 `generate_handler!` 的**条目数**，不比名字。
+
+#### 6.57.2 探针先栽了一次：正则处理不了嵌套泛型
+
+第一版探针用正则扫调用点，报出「后端注册了但前端不调用 **12** 个」。
+随手 grep 其中两个：
+
+```
+src/api/project.ts:703:  invokeWithError<Record<string, ScopedCounts>>('project_scoped_counts')
+src/api/project.ts:1014: invokeWithError<Array<[string, string]>>('list_tool_groups')
+```
+
+**两个都在调用。** `<[^>]*>` 在 `Record<string, ScopedCounts>>` 上停在第一个 `>`，
+整条调用被吞掉。
+
+⚠️ 这是第二十七批「手写词法分析器吞掉真引用」的**第二次出现**——
+**手写解析器遇到嵌套结构必然出错，而表现形式是静默少报**。
+第二十七批的结论（仓库里已有 TypeScript 解析器就别手写）是对的，
+错的是这次没先执行它。换 `ts.createSourceFile` 后：前端 **325** 个命令，
+动态调用点 **0** 处。
+
+#### 6.57.3 门禁第一次跑就报出**假全绿**
+
+```
+$ node scripts/check-ipc-commands.mjs
+IPC 命令对齐：前端 invoke 0 个命令，全部在 generate_handler! 里注册（后端共注册 334 个）   ← exit 0
+```
+
+真因：`import { invoke as tauriInvoke }` 里 `el.name` 是 **tauriInvoke**、
+`el.propertyName` 才是 **invoke**，我判断反了 ⇒ 封装名单推导成**空集**
+⇒ 一个调用都收集不到 ⇒ 「零缺失」⇒ 全绿。
+
+而「注册表解析到 0 条就报红」我**当时是写了**的——只是**只给注册表那侧写了**。
+
+> **一道检查有 N 个解析步骤，零条守卫就要写 N 遍。**
+> `calls` 为空完全可能是 `wrappers` 为空，而不是「前端真的不调」。
+> ⚠️ 这个 bug **只有自测能抓**：人眼看到「前端 invoke 0 个命令」会以为「哦前端没调」。
+
+#### 6.57.4 四条判据
+
+`scripts/check-ipc-commands.mjs`：
+
+| # | 判据 | 方向 |
+|---|---|---|
+| 1 | 前端调用 ⊆ 后端注册 | **判红**（唯一不会误报的方向） |
+| 2 | 入口封闭：`@tauri-apps/api/core` 的 `invoke` 只允许 `src/api/invoke.ts` 导入 | **判红**（守卫本门自己：封装名单是从那里**推导**的） |
+| 3 | 命令名不得重复注册 | **判红**（同名会让 invoke 只命中最后一个） |
+| 4 | 后端注册了但前端不调用 | **只报告**（`--report-unused`） |
+
+判据 2 的实测基础：`@tauri-apps/api/core` 全仓只有 `src/api/invoke.ts`
+真正绑定 `invoke`；另外三处只取 `convertFileSrc`。
+
+#### 6.57.5 那 9 个「注册了但前端不调用」——核实后不是 bug
+
+9 个全在 `commands::reliability::`（调度队列与 DAG 的 list/get/claim/retry 一族）。
+我按「底层函数零生产调用者」推断出「任务入队却没人领取」，**读代码后被推翻**：
+
+- `scheduler::register_active`（生产路径，`commands/chat.rs:4849` 调用）
+  在 `enqueue` 之后**就地**用一条带并发键保护的 `UPDATE` 完成了领取
+  （`scheduler.rs:280-296`）；
+- `scheduler::claim_next` 是给**外部 worker 轮询**用的拉取式 API，
+  桌面端单 worker 场景下本来就没有轮询方。
+
+⇒ 属「已建好、已测试、尚未接入 UI 的运维表面」，删不删是**产品判断**，
+所以判据 4 **只报告不判红**。
+
+> 「函数零调用者」至少还有四种解释：真死代码 / 反射或宏 / 测试独占 /
+> **被同名路径替代**。统计信号是线索，不是结论。
+
+#### 6.57.6 变异 6/6：5 真源承重 + 1 反向证据
+
+| 变异 | 结果 |
+|---|---|
+| N1 前端 invoke 一个后端没有的命令 | 判红（真源承重） |
+| N2 后端摘掉注册而前端仍在调 | 判红（真源承重） |
+| N3 绕过封装直接 import core.invoke | 判红（真源承重） |
+| N4 同一命令名注册两次 | 判红（真源承重） |
+| N5 命令名写成变量 | **exit 0 + 说明**（反向证据：判据有上界就不写成事实） |
+| N6 封装清单推导失效 | 判红（真源承重） |
+
+N5 抓到的是**契约与实现不一致**：docstring 写「不判红」，
+代码却把它塞进 `problems` 导致 exit=1。修的时候自测又挡住我修反方向——
+动态调用只让「没发现缺失」变成上界，**不压制**静态已看见的真缺失。
+
+> **上界不许吞掉事实。** 正确输出是「已看见 N 个问题 + 另外 M 处我看不清」，
+> 而不是「0 个问题」。
+
+#### 6.57.7 验证
+
+新门禁自测 **16/16** · 变异 **5 真源承重 + 1 反向证据** ·
+`check-self-test-counts.py` 报「**20** 道门的台账数字与真源一致」·
+全量门禁 **46/46**。
+
+
 

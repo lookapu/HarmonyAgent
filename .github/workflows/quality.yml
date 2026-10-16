@@ -163,6 +163,12 @@ jobs:
       # 把 7 处文档数字一并改成 85 之后 check-docs 仍然 exit 0）。
       - name: Migration registry gate
         run: python scripts/check-migration-registry.py
+      # 第 20 道门禁：前端 invoke 的命令名必须在后端 generate_handler! 里注册。
+      # invoke 的第一个参数是字符串 ⇒ 后端改名/删命令前端**不会编译报错**，
+      # 只在用户点到那个界面时 runtime command not found。
+      # check-docs 只数 generate_handler! 的条目数，不比名字。
+      - name: IPC command gate
+        run: node scripts/check-ipc-commands.mjs
       # 门禁**自身**的合成样例回归。七道门禁的判据都被逐步调宽/调窄过
       # （本项目真实发生过：多行 EmptyState 被误判、role 跨文件统计构造不出失败、
       # 给字号加缩放包装后解析正则全线失效、CHANGELOG 历史段旧数字被当成漂移）。
@@ -190,6 +196,7 @@ jobs:
           python scripts/check-i18n-dupe-keys.py --self-test
           node scripts/check-i18n-key-usage.mjs --self-test
           python scripts/check-migration-registry.py --self-test
+          node scripts/check-ipc-commands.mjs --self-test
       - name: Frontend production build
         run: npm run build
       # 密度门禁的数字层：**必须在 build 之后**——探针是从 dist/ 起静态服务的，
