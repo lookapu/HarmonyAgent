@@ -157,6 +157,12 @@ jobs:
       # 只报告不判红。
       - name: i18n key usage gate
         run: node scripts/check-i18n-key-usage.mjs
+      # 第 19 道门禁：db/mod.rs 的迁移注册表必须与 migrations/ 目录一一对应。
+      # check-docs 只比「文件数 == include_str! 出现次数」这两个计数，
+      # 同时删掉一个 .sql 与它的注册行时两者一起减一 ⇒ 它全绿（实测过：
+      # 把 7 处文档数字一并改成 85 之后 check-docs 仍然 exit 0）。
+      - name: Migration registry gate
+        run: python scripts/check-migration-registry.py
       # 门禁**自身**的合成样例回归。七道门禁的判据都被逐步调宽/调窄过
       # （本项目真实发生过：多行 EmptyState 被误判、role 跨文件统计构造不出失败、
       # 给字号加缩放包装后解析正则全线失效、CHANGELOG 历史段旧数字被当成漂移）。
@@ -183,6 +189,7 @@ jobs:
           python scripts/check-encoding-damage.py --self-test
           python scripts/check-i18n-dupe-keys.py --self-test
           node scripts/check-i18n-key-usage.mjs --self-test
+          python scripts/check-migration-registry.py --self-test
       - name: Frontend production build
         run: npm run build
       # 密度门禁的数字层：**必须在 build 之后**——探针是从 dist/ 起静态服务的，

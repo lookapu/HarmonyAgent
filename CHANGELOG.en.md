@@ -6,6 +6,124 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 29: the first gate on the Rust backend, plus one false premise that nearly became a contract (2026-10-16)
+
+This batch changes no product behaviour — it adds one gate and three documents.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**
+(nothing added, nothing removed).
+
+### Topic: 20 gate scripts, zero of them on the Rust backend
+
+Auditing `scripts/`: 20 `check-*` scripts, all of them about the frontend and the
+docs — while `src-tauri` is **224** Rust files / **156,212** lines /
+**86** migrations with **no gate coverage at all**.
+
+The probe numbers were tempting: all **86** migrations replay in order on an empty
+in-memory database with **0 failures**, producing **71** tables and **102** explicit
+indexes. The first-draft topic was "the migration chain must replay from zero".
+
+### But that premise was false — one grep before writing the docstring
+
+`run_migrations` is called by **dozens** of tests in `db/mod.rs`, each replaying the
+full 86-migration chain on an in-memory database. `db/mod.rs` also carries a
+hand-written registry:
+
+```rust
+(86, "086_drop_api_details_members", include_str!("../../migrations/086_drop_api_details_members.sql")),
+```
+
+⇒ **"nobody replays the migration chain from zero" does not hold.** Had I not
+checked, the contract of a brand-new gate would have rested on an unverified claim.
+
+> **Before writing a "gap in coverage", go find out whether it is already covered.**
+> "nobody watches this" and "nobody watches this **and I verified nobody does**"
+> look identical in a report.
+
+### The real hole: two **counts** impersonating two **sets**
+
+Once that was settled, the actual gap is that `migrations/` and the registry are
+kept in sync **by hand**. `check-docs.py` has a line that appears to cover it:
+
+```python
+if files != registered:      # two counts
+```
+
+Deleting one `.sql` **and** its registration line decrements both counts by one —
+they stay equal.
+
+⚠️ I overclaimed here at first, writing "check-docs cannot see it at all".
+**Measurement refuted that**: deleting both sides without touching the docs *does*
+make it go red — but red for a different reason (the docs still say 86 while the
+source now says 85). The decisive experiment — **change all 7 documentation numbers
+to 85 as well**:
+
+| | Result |
+|---|---|
+| `check-docs.py` | **exit 0, fully green** |
+| The 19th gate | **exit 1**: `migration numbering is not contiguous… missing [50]` |
+
+⇒ **A backstop is not a guard.** The documentation-number checks stop you from
+*forgetting* to update the docs; they do not stop the *normal* workflow.
+
+### Gate 19: seven criteria
+
+`scripts/check-migration-registry.py`. It judges **reconciliation** only, not SQL
+content or semantic ordering (the latter is the job of `run_migrations` replaying
+from zero — no duplicated work).
+
+| # | Criterion |
+|---|---|
+| 1 | **Set equality** (reported in both directions) |
+| 2 | `id` == the numeric prefix of the filename |
+| 3 | `name` == the filename without `.sql` |
+| 4 | `id` must be unique — **the most insidious one**: `run_migrations` is `if !applied { execute }`, so once the first entry with that `id` runs it is recorded as applied and **a second migration with the same `id` is silently skipped and never executes** |
+| 5 | The registry must be sorted by ascending `id` (array order is apply order) |
+| 6 | **Parser shape guard**: `include_str!` occurrences == parseable tuple count |
+| 7 | Numbering is contiguous from `001` — **the only criterion that catches "delete both sides"** |
+
+Criterion 6 is not a business rule but a **parser guard**: a gate that parses
+source as literal text will report **all green** the moment its parsing breaks, and
+"all green" is indistinguishable from "genuinely fine" in any report.
+
+Self-test **12/12**; the baseline case uses **verbatim** line 166 of the real source.
+
+### Mutations 6/6, all load-bearing on the real source
+
+N1 delete file + registration together (numbering gap) · N2 duplicate `id` ·
+N3 `id`/prefix mismatch · N4 `name`/stem mismatch · N5 out of order ·
+N6 a new unregistered file. After each restore, `db/mod.rs` and all 86 `.sql`
+files were sha256-verified, and the baseline returned to green.
+
+**Load-bearing, stated honestly**:
+
+- Criterion 6 (the shape guard) carries **zero real-source load** — all 86 entries
+  parse, and no "unparseable" real-source shape can be injected without breaking
+  the Rust build. It is **carried by the synthetic cases alone**.
+- Criterion 1's "registration points at a missing file" direction is covered on the
+  real source by `include_str!` failing at **compile time** (`cargo build` blows up
+  first); this gate is the second line of defence.
+
+### Found along the way: a test whose comment describes something it does not do
+
+`db/mod.rs`'s `migrations_apply_ohpm_sort_columns` carries the comment "the
+migration list must be fully registered … preventing a new migration file from
+being unregistered". What it actually does is run the migrations and then
+`PRAGMA table_info` **spot-check a few specific columns of two tables** — it never
+reconciles the registry against the directory. Worse, the guard its comment names
+is from a previous generation (`check-docs.py`'s count check already covered
+"new file unregistered"), so **the guard in the comment and the guard in the code
+are not the same one, with a generation in between**.
+
+> **Treat assertions in comments as claims to be verified, not as facts.**
+> Corrected it in passing, so the next person does not assume someone is watching.
+
+### Verification
+
+New gate self-test **12/12** · mutations **6/6 load-bearing on real source** ·
+`check-self-test-counts.py` reports "**19** gates match the ledger" ·
+`check-docs.py` green · gates **44/44**
+(19 gates + 19 self-tests + tsc + eslint + vitest + build + bundle + cargo).
+
 ## Unreleased — Batch 28: the gate I had just shipped had three false negatives (2026-10-16)
 
 This batch changes no product behaviour — only a gate and the translation files.

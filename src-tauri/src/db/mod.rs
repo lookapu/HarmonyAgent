@@ -231,7 +231,17 @@ pub fn apply_pending_migrations(conn: &Connection) -> Result<usize, rusqlite::Er
 mod tests {
     use super::*;
 
-    /// 迁移清单必须完整注册：验证关键后期迁移列，防止新增迁移文件却未登记。
+    /// 迁移链的**抽查**：跑一遍全量迁移后，验证几张关键表的列确实建出来了。
+    ///
+    /// ⚠️ 这**不是**清单与目录的对账。2026-10-16 修正：本注释原写「迁移清单必须完整注册……
+    /// 防止新增迁移文件却未登记」，但函数体只做了 `PRAGMA table_info` 抽查，
+    /// 从未核对 `migrations/` 目录与本文件的注册表是否一一对应——
+    /// 而且它说的那个守卫属于上一代（`scripts/check-docs.py` 的**计数**判据）。
+    ///
+    /// 对账现在归 `scripts/check-migration-registry.py`（第 19 道门禁）管：
+    /// 同时删掉一个 `.sql` 与它的注册行时两个计数一起减一，`check-docs` 全绿，
+    /// 只有「迁移编号自 001 连续」那条判据能抓到。
+    /// 本测试继续存在，因为它守的是另一件事：**关键列真的被执行出来了**。
     #[test]
     fn migrations_apply_ohpm_sort_columns() {
         let conn = Connection::open_in_memory().unwrap();
