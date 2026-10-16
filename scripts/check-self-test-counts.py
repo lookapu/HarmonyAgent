@@ -43,7 +43,10 @@ DEBT = REPO / "docs" / "TECH_DEBT.md"
 WORKFLOWS = REPO / ".github" / "workflows"
 
 #: 台账表格的形状：`| `check-xxx.py` | 说明 | 数字 |`
-ROW_RE = re.compile(r"^\|\s*`check-([a-z0-9-]+)\.py`\s*\|[^|]*\|\s*(\d+)\s*\|", re.M)
+#: 扩展名**收 `.py` 与 `.mjs`**：第二十七批新增的 `check-i18n-key-usage.mjs`
+#: 用 TypeScript 解析器读 TSX，手写词法分析做不到（实测丢 380/424 个真引用）。
+#: 只认 `.py` 会让这道门把它当成「没登记」——而它明明已经登记了。
+ROW_RE = re.compile(r"^\|\s*`check-([a-z0-9-]+)\.(py|mjs)`\s*\|[^|]*\|\s*(\d+)\s*\|", re.M)
 
 #: 13 道门现有的自测输出格式，全部兼容。
 #: 顺序有意义：带 `N/N` 的先试（分母才是「共多少条」），再试单数字，
@@ -89,14 +92,21 @@ def parse_count(text: str) -> int | None:
     return None
 
 
-def gates_from_workflow() -> list[str]:
+def gates_from_workflow() -> dict[str, str]:
+    """quality.yml 里已接 CI 的门禁 -> 扩展名（`.py` / `.mjs`）。"""
     q = (WORKFLOWS / "quality.yml").read_text(encoding="utf-8")
-    names = set(re.findall(r"check-([a-z0-9-]+)\.py", q))
-    return sorted(n for n in names if n != "warnings")
+    exts: dict[str, str] = {}
+    for name, ext in re.findall(r"check-([a-z0-9-]+)\.(py|mjs)", q):
+        if name != "warnings":
+            exts.setdefault(name, ext)
+    return exts
 
 
-def run_self_test(gate: str) -> tuple[int, str]:
+def run_self_test(gate: str, ext: str = "py") -> tuple[int, str]:
     """跑一道门的自测并取回它的输出。
+
+    `ext` 决定解释器：`.py` 走 `python`，`.mjs` 走 `node`
+    （`node` 是 `.exe`，不带 shell 也能找到——不像 `npx`/`npm` 那些 `.cmd`）。
 
     ## `PYTHONIOENCODING` 不是洁癖，是本门能不能用的前提（2026-10-08 实测）
 
@@ -120,8 +130,10 @@ def run_self_test(gate: str) -> tuple[int, str]:
     教训：**修「症状出现的地方」不够，要问「谁让它出现」**。
     这里症状在解析结果，成因在 spawn 时没带环境。
     """
+    path = str(REPO / "scripts" / f"check-{gate}.{ext}")
+    runner = ["node"] if ext == "mjs" else ["python"]
     r = subprocess.run(
-        ["python", str(REPO / "scripts" / f"check-{gate}.py"), "--self-test"],
+        runner + [path, "--self-test"],
         capture_output=True, cwd=REPO,
         # stdout 是管道 ⇒ 子进程按 locale（中文 Windows=GBK）写中文 ⇒
         # 与下面固定的 utf-8 解码对不上。必须显式钉死子进程输出编码。
@@ -222,17 +234,18 @@ def self_test() -> int:
             continue
         passed += 1
 
-    # 台账表格解析
+    # 台账表格解析（第三行是 `.mjs` 门禁：扩展名不收的话会整行漏掉）
     fake = (
         "| 门 | 覆盖面 | 自测 |\n|---|---|---:|\n"
         "| `check-docs.py` | 说明 | 15 |\n"
         "| `check-website.py` | 说明 | 33 |\n"
+        "| `check-i18n-key-usage.mjs` | 说明 | 12 |\n"
     )
-    rows = dict((m.group(1), int(m.group(2))) for m in ROW_RE.finditer(fake))
-    if rows == {"docs": 15, "website": 33}:
+    rows = dict((m.group(1), int(m.group(3))) for m in ROW_RE.finditer(fake))
+    if rows == {"docs": 15, "website": 33, "i18n-key-usage": 12}:
         passed += 1
     else:
-        failures.append(f"台账表格解析: 期望 2 行，实得 {rows}")
+        failures.append(f"台账表格解析: 期望 3 行（含 .mjs），实得 {rows}")
 
     # 空表格必须报「扫描范围失效」
     problems = check({}, lambda g: (0, "自测 1/1"))
@@ -279,10 +292,11 @@ def main() -> int:
         print(f"找不到 {DEBT.relative_to(REPO)}", file=sys.stderr)
         return 1
     text = DEBT.read_text(encoding="utf-8")
-    claims = {m.group(1): int(m.group(2)) for m in ROW_RE.finditer(text)}
+    exts_doc = {m.group(1): m.group(2) for m in ROW_RE.finditer(text)}
+    claims = {m.group(1): int(m.group(3)) for m in ROW_RE.finditer(text)}
 
-    wired = set(gates_from_workflow())
-    missing_from_doc = sorted(wired - set(claims))
+    exts = gates_from_workflow()
+    missing_from_doc = sorted(set(exts) - set(claims))
     if missing_from_doc:
         print(
             f"台账缺 {len(missing_from_doc)} 道已接 CI 的门禁：{missing_from_doc}"
@@ -290,7 +304,10 @@ def main() -> int:
         )
         return 1
 
-    problems = check(claims, run_self_test)
+    def runner(gate: str):
+        return run_self_test(gate, exts_doc.get(gate, "py"))
+
+    problems = check(claims, runner)
     if problems:
         print(f"门禁自测条数核对失败：{len(problems)} 项")
         for p in problems:

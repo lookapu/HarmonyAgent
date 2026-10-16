@@ -187,8 +187,8 @@ export default function AboutPage() {
             <dt className="text-[var(--text-secondary)]">{t('about.appVersion')}</dt>
             <dd className="tnum">{version || '—'}</dd>
             <dt className="text-[var(--text-secondary)]">{t('about.runtime')}</dt>
-            {/* 单一插值而不是 `{t('about.tauri')} {tauriVersion}`：
-                两段文本节点会被读屏断成两个片段，测试也只能用正则绕。 */}
+            {/* 版本号与说明文字合成一个插值，而不是两个相邻文本节点：
+                两段会被读屏断成两个片段，测试也只能用正则绕。 */}
             <dd className="tnum">
               {tauriVersion ? t('about.runtimeValue', { version: tauriVersion }) : '—'}
             </dd>

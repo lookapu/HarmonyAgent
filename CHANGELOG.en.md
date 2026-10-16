@@ -949,6 +949,89 @@ mutations **8/8** (sha256-verified restore each time, green baseline) ·
 `check-i18n-wording.py` green (**2270** keys / 0 unexplained conflicts) ·
 `tsc` / `eslint` / `vitest` green · gates **40/40**.
 
+### The code references i18n keys that **do not exist** — three user-visible (gate 18)
+
+| Key | Symptom in the UI |
+|---|---|
+| `common.off` | the dropdown option literally reads **`common.off`** |
+| `md.copied` | after copying a code block the button literally reads **`md.copied`** |
+| `home.queueFailed` | it carried a Chinese default, so **English users saw Chinese** |
+
+i18next's fallback renders **the key name itself**, so the symptom is not "the
+translation didn't load" — it is a raw key sitting on screen, which sends you
+debugging in exactly the wrong direction.
+
+`check-i18n-wording.py` structurally cannot catch this: it compares whether the
+two languages line up, and when a key is missing on **both** sides the parity
+check sees nothing wrong.
+
+A fourth hit, `about.tauri`, turned out to be inside a **comment** — the code had
+long since switched to `about.runtimeValue`. A dead key name in a comment is still
+harmful, so the comment was fixed too.
+
+#### The big one: a hand-rolled lexer **ate the real references**
+
+The first version used a hand-written Python state machine to strip comments.
+Injecting a bad key and running it, **the gate was green**. Investigation showed:
+
+| File | Real references | Left after comment stripping |
+|---|---:|---:|
+| `Home.tsx` | 424 | **35** |
+| `ConfigPage.tsx` | 75 | **0** |
+| `Markdown.tsx` | 27 | **0** |
+
+Root cause is template literals —
+`` setError(`${t('config.clearError')}: ${e}`) ``: inside `` `${...} `` there is
+**real code**, and the state machine blanked the whole template as a string.
+
+⇒ The repository already has TypeScript (`tsc` runs it daily). Switching to
+`ts.createSourceFile` + AST walk: not one reference lost, dead keys inside comments
+still correctly ignored, and an injected bad key is reported with an exact
+`file:line`.
+
+> "Nobody guards this" comes in two kinds: **the guard was never built**, and
+> **the guard was built but has been dead all along**. The first mutation round
+> reported "load-bearing: none" and I nearly concluded the former; the truth was
+> the latter.
+
+#### A gate's language need not be uniform, but the **ledger parsing must follow**
+
+With the gate now in Node, the gate-list regex in both `check-self-test-counts.py`
+and the full verification script widened from `check-xxx.py` to `py|mjs`.
+Otherwise the new gate is reported as "the ledger is missing N gates" —
+**which looks like a documentation problem but is actually a parsing-scope problem**,
+and is very easy to fix in the wrong place.
+
+#### Two directions are red; dead keys are not judged
+
+"A namespace that does not exist" was simply filtered out in the first version,
+but its symptom is identical to a missing key and the real source has **0**
+such hits — so judging it produces no noise and there is no reason to leave a
+silent hole.
+
+Dead keys are not judged: 13 files use dynamic keys ``t(`...`)`` which cannot be
+enumerated statically, so any number reported is an **upper bound, not a fact**.
+
+#### Mutations 8/8
+
+| Mutation | Real source | Self-test | Load-bearing |
+|---|---|---|---|
+| Inject a **misspelled leaf key** | red | green | **Real source** |
+| Inject a **misspelled namespace** | red | green | **Real source** |
+| Bad key in a **comment** only | green | green | Reverse evidence (must not false-alarm) |
+| No longer require namespaced shape | green | red | Synthetic only |
+| No longer exclude test files | green | red | Synthetic only |
+| No longer check "this file uses i18next" | green | red | Synthetic only |
+| Silently drop "namespace missing" | green | red | Synthetic only |
+| Missing keys never reported | green | red | Synthetic only |
+
+#### Verification
+
+New gate self-tests **15/15** · mutations **8/8** ·
+`check-self-test-counts.py` reports "**18** gates match the ledger" (including the
+`.mjs` one) · `check-i18n-wording.py` green (**2273** keys / 0 unexplained
+conflicts) · gates **42/42**.
+
 ---
 
 ## Unreleased — Batch 23: the sample size of the census is itself a finding (2026-10-02)

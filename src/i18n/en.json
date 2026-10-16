@@ -83,6 +83,7 @@
     "collapse": "Collapse",
     "expandLines": "Expand ({{count}} lines)",
     "copy": "Copy",
+    "copied": "Copied",
     "downloadCode": "Download code",
     "downloadImage": "Save image",
     "copyCode": "Copy code",
@@ -269,6 +270,7 @@
     "queuedHint": "Sent while running will be queued and processed after the current task",
     "sendToAgent": "Send to Agent",
     "queueSend": "Queue",
+    "queueFailed": "Queued message failed to send",
     "queuedLabel": "Queued — after current task",
     "queuedAgentLabel": "Pending Agent merge",
     "queuedBar": "{{count}} queued (click to expand)",
@@ -1425,7 +1427,8 @@
     "onboardingReplay": "Show the guide again",
     "telemetry": "Usage stats",
     "telemetryHint": "Records which features you use on this machine, so dead features become visible. Data stays in this machine's database and is never uploaded.",
-    "telemetryEnable": "Enable usage stats"
+    "telemetryEnable": "Enable usage stats",
+    "telemetryDisable": "Disable usage stats"
 
   },
   "about": {

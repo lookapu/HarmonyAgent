@@ -396,7 +396,7 @@ export default function ConfigPage() {
               <Segmented
                 label={t('config.telemetry')}
                 options={[
-                  { value: 'off', label: t('common.off') },
+                  { value: 'off', label: t('config.telemetryDisable') },
                   { value: 'on', label: t('config.telemetryEnable') },
                 ]}
                 value={trackingOn ? 'on' : 'off'}

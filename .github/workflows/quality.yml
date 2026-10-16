@@ -148,6 +148,15 @@ jobs:
       # 解析器已经替它把重复键丢掉了。两者互补而非重叠。
       - name: i18n duplicate key gate
         run: python scripts/check-i18n-dupe-keys.py
+      # 第 18 道门禁：代码引用的键必须在词库里**存在**。
+      # i18next 的 fallback 是把**键名本身**渲染出来，所以缺失键的界面症状是
+      # 屏幕上直接写着 `common.off`；带中文默认值的更隐蔽——英文用户看到中文。
+      # check-i18n-wording.py 管不了这一面：两边都缺时配平检查完全看不出少了键。
+      # 用 TypeScript 解析器读 TSX：手写词法分析实测在 Home.tsx 上丢了 380/424 个真引用。
+      # 只判「缺失」与「命名空间不存在」两个方向；死键因 13 个文件用动态键而不可靠，
+      # 只报告不判红。
+      - name: i18n key usage gate
+        run: node scripts/check-i18n-key-usage.mjs
       # 门禁**自身**的合成样例回归。七道门禁的判据都被逐步调宽/调窄过
       # （本项目真实发生过：多行 EmptyState 被误判、role 跨文件统计构造不出失败、
       # 给字号加缩放包装后解析正则全线失效、CHANGELOG 历史段旧数字被当成漂移）。
@@ -173,6 +182,7 @@ jobs:
           python scripts/check-self-test-counts.py --self-test
           python scripts/check-encoding-damage.py --self-test
           python scripts/check-i18n-dupe-keys.py --self-test
+          node scripts/check-i18n-key-usage.mjs --self-test
       - name: Frontend production build
         run: npm run build
       # 密度门禁的数字层：**必须在 build 之后**——探针是从 dist/ 起静态服务的，

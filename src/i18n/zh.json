@@ -83,6 +83,7 @@
     "collapse": "折叠",
     "expandLines": "展开 ({{count}} 行)",
     "copy": "复制",
+    "copied": "已复制",
     "downloadCode": "下载代码",
     "downloadImage": "保存图片",
     "copyCode": "复制代码",
@@ -269,6 +270,7 @@
     "queuedHint": "运行中发送将排队，任务结束后自动处理",
     "sendToAgent": "发给 Agent",
     "queueSend": "排队发送",
+    "queueFailed": "排队消息发送失败",
     "queuedLabel": "排队中，任务结束后处理",
     "queuedAgentLabel": "待 Agent 并入当前任务",
     "queuedBar": "排队中 {{count}} 条（点击展开）",
@@ -1425,7 +1427,8 @@
     "onboardingReplay": "重新查看引导",
     "telemetry": "使用统计",
     "telemetryHint": "在本机记录你用了哪些功能，用来判断哪些功能是死代码。数据只存在这台机器的数据库里，不会上传到任何地方。",
-    "telemetryEnable": "开启使用统计"
+    "telemetryEnable": "开启使用统计",
+    "telemetryDisable": "关闭统计"
 
   },
   "about": {

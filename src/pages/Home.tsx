@@ -2513,7 +2513,7 @@ export default function Home() {
         }
         useNotificationStore.getState().push({
           tone: 'error',
-          title: t('chat.queueFailed', '排队消息发送失败'),
+          title: t('home.queueFailed'),
           body: String(e ?? ''),
         })
       })
@@ -2585,7 +2585,7 @@ export default function Home() {
       }
       useNotificationStore.getState().push({
         tone: 'error',
-        title: t('chat.queueFailed', '排队消息发送失败'),
+        title: t('home.queueFailed'),
         body: String(e ?? ''),
       })
     })
