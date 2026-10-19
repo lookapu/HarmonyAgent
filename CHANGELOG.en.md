@@ -6,6 +6,64 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 32: making stalls visible — so the user can see the Agent going in circles (2026-10-19)
+
+This batch is a **product feature** (the previous one was a gate). It adds a user-visible
+notice: when the Agent makes several tool calls in a row without real progress, a stall
+banner appears at the top of the conversation — **and shows how much context the stall
+has already eaten**.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### Until now, only the model could see it
+
+The stall guardrail (T-8) has been injecting tiered wording into the **model's prompt**
+for a long time, but **the user could see nothing**:
+
+- the interface stayed quiet while the backend burned context at the rate T-8 measured —
+  a **9-character question → 209,825 input tokens**, of which tool time was only **2.2%**;
+- the "bytes accumulated during the stall" the guardrail already computed went **into the
+  prompt and nowhere else**;
+- the budget prices **rounds and duration only** — it is completely blind to this cost.
+
+⇒ the user could only find out from the bill, with **no handle to stop it**.
+
+### There is now a banner
+
+A stall banner appears at the top of the conversation (just under the notes bar):
+
+> **Agent may be going in circles** · Level 2
+> 24 consecutive tool calls without real progress · 160 KB added to context during the stall
+> Stop it to redirect, or just tell it what you want
+
+- Levels 1/2 use the warning colour, level 3 the danger colour (matching the backend tiers);
+- the data comes from a new backend event, `chat-guard`, emitted **only when the level
+  changes** (with `stage=0` when it recovers) — every tool call during a stall trips the
+  guardrail, so emitting each time would flood the interface;
+- the backend also emits one `stage=0` **when the task ends** (including a user stop),
+  otherwise the banner would keep a **stale warning**: the user would see "the Agent is
+  stuck" long after it had actually finished.
+
+### One source of truth for the level
+
+The tiering was extracted into `task_guard::stall_stage` as the single source of truth;
+both the wording and the notification go through it. Computing it in two places produces
+states like "the banner says level 1 while the model sees level 2" — where each side
+individually looks perfectly fine.
+
+### Boundary: still only a notice, **no forced termination**
+
+*Which round should force the loop to stop* remains a **product decision** (the open part
+of T-8) and this batch does **not** touch it: even the heaviest tier only asks the model
+to "do one of two things this round" — it **does not actually end the loop**.
+What this batch adds is a handle for the **user** to stop it, not a decision made on the
+user's behalf.
+
+### Verification
+
+Rust unit tests **11/11** (4 new: the level function, wording and level agreeing,
+"notify only on level change", bytes carried by the event) ·
+mutations **7/7** (including 2 reverse-evidence cases) · full gate suite **48/48**.
+
 ## Unreleased — Batch 31: the 21st gate (frontend/backend Tauri event reconciliation) (2026-10-19)
 
 This batch changes almost no product behaviour: it adds one gate and four documents, and

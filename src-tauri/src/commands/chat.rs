@@ -374,6 +374,36 @@ pub struct ChatToolApprovalEvent {
     pub impact: Option<crate::agent::impact::ImpactContract>,
 }
 
+/// 失速提示事件（**级别变化时**才发；stage=0 表示已恢复）
+///
+/// ## 为什么要有这个事件
+///
+/// 失速护栏此前只把阶梯文案**注入模型的提示词**，用户**完全看不见**：
+/// 界面上一片安静，后台却在按 T-8 实测的量烧上下文
+/// （9 字提问 → 209,825 输入 token，工具总耗时只占 2.2%）。
+///
+/// ⇒ 把同一个数字同时给用户看：**连续 N 次无实质进展 · 停滞期累计 X KB 进上下文**。
+/// 用户据此可以主动叫停，而不是等账单说话。
+///
+/// ## 契约
+///
+/// - **只在级别变化时发**：失速期间每个工具调用都会命中护栏，
+///   每次都发会把界面刷屏；用户需要知道的是「变严重了」与「恢复了」这两个时刻。
+/// - `stage` 与模型侧文案的分级**同源**（`task_guard::stall_stage` 是单一真源）。
+#[derive(Clone, Serialize)]
+pub struct ChatGuardEvent {
+    pub conversation_id: String,
+    pub run_id: String,
+    /// 0 = 已恢复（清空提示）· 1/2/3 = 失速阶梯
+    pub stage: u8,
+    /// 距离上次实质进展的工具调用数
+    pub since_progress: usize,
+    /// 停滞期累计进上下文的字节数
+    pub stalled_bytes: usize,
+    /// 当前失速阈值（连续多少次无进展即触发）
+    pub stall_threshold: usize,
+}
+
 /// 回复工具权限审核结果（前端确认弹窗调用）
 /// remember=true 时把 (会话, 工具) 加入会话级“始终允许”记忆，本会话后续同工具免审；
 /// scope="project" 时额外写入项目级持久化白名单（跨会话、跨重启免审）
@@ -2354,6 +2384,23 @@ async fn stream_chat_body(
                 "tool_rounds": stats.tool_rounds,
                 "kind": result.as_ref().err().map(|e| e.kind.as_str()),
             }),
+        );
+
+        // 任务结束 ⇒ 清掉失速提示。
+        //
+        // 失速提示是**任务内**的信号：任务结束（或被停止）后它就不再成立，
+        // 而提示条是按会话记的，不清就会留下一条**过期警告**——
+        // 用户看到「Agent 在打转」，而它其实早就跑完了。
+        let _ = app.emit(
+            "chat-guard",
+            ChatGuardEvent {
+                conversation_id: conversation_id.clone(),
+                run_id: stats.run_id.clone().unwrap_or_default(),
+                stage: 0,
+                since_progress: 0,
+                stalled_bytes: 0,
+                stall_threshold: 0,
+            },
         );
 
         if let Err(e) = &result {

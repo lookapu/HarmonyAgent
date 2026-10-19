@@ -12,8 +12,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::commands::chat::{
-    ChatCancel, ChatToolApprovalEvent, FirstWriteApprovedState, SessionToolAllowState,
-    ToolApprovalState,
+    ChatCancel, ChatGuardEvent, ChatToolApprovalEvent, FirstWriteApprovedState,
+    SessionToolAllowState, ToolApprovalState,
 };
 use crate::db::DbState;
 use crate::services::{permissions, task_guard, tool_limits};
@@ -346,6 +346,24 @@ async fn post_guard(inv: &ToolInvocation<'_>, result: &mut Result<String, String
         result.is_ok(),
         result_bytes,
     );
+    // 失速级别**变化**时通知用户（stage=0 表示恢复）。
+    // 用户此前完全看不见这件事：护栏只把阶梯文案注入模型的提示词，
+    // 界面一片安静而后台在按 T-8 实测的量烧上下文。
+    if hint.stall_stage_changed {
+        if let Some(app) = &inv.ctx.app {
+            let _ = app.emit(
+                "chat-guard",
+                ChatGuardEvent {
+                    conversation_id: inv.conversation_id.to_string(),
+                    run_id: inv.ctx.run_id.clone(),
+                    stage: hint.stall_stage,
+                    since_progress: hint.since_progress,
+                    stalled_bytes: hint.stalled_bytes,
+                    stall_threshold: hint.stall_threshold,
+                },
+            );
+        }
+    }
     if let Some(note) = hint.to_injection() {
         match result {
             Ok(out) => out.push_str(&format!("\n\n{note}")),

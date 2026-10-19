@@ -34,12 +34,18 @@ struct ConversationGuard {
     tool_count: usize,
     /// 距离上次"实质进展"的工具调用数
     since_progress: usize,
-    /// **停滞期间**工具结果累计进上下文的字节数（发生实质进展即清零）
+    /// 停滞期**工具结果**累计进上下文的字节数（发生实质进展即清零）
     ///
     /// 为什么要有它：T-8 实测 9 字提问烧掉 209,825 输入 token，而**工具总耗时只占 2.2%**
     /// ——成本几乎全在「每个字节进上下文」。而护栏此前**只数轮次**，
     /// 对这笔钱完全看不见。
     stalled_bytes: usize,
+    /// 已通知给用户的失速级别（0 = 从未通知）
+    ///
+    /// 用来做**「级别变化才通知」**：失速期间每个工具调用都会命中护栏，
+    /// 若每次都发事件，前端会被同一条提示刷屏；反过来，
+    /// 用户真正需要知道的是「级别变了」和「恢复了」这两个时刻。
+    notified_stage: u8,
     /// 文件 → 连续编辑次数（发生其他进展动作时清零）
     edit_counts: HashMap<String, usize>,
     /// 最近一次被编辑的文件（用于连续计数）
@@ -60,6 +66,25 @@ fn guard_mut<F: FnOnce(&mut ConversationGuard) -> R, R>(conversation_id: &str, f
     let mut map = guards().lock().unwrap();
     let g = map.entry(conversation_id.to_string()).or_default();
     f(g)
+}
+
+/// 失速级别（0 = 无，1/2/3 = 阶梯）。
+///
+/// **单一真源**：`stall_message` 的分级与「要不要告诉用户」都必须走这里，
+/// 否则两处各算一次就会漂移（文案说第 2 级、通知说第 1 级）。
+///
+/// - 0：未达阈值（**不通知**——刚到阈值的正常任务不该被惊扰）
+/// - 1：刚到阈值
+/// - 2：`2 × 阈值`
+/// - 3：`3 × 阈值` 及以上（封顶，不再往上升）
+///
+/// `threshold` 为 `None` 表示该护栏被用户关掉（0 / -1 = 不限制）⇒ 恒为 0。
+pub fn stall_stage(since_progress: usize, threshold: Option<usize>) -> u8 {
+    let Some(t) = threshold else { return 0 };
+    if since_progress < t { return 0; }
+    // 阈值可能为 0（纯函数不该假设调用方已过滤），除法至少按 1 算
+    let raw = since_progress / t.max(1);
+    raw.min(3) as u8
 }
 
 /// 失速提示的**阶梯文案**。
@@ -88,31 +113,31 @@ fn guard_mut<F: FnOnce(&mut ConversationGuard) -> R, R>(conversation_id: &str, f
 /// 三级文案最重也只是要求模型「本轮必须二选一」，**不会真的终止循环**。
 /// 越过这条线就不是工程判断而是替用户做产品决定了。
 fn stall_message(since_progress: usize, threshold: usize, stalled_bytes: usize) -> String {
-    // threshold 是 Some(0) 已被 `agent_limits::opt` 过滤掉，这里仍兜一层防除零
-    let stage = since_progress / threshold.max(1);
     let kb = stalled_bytes / 1024;
-    if stage <= 1 {
-        format!(
-            "已连续 {since_progress} 次工具调用未产生实质进展（无写文件/构建/部署/测试）。\
-             若仍在排查请继续推进，但建议尽快进入验证环节（有代码改动就 build_project，\
-             能部署就 deploy）；不要长时间停留在只读探索上。"
-        )
-    } else if stage == 2 {
-        format!(
+    match stall_stage(since_progress, Some(threshold)) {
+        2 => format!(
             "【失速提醒 · 第 2 级】已连续 {since_progress} 次无实质进展（阈值 {threshold}），\
              本次停滞期间工具结果已累计约 {kb} KB 进上下文。\n\
              **重复的同类只读调用不会再带来新信息**——请在本轮内做一个**可验证**的动作：\
              build_project / run_tests / deploy，或明确写出你接下来要验证的那**一个**假设，\
              然后去验证它。不要再增加同类只读调用。"
-        )
-    } else {
-        format!(
+        ),
+        3 => format!(
             "【失速提醒 · 第 3 级】已连续 {since_progress} 次无实质进展（阈值 {threshold}，\
              累计约 {kb} KB 进上下文）。\n\
              **本轮必须二选一**：① 产出一个可验证的进展（构建 / 测试 / 部署）；\
              ② 向用户汇报当前现状、已排除的可能、以及建议的下一步。\n\
              继续只读探索是**纯成本**——每次这样的调用都在消耗上下文预算却不产生结论。"
-        )
+        ),
+        // 0 与 1 都用「未分级」文案。
+        // ⚠️ 0 实际**不可达**（调用方保证 `since_progress >= threshold`），
+        //    但纯函数不该在不可达分支上写出「第 3 级」这种与级别自相矛盾的文案——
+        //    变异验证正是靠这一点抓出过一个**真隐患**（旧写法把 0 落进第 3 级分支）。
+        _ => format!(
+            "已连续 {since_progress} 次工具调用未产生实质进展（无写文件/构建/部署/测试）。\
+             若仍在排查请继续推进，但建议尽快进入验证环节（有代码改动就 build_project，\
+             能部署就 deploy）；不要长时间停留在只读探索上。"
+        ),
     }
 }
 
@@ -191,6 +216,17 @@ pub fn record_tool(
 
         // 组装提示
         let mut hint = GuardHint::default();
+        // 失速级别与「变化」标记：与文案分级**同源**（`stall_stage` 是单一真源），
+        // 供调用方决定要不要通知用户。级别与文案分开算的话，
+        // 会出现「文案说第 2 级、提示条说第 1 级」这种对不上的状态。
+        let stall_threshold = limits.stall_tool_threshold();
+        let stage = stall_stage(g.since_progress, stall_threshold);
+        hint.stall_stage = stage;
+        hint.stall_stage_changed = stage != g.notified_stage;
+        hint.stalled_bytes = g.stalled_bytes;
+        hint.since_progress = g.since_progress;
+        hint.stall_threshold = stall_threshold.unwrap_or(0);
+        g.notified_stage = stage;
         if let Some(f) = &g.last_edited {
             if let Some(n) = g.edit_counts.get(f) {
                 if let Some(threshold) = limits.repeat_edit_threshold() {
@@ -204,7 +240,7 @@ pub fn record_tool(
                 }
             }
         }
-        if let Some(threshold) = limits.stall_tool_threshold() {
+        if let Some(threshold) = stall_threshold {
             if g.since_progress >= threshold && hint.force_verify.is_none() {
                 hint.stall_warning = Some(stall_message(
                     g.since_progress,
@@ -267,6 +303,16 @@ pub struct GuardHint {
     pub goal_reminder: Option<String>,
     /// 连续构建失败收敛警告
     pub converge_warning: Option<String>,
+    /// 当前失速级别（0 = 无；1/2/3 = 阶梯）。见 [`stall_stage`]
+    pub stall_stage: u8,
+    /// 级别**是否刚发生变化**（用于「变化才通知用户」，避免失速期间刷屏）
+    pub stall_stage_changed: bool,
+    /// 停滞期累计进上下文的字节数
+    pub stalled_bytes: usize,
+    /// 距离上次实质进展的工具调用数
+    pub since_progress: usize,
+    /// 当前失速阈值（0 表示该护栏未启用）
+    pub stall_threshold: usize,
 }
 
 impl GuardHint {
@@ -433,6 +479,124 @@ mod tests {
             w2.contains("160"),
             "进展后应重新从 160KB 起算，而不是累计到 320KB：{w2}"
         );
+    }
+
+    /// 失速级别函数本身：0/1/2/3，封顶，阈值关闭时恒 0。
+    #[test]
+    fn stall_stage_levels() {
+        let t = 10usize;
+        assert_eq!(stall_stage(0, Some(t)), 0, "未达阈值不应失速");
+        assert_eq!(stall_stage(t - 1, Some(t)), 0, "差一次也不该失速");
+        assert_eq!(stall_stage(t, Some(t)), 1, "刚到阈值为第 1 级");
+        assert_eq!(stall_stage(t * 2, Some(t)), 2, "2 倍阈值为第 2 级");
+        assert_eq!(stall_stage(t * 3, Some(t)), 3, "3 倍阈值为第 3 级");
+        assert_eq!(stall_stage(t * 9, Some(t)), 3, "再往上封顶在第 3 级");
+        assert_eq!(stall_stage(100, None), 0, "护栏被关掉时恒为 0");
+        assert_eq!(stall_stage(100, Some(0)), 3, "阈值为 0 不该除零 panic");
+    }
+
+    /// 级别与文案**同源**：文案里出现的级别必须与 `stall_stage` 算出来的一致。
+    ///
+    /// 分两处算的话会出现「提示条说第 1 级、模型看到的是第 2 级」这种对不上的状态，
+    /// 而两边各自都「看起来对」。
+    ///
+    /// ⚠️ 采样必须**跨过分级边界**（`2t-1` / `2t+1` 这类），
+    /// 只在 `t` / `2t` / `3t` 这些**整数倍**上采样的话，
+    /// 「+1 偏移」那类改法算出来的级别完全相同 ⇒ 判据形同虚设（变异 M4 实测）。
+    #[test]
+    fn stall_stage_matches_message_level() {
+        let t = 10usize;
+        for since in [0, 1, t - 1, t, t + 1, t * 2 - 1, t * 2, t * 2 + 1, t * 3 - 1, t * 3, t * 4, t * 9] {
+            let level = stall_stage(since, Some(t));
+            let msg = stall_message(since, t, 0);
+            // 文案里的级别标记：带「第 N 级」的是 2/3，不带的是「未分级」（0 或 1）
+            let msg_level = if msg.contains("第 3 级") {
+                3
+            } else if msg.contains("第 2 级") {
+                2
+            } else {
+                1
+            };
+            // 级别 0（未达阈值）用「未分级」文案，与级别 1 同形
+            let expect = if level == 0 { 1 } else { level };
+            assert_eq!(
+                msg_level, expect,
+                "since={since}（级别 {level}）文案级别与 stall_stage 不一致：{msg}"
+            );
+        }
+    }
+
+    /// **「级别变化才通知」**——失速期间每个工具调用都会命中护栏，
+    /// 每次都发事件会把界面刷屏；用户需要知道的是「变严重了」与「恢复了」两个时刻。
+    ///
+    /// 判据是「整段停滞里恰好通知一次」：删掉 `notified_stage` 记账会变成每次都通知，
+    /// 而永远不通知则第一次就丢——两种改法都被这一条挡住。
+    #[test]
+    fn stall_level_notified_only_on_change() {
+        let cid = "test-conv-notify";
+        begin_task(cid, "查一个问题");
+        let v = serde_json::Value::Null;
+        let t = STALL_TOOL_THRESHOLD;
+
+        // 未达阈值：级别恒 0，且**不应**有任何通知
+        for _ in 0..t - 1 {
+            let h = record_tool(cid, "list_dir", &v, true, 0);
+            assert_eq!(h.stall_stage, 0);
+            assert!(!h.stall_stage_changed, "级别没变就不该通知");
+        }
+
+        // 刚到阈值：首次进入失速 ⇒ 通知一次
+        let h = record_tool(cid, "list_dir", &v, true, 0);
+        assert_eq!(h.stall_stage, 1, "刚到阈值为第 1 级");
+        assert!(h.stall_stage_changed, "首次进入失速必须通知");
+        assert_eq!(h.since_progress, t);
+        assert_eq!(h.stall_threshold, t);
+
+        // 继续只读直到 2 倍阈值：整段里**只应再通知一次**（升到第 2 级）
+        let mut changes = 0;
+        let mut stages = Vec::new();
+        for _ in 0..t {
+            let h = record_tool(cid, "list_dir", &v, true, 1024);
+            stages.push(h.stall_stage);
+            if h.stall_stage_changed {
+                changes += 1;
+            }
+        }
+        assert_eq!(changes, 1, "1→2 级只该通知一次，实得 {changes} 次");
+        assert_eq!(stages.last().copied(), Some(2), "末次应升到第 2 级：{stages:?}");
+
+        // 一次实质进展 ⇒ 级别归 0 ⇒ **恢复通知**（这是清空提示条的信号）
+        let h = record_tool(cid, "build_project", &serde_json::Value::Null, true, 0);
+        assert_eq!(h.stall_stage, 0, "有实质进展后不该还失速");
+        assert!(h.stall_stage_changed, "恢复必须通知，否则提示条清不掉");
+
+        // 恢复后**再次**失速：必须重新通知一次。
+        //
+        // ⚠️ 判据不能只到「恢复会通知」为止：若 `notified_stage` 在恢复时**不清零**，
+        //    下一轮从第 1 级重新失速时与旧值相同 ⇒ 判定为「没变化」⇒ **再也不通知**。
+        //    用户就看不到第二次失速了——而这正是变异 M5 抓出来的漏网。
+        let mut changes = 0;
+        for _ in 0..t {
+            let h = record_tool(cid, "list_dir", &v, true, 0);
+            if h.stall_stage_changed {
+                changes += 1;
+            }
+        }
+        assert_eq!(changes, 1, "恢复后再次失速必须重新通知一次，实得 {changes} 次");
+    }
+
+    /// 停滞字节要随事件一起带出去（用户据此判断「这轮只读探索花了多少上下文」）。
+    #[test]
+    fn hint_carries_stalled_bytes() {
+        let cid = "test-conv-hint-bytes";
+        begin_task(cid, "查一个问题");
+        let v = serde_json::Value::Null;
+        let eight_kb = 8 * 1024;
+        let mut last = 0usize;
+        for _ in 0..STALL_TOOL_THRESHOLD {
+            last = record_tool(cid, "list_dir", &v, true, eight_kb).stalled_bytes;
+        }
+        assert_eq!(last, STALL_TOOL_THRESHOLD * eight_kb);
     }
 
     #[test]

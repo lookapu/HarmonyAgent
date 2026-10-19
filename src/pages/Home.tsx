@@ -125,7 +125,7 @@ import { detectGpu, getRecommendedOverscan, shouldUseSmoothScroll } from '../uti
 import { getLastProjectId } from '../stores/slices/projectSlice'
 import { ShortcutsPanel, ProjectSwitcher } from '../components/home/HomeOverlays'
 import { BatchSendDialog, ImportDialog, AuditDialog } from '../components/home/HomeDialogs'
-import { ConvNoteBar, PinnedBar } from '../components/home/HomeBars'
+import { ConvNoteBar, GuardBar, PinnedBar } from '../components/home/HomeBars'
 import { MessageItem } from '../components/home/MessageItem'
 import {
   externalTextReference,
@@ -5110,6 +5110,10 @@ export default function Home() {
                * - 默认收起，点编辑/查看展开
                * - 自动保存（debounce 600ms） */}
               <ConvNoteBar convId={currentConversation.id} />
+              {/* 失速提示：Agent 连续多次工具调用没有实质进展时出现。
+               * 后端只在**级别变化**时发事件（stage=0 表示恢复），
+               * 任务结束时后端也会发一次 stage=0 清掉它。 */}
+              <GuardBar convId={currentConversation.id} />
               <PinnedBar convId={currentConversation.id} onJump={(msgId) => {
                 const el = document.querySelector(`[data-msg-id="${msgId}"]`) as HTMLElement | null
                 if (el) {

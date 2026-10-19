@@ -45,6 +45,7 @@ import type {
   StreamingState,
 } from '../projectStoreTypes'
 import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
+import { useGuardStore } from '../guardStore'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
 import { STORAGE_KEYS } from '../../constants'
@@ -1015,6 +1016,42 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           : [...s.toolApprovals, { requestId: request_id, tool, args, level, desc, impact }],
       }))
     }
+  }).catch(() => {})
+
+  // 失速提示：Agent 连续多次工具调用没有实质进展时，把**级别**与**停滞字节**告诉用户。
+  //
+  // 此前护栏只把阶梯文案注入模型的提示词，用户完全看不见——界面一片安静，
+  // 后台却在按 T-8 实测的量烧上下文（9 字提问 → 209,825 输入 token）。
+  //
+  // 后端**只在级别变化时**发（stage=0 表示恢复），所以这里不需要节流，
+  // 也不需要自己比较前后值；只管把状态记下来。
+  listen<{
+    conversation_id: string
+    run_id: string
+    stage: number
+    since_progress: number
+    stalled_bytes: number
+    stall_threshold: number
+  }>('chat-guard', (event) => {
+    const { conversation_id, run_id, stage, since_progress, stalled_bytes, stall_threshold } = event.payload
+    // 运行代次过滤：旧任务被停止后，它**在途**的工具调用仍可能迟到一步，
+    // 带着旧 run_id 发事件——不挡的话，它会覆盖新任务的失速状态。
+    // 桶的 runId 已知（任务进行中）⇒ 必须与当前代次一致；
+    // 桶已空或 runId 还没到（任务刚开始/已结束）⇒ 放行，
+    // 否则「任务结束时清掉提示」这条永远送不到。
+    const bucket = get().streamings[conversation_id]
+    if (bucket?.runId && run_id && bucket.runId !== run_id) return
+    if (stage <= 0) {
+      useGuardStore.getState().clear(conversation_id)
+      return
+    }
+    useGuardStore.getState().set(conversation_id, {
+      stage,
+      sinceProgress: since_progress,
+      stalledBytes: stalled_bytes,
+      threshold: stall_threshold,
+      at: Date.now(),
+    })
   }).catch(() => {})
 
   // Agent 诊断引导卡片：签名/SDK/依赖等需用户手动操作时，在对话流上方展示可操作卡片

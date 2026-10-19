@@ -11,9 +11,59 @@ import { useTranslation } from 'react-i18next'
 import { NOTE_MAX_LEN, useNoteStore } from '../../stores/noteStore'
 import { usePinStore } from '../../stores/pinStore'
 import { useProjectStore } from '../../stores/projectStore'
+import { formatBytes, useGuardStore } from '../../stores/guardStore'
 import { setConversationContextPin } from '../../api/project'
 import Icon from '../../icons/Icon'
 import { Button } from '../ui/Button'
+
+/* ============ Agent 失速提示条（仅失速中显示） ============
+ * - 触发：Agent 连续 N 次工具调用没有实质进展（写文件/构建/部署/测试）
+ * - 数据来源：后端 `chat-guard` 事件，**只在级别变化时**发（stage=0 表示恢复）
+ * - 为什么要有这一条：护栏此前只把阶梯文案注入**模型的提示词**，用户完全看不见——
+ *   界面一片安静，后台却在按 T-8 实测的量烧上下文（9 字提问 → 209,825 输入 token，
+ *   其中工具总耗时只占 2.2%）。用户据此可以主动叫停，而不是等账单说话。
+ * - 级别色：1/2 级用 --warning，3 级用 --danger（与后端阶梯一致）
+ *
+ * ⚠️ 样式类名必须**字面量写全**（下面三档各一串）——
+ *    Tailwind v4 按源码里的完整类名生成规则，动态拼 `var(--x)` 的类名不会被扫到。
+ */
+const GUARD_STAGE_CLS = {
+  1: 'border-[var(--warning)]/35 bg-[var(--warning)]/8 text-[var(--warning)]',
+  2: 'border-[var(--warning)]/50 bg-[var(--warning)]/12 text-[var(--warning)]',
+  3: 'border-[var(--danger)]/50 bg-[var(--danger)]/12 text-[var(--danger)]',
+} as const
+
+export function GuardBar({ convId }: { convId: string }) {
+  const { t } = useTranslation()
+  const guard = useGuardStore((s) => s.guards[convId])
+  // 没失速（或已恢复）就不渲染——空占位会给对话流留一条无意义的白边
+  if (!guard || guard.stage <= 0) return null
+  const stage = Math.min(3, Math.max(1, guard.stage)) as 1 | 2 | 3
+  return (
+    <div
+      role="status"
+      className={`mb-2 rounded-lg border px-2.5 py-2 animate-fade-in ${GUARD_STAGE_CLS[stage]}`}
+    >
+      <div className="flex items-center gap-1.5">
+        <Icon name="bolt" size={11} className="shrink-0" />
+        <span className="text-[length:var(--app-text-xs)] font-medium">
+          {t('home.guardTitle')}
+        </span>
+        <span className="text-[length:var(--app-text-2xs)] opacity-80">
+          {t('home.guardLevel', { level: stage })}
+        </span>
+      </div>
+      <div className="mt-1 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
+        {t('home.guardCount', { count: guard.sinceProgress })}
+        {' · '}
+        {t('home.guardBytes', { kb: formatBytes(guard.stalledBytes) })}
+      </div>
+      <div className="mt-0.5 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
+        {t('home.guardAdvice')}
+      </div>
+    </div>
+  )
+}
 
 /* ============ 会话笔记（顶部笔记区，per conversation 持久化） ============
  * - 默认收起（点 "📝 写笔记" 展开）
