@@ -9,6 +9,21 @@
 //!
 //! 两个方向都带**非空下限断言**：抽取逻辑本身写坏时（例如改了调用风格）测试必须失败，
 //! 而不是因为「一个名字都没抽到」而空过。
+//!
+//! ## 本测试与 `scripts/check-tauri-events.mjs` / `scripts/check-ipc-commands.mjs` 的分工
+//!
+//! 本测试是**粗网**：`listen('x')` 只要**在 Rust 源码里出现过**这个字面量就算通过
+//! （哪怕它只出现在注释里、只出现在 LAN 转发白名单里）。
+//! 脚本门禁是**细网**：用 TypeScript 解析器读前端，并要求后端**真的 emit** 它，
+//! 还额外看住 LAN 桥白名单（死转发项）。
+//!
+//! ⇒ 粗网漏掉的（字面量被提到但没人发）正是细网抓的；细网抓不到的
+//! （前端用非字面量订阅）粗网也抓不到。**两层都要留着。**
+//!
+//! ⚠️ 粗网的代价：它按**文本**抽取，所以注释里的字面量会被当真引用
+//! （2026-10-19 实测踩过：一条提到旧事件名的注释把本测试判红了）。
+//! ⇒ 前端那一侧先过 `strip_comments()`；**后端那一侧不剥注释**——
+//! Rust 的 `'` 是生命周期而非字符串，套 JS 那套屏蔽器会把代码整段吃掉。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -54,6 +69,71 @@ fn collect_by_ext(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     }
 }
 
+/// 把注释内容替换成等长空格：位置不变，但注释里的 `listen('x')` 不会被当成调用点。
+///
+/// ## 为什么必须有这一步（2026-10-19 实测）
+///
+/// 本测试按**文本**抽取前端调用，注释里的字面量会被当真引用。实测踩过：
+/// 一条注释里写了「此前这里还挂过一个 `listen('chat-reasoning', …)`」，
+/// 于是本测试报「前端订阅了 Rust 侧不存在的字面量事件名」——而那条订阅
+/// 三个批次前就已经删掉了，**注释才是唯一残留**。
+///
+/// ⚠️ 必须**跟踪字符串**：源码里有 `https://…` 这类字面量，
+/// 朴素的「按 `//` 切到行尾」会把 URL 之后的内容整段吃掉，
+/// 那会把真引用一起弄丢（假阴性）。
+fn strip_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out: Vec<char> = chars.clone();
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' || ch == '`' {
+            quote = Some(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            while i < chars.len() && chars[i] != '\n' {
+                out[i] = ' ';
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            let mut k = i + 2;
+            while k < chars.len() {
+                if chars[k] == '*' && k + 1 < chars.len() && chars[k + 1] == '/' {
+                    out[k] = ' ';
+                    out[k + 1] = ' ';
+                    k += 2;
+                    break;
+                }
+                if chars[k] != '\n' {
+                    out[k] = ' ';
+                }
+                k += 1;
+            }
+            i = k;
+            continue;
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
 fn frontend_names() -> (BTreeSet<String>, BTreeSet<String>) {
     let mut files = Vec::new();
     collect_by_ext(&repo_root().join("src"), &[".ts", ".tsx"], &mut files);
@@ -65,6 +145,8 @@ fn frontend_names() -> (BTreeSet<String>, BTreeSet<String>) {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
+        // 注释里的字面量**不是**调用点（见 strip_comments 的说明）
+        let text = strip_comments(&text);
         for caps in invoke.captures_iter(&text) {
             commands.insert(caps[1].to_string());
         }
@@ -130,4 +212,20 @@ fn every_frontend_event_exists_in_backend() {
         missing.is_empty(),
         "前端订阅了 Rust 侧不存在的字面量事件名（多半是拼写不一致）：{missing:?}"
     );
+}
+
+/// 屏蔽器自己的回归：**手写词法分析器必须有自测**，否则它坏掉时
+/// 表现是「静默少抽/多抽」，和「真的没有」在报告里长得一模一样。
+#[test]
+fn comment_stripper_keeps_strings_and_drops_comments() {
+    let src = "let a = 1; // listen('x')\n/* listen('y') */ let u = 'https://a//b';\nlisten('z')";
+    let out = strip_comments(src);
+    assert!(!out.contains("listen('x')"), "行注释里的调用必须被去掉");
+    assert!(!out.contains("listen('y')"), "块注释里的调用必须被去掉");
+    assert!(out.contains("listen('z')"), "真调用必须留下");
+    assert!(
+        out.contains("https://a//b"),
+        "字符串里的 // 必须留下——朴素切行尾会把它之后的内容整段吃掉"
+    );
+    assert_eq!(out.chars().count(), src.chars().count(), "屏蔽必须保持长度不变");
 }

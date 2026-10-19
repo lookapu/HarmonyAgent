@@ -494,20 +494,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     if (reasoning) queueStreamDelta(conversation_id, 'reasoning', reasoning)
   }).catch(() => {})
 
-  // 思考过程流式增量（推理模型 reasoning_content 透传；同样分桶）
-  listen<{ conversation_id: string; run_id?: string; delta: string }>('chat-reasoning', (event) => {
-    const { conversation_id, run_id, delta } = event.payload
-    if (!acceptsRun(conversation_id, run_id)) return
-    const bucket = get().streamings[conversation_id]
-    if (!bucket) return
-    const pending = pendingStreamDeltas.get(conversation_id)
-    // 首个思考 delta 也算 TTFB（推理模型可能先吐 thinking 再吐 content）
-    if (!bucket.content && !bucket.reasoning && !pending?.content && !pending?.reasoning) {
-      const t = sendTraces.get(conversation_id)
-      t?.mark('ttfb')
-    }
-    queueStreamDelta(conversation_id, 'reasoning', delta)
-  }).catch(() => {})
+  // 思考过程（reasoning）**没有单独的事件**：Rust 侧 `StreamEventBatcher` 把正文与思考
+  // 合并进 `chat-stream-batch` 的 payload，上面的监听已处理其中的 `reasoning` 字段。
+  // 此前这里还挂过一个 `chat-reasoning` 的事件订阅，而后端**从来不发这个事件**
+  // （思考增量自合并批次起就没再单独 emit 过）——那是一个永不触发的订阅，
+  // 由第 21 道门禁 `check-tauri-events.mjs` 实测判红后移除。
+  // ⚠️ **注释里不要照抄监听调用的写法**：`src-tauri/tests/frontend_backend_contract.rs`
+  // 那个契约测试按文本抽取前端调用，会把注释里的字面量当真引用（已踩过）。
 
   listen<{ conversation_id: string; run_id?: string; message: ChatMessage; unfinished: boolean; user_message_id?: string | null }>('chat-done', (event) => {
     const { conversation_id, run_id, message, unfinished, user_message_id } = event.payload

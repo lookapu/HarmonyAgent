@@ -36,7 +36,6 @@ use crate::db::DbState;
 const EVENT_WHITELIST: &[&str] = &[
     "chat-stream",
     "chat-stream-batch",
-    "chat-reasoning",
     "chat-run-started",
     "chat-heartbeat",
     "chat-done",
@@ -643,7 +642,7 @@ impl LanServer {
                             }
                         }
                     }
-                    "chat-stream" | "chat-stream-batch" | "chat-reasoning" => {
+                    "chat-stream" | "chat-stream-batch" => {
                         if let Some(cid) = &conv {
                             if let Ok(mut buf) = buffer.lock() {
                                 let cb = buf.entry(cid.clone()).or_default();

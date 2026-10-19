@@ -1468,7 +1468,9 @@ function connectSSE() {
   on('chat-stream-batch', (p) => {
     if (acceptsRun(p) && p.content) appendStream(p.conversation_id, p.content);
   });
-  on('chat-reasoning', () => { /* keep alive */ });
+  // 思考过程没有单独事件：Rust 侧把正文与思考合并进 chat-stream-batch，
+  // 且网页端本来就不渲染思考增量。此处原先挂着一个 chat-reasoning 的空监听，
+  // 而后端从不发该事件——已随第 21 道门禁 check-tauri-events.mjs 一并移除。
   on('chat-done', (p) => {
     if (!acceptsRun(p)) return;
     if (S.conv && p.conversation_id === S.conv.id) {

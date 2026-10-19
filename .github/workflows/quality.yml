@@ -169,6 +169,16 @@ jobs:
       # check-docs 只数 generate_handler! 的条目数，不比名字。
       - name: IPC command gate
         run: node scripts/check-ipc-commands.mjs
+      # 第 21 道门禁：前端 listen 的事件名必须在后端 emit。
+      # 与第 20 道门禁同构，只是这回是**事件**而不是命令：事件名是字符串字面量，
+      # 后端改名/删事件前端**不会编译报错**，运行时也不报错——
+      # listen 一个永远不来的事件只是**永远不触发**，症状是「某个功能就是不动」。
+      # 本门同时看住 LAN 桥白名单 EVENT_WHITELIST（后端自己维护的事件名名单），
+      # 名单里躺着没人发的事件 = 名册造假。
+      # 事件名解析三层：字面量 / 同文件 const / 跨文件辅助函数参数（含透传）——
+      # 只认字面量会把 3 个真实存在的事件误报成死监听。
+      - name: Tauri event gate
+        run: node scripts/check-tauri-events.mjs
       # 门禁**自身**的合成样例回归。七道门禁的判据都被逐步调宽/调窄过
       # （本项目真实发生过：多行 EmptyState 被误判、role 跨文件统计构造不出失败、
       # 给字号加缩放包装后解析正则全线失效、CHANGELOG 历史段旧数字被当成漂移）。
@@ -197,6 +207,7 @@ jobs:
           node scripts/check-i18n-key-usage.mjs --self-test
           python scripts/check-migration-registry.py --self-test
           node scripts/check-ipc-commands.mjs --self-test
+          node scripts/check-tauri-events.mjs --self-test
       - name: Frontend production build
         run: npm run build
       # 密度门禁的数字层：**必须在 build 之后**——探针是从 dist/ 起静态服务的，

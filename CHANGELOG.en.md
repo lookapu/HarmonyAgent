@@ -6,6 +6,116 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 31: the 21st gate (frontend/backend Tauri event reconciliation) (2026-10-19)
+
+This batch changes almost no product behaviour: it adds one gate and four documents, and
+removes one **never-emitted** dead event subscription.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### The third face of the same problem
+
+Gate 18 checks that i18n keys referenced by code exist. Gate 20 checks that the command
+name a frontend `invoke`s is registered in the backend's `generate_handler!`. Tauri
+**events** are the third face of the same problem:
+
+- the frontend subscribes with `listen('evt', cb)` (`@tauri-apps/api/event`);
+- the backend emits with `app.emit("evt", payload)`.
+
+The event name is a **string literal** ⇒ renaming or deleting a backend event does
+**not** break the frontend build; and nothing fails at runtime either — `listen`ing an
+event that never arrives simply **never fires**. The symptom is "this feature just
+doesn't do anything", with **nothing anywhere reporting an error**.
+
+And the desktop app is **not the only consumer**: the LAN bridge keeps an
+`EVENT_WHITELIST` in `lan_server.rs` (forwarded as SSE to the web client), and
+`lan_ui/app.js` then subscribes with `on('X', …)`. ⇒ the event name is stored in
+**three** places.
+
+### The probe fell over first: 3 of the 4 "nobody emits it" were false positives
+
+The first probe only matched `.emit("literal", …)` and reported 4 events the frontend
+listens to but the backend never emits. Checking each one:
+
+| Event | Reality |
+|---|---|
+| `node-runtime-progress` | The backend **does** emit it — the name hides behind `const EVENT: &str = "…"` |
+| `git-runtime-progress` | Same |
+| `jdk-install-progress` | Same, and the constant lives in **another file** |
+| `chat-reasoning` | The backend **never emitted it** — a genuinely dead listener |
+
+⇒ event names need **three** layers of resolution: literals / same-file constants /
+**cross-file helper-function parameters** (including pass-through). A bare literal regex
+only sees **90 of 91** `.emit(` call sites.
+
+> ⚠️ **A false positive costs more than a false negative**: it makes someone delete a
+> listener that is alive. **"I didn't see it" and "it doesn't exist" are not the same
+> statement.**
+
+### "Dynamic" has **opposite** polarity in the two directions
+
+In gate 20 the dynamic part is a **call site** (`invoke(cmd)` with a variable `cmd`)
+⇒ it makes "nobody calls it" an upper bound, and it does **not** suppress a statically
+visible real gap ⇒ still judged red. Here the dynamic part is an **emission site**
+⇒ it makes "nobody emits it" an upper bound ⇒ "this is a dead listener" is **not a
+fact** ⇒ **downgraded to report-only**.
+
+Copying one template into the other gets the direction exactly wrong.
+
+### Real finding: `chat-reasoning` was a subscription nobody ever emitted
+
+The backend merges content and reasoning increments into the `chat-stream-batch` event
+(`StreamEventBatcher::flush()`) and **no longer emits `chat-reasoning` on its own** —
+yet the `/// 思考增量（透传 emit chat-reasoning）` comment in `chat.rs` still described
+the old design.
+
+⇒ the desktop app carried a `listen('chat-reasoning', …)` that **could never fire**;
+the LAN bridge whitelist carried the same dead entry; and the LAN web client carried
+an empty `on('chat-reasoning', () => { /* keep alive */ })` listener.
+
+All three removed, and the stale comment corrected. **Reasoning display is unaffected**
+— it has always travelled in the `reasoning` field of `chat-stream-batch`.
+
+### A mutation caught a hole in my own gate
+
+Mutation N6 injected an emission site whose event name cannot be determined, expecting
+the gate to **downgrade to report-only**. Instead it kept judging against the full
+set — the point had been **silently dropped**.
+
+Root cause: the classification logic was split in two, and "the identifier is neither a
+constant nor an event-source parameter" was handled by **neither**.
+⇒ **Classification must be done in one place.** This is the same trap as batch 30's
+"write the zero-guard for only one side", in a different shape.
+
+### Nearly wrote "nobody guards this" when a coarse guard already existed
+
+The full gate run turned up a `cargo test` failure I had **not** expected:
+`src-tauri/tests/frontend_backend_contract.rs` already contained an event-reconciliation
+test. So this surface was **not** unguarded — that guard is simply **coarse**: it
+extracts frontend calls from raw text, and only requires the event name to **appear
+somewhere in the Rust sources** (comments, whitelists and constants all count).
+
+`chat-reasoning` still had a literal in the LAN whitelist and in the docs ⇒ the coarse
+guard **let it through**, while the fine guard (which requires the backend to **really
+emit** it) flagged it. **Both layers stay.**
+
+### My own comment made the coarse guard go red
+
+The failing item did not come from code — it came from a **comment written in this
+batch** that copied the shape of a listener call, which the coarse guard then read as a
+real subscription. The comment was rewritten, and the coarse guard now strips comments
+(**preserving length**) with a self-test for the stripper itself. The backend side
+deliberately does **not** strip comments: in Rust `'` is a *lifetime*, so the JS-style
+stripper would swallow real code.
+
+### Verification
+
+New gate self-test **41/41** · mutations **6/6** (including one reverse-evidence case:
+after the backend switches a literal to a constant the gate must **still** resolve it,
+not rely on a literal coincidence; and one downgrade case: an emission site whose event
+name cannot be determined must be report-only, not red) ·
+`check-self-test-counts.py` reports "the ledger matches the real source for **21** gates" ·
+`check-docs.py` green.
+
 ## Unreleased — Batch 30: the 20th gate (frontend/backend IPC reconciliation) — which reported a false all-green on its very first run (2026-10-16)
 
 This batch changes no product behaviour — it adds one gate and four documents.

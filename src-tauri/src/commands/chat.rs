@@ -8766,7 +8766,7 @@ async fn await_parse_done(
 enum StreamParserEvent {
     /// 正文增量（透传 emit chat-stream）
     Delta(String),
-    /// 思考增量（透传 emit chat-reasoning）
+    /// 思考增量（与正文合并进 `chat-stream-batch` 事件，不单独 emit）
     Reasoning(String),
     /// 原生工具调用增量到达（解析线程累积；async 侧仅刷新产出打点）
     ToolCall,
