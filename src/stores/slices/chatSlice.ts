@@ -1025,6 +1025,11 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   //
   // 后端**只在级别变化时**发（stage=0 表示恢复），所以这里不需要节流，
   // 也不需要自己比较前后值；只管把状态记下来。
+  //
+  // ⚠️ 载荷字段名必须与后端 `ChatGuardEvent` **逐字对得上**——
+  //    事件名对得上但字段名对不上时，TypeScript **不会报错**，
+  //    运行时那个字段恒为 undefined ⇒ 画像整段静默消失。
+  //    这条对账由 `src-tauri/tests/frontend_backend_contract.rs` 守着。
   listen<{
     conversation_id: string
     run_id: string
@@ -1032,8 +1037,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     since_progress: number
     stalled_bytes: number
     stall_threshold: number
+    profile: {
+      repeats: { tool: string; target: string | null; count: number }[]
+      top_tool: { tool: string; count: number } | null
+    }
   }>('chat-guard', (event) => {
-    const { conversation_id, run_id, stage, since_progress, stalled_bytes, stall_threshold } = event.payload
+    const { conversation_id, run_id, stage, since_progress, stalled_bytes, stall_threshold, profile } = event.payload
     // 运行代次过滤：旧任务被停止后，它**在途**的工具调用仍可能迟到一步，
     // 带着旧 run_id 发事件——不挡的话，它会覆盖新任务的失速状态。
     // 桶的 runId 已知（任务进行中）⇒ 必须与当前代次一致；
@@ -1050,6 +1059,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       sinceProgress: since_progress,
       stalledBytes: stalled_bytes,
       threshold: stall_threshold,
+      profile: {
+        // ⚠️ `profile` 可能是 undefined（旧后端 / 字段名对不上）⇒ 兜底成空画像，
+        //    让提示条只显示级别与字节，而不是整个组件崩掉。
+        repeats: profile?.repeats ?? [],
+        topTool: profile?.top_tool ?? null,
+      },
       at: Date.now(),
     })
   }).catch(() => {})

@@ -402,6 +402,11 @@ pub struct ChatGuardEvent {
     pub stalled_bytes: usize,
     /// 当前失速阈值（连续多少次无进展即触发）
     pub stall_threshold: usize,
+    /// 失速画像：**它到底在干什么**（重复最多的动作 + 主导工具）
+    ///
+    /// 与 `stage` / `stalled_bytes` 同源：都是后端 `task_guard` 算出来的，
+    /// 前端**不自己判断**「算不算打转」，只负责把事实显示出来。
+    pub profile: crate::services::task_guard::StallProfile,
 }
 
 /// 回复工具权限审核结果（前端确认弹窗调用）
@@ -2400,6 +2405,7 @@ async fn stream_chat_body(
                 since_progress: 0,
                 stalled_bytes: 0,
                 stall_threshold: 0,
+                profile: Default::default(),
             },
         );
 

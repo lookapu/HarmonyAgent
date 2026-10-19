@@ -360,6 +360,8 @@ async fn post_guard(inv: &ToolInvocation<'_>, result: &mut Result<String, String
                     since_progress: hint.since_progress,
                     stalled_bytes: hint.stalled_bytes,
                     stall_threshold: hint.stall_threshold,
+                    // 失速画像：**它到底在干什么**（重复最多的动作 + 主导工具）
+                    profile: hint.stall_profile.clone(),
                 },
             );
         }

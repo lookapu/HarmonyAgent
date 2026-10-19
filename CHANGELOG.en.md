@@ -6,6 +6,102 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 33: the stall profile — so the user can see *what it is doing* (2026-10-19)
+
+This batch continues the previous one. Batch 32 made stalls **visible** (level + stalled
+bytes); this batch adds the **more important half** — **what it is actually doing**.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### "24 consecutive calls" carries no information
+
+Batch 32's banner said "24 consecutive tool calls without real progress". But the user
+cannot tell two **completely different** situations apart:
+
+- reading **the same file** 9 times — real spinning, time to stop;
+- reading **24 different files** — exploration, also burning context, but not spinning.
+
+The right response differs, yet "24" flattens them into one sentence.
+⇒ The user saw "something is wrong" but still had **no idea what the Agent was doing**.
+
+### Now the banner names it
+
+> **Agent may be going in circles** · Level 2
+> 24 consecutive tool calls without real progress · 160 KB added to context during the stall
+> **Most repeated:** read_file src/main.ets × 9 · list_dir × 6
+> Stop it to redirect, or just tell it what you want
+
+When nothing repeats (24 different files), it falls back to one line:
+
+> **Mostly using:** read_file × 24
+
+- "Most repeated" lists the **same action** (same tool + same identifying argument)
+  called at least twice;
+- "Mostly using" is the tool called most during the stall window (**aggregated across
+  targets**).
+
+### The guardrail already had this — it just threw it away
+
+`record_tool` has always received the **tool name and arguments**; they were only used
+to count calls, never kept to answer "what did it do".
+This batch records an **action profile** for the stall window, with the **same lifetime**
+as the stalled-bytes counter (cleared on real progress — it describes *this* stall,
+not the whole task).
+
+What counts as "the same thing" **depends on the tool**, so it cannot always be `path`:
+`read_file` keys on `path`, `grep_files` on `pattern`, `codebase_search` on `query`,
+`run_command` on `command`.
+Keying on `path` alone would collapse 20 greps with different keywords into "one
+action" (they all carry the same default `path`) — and grep is one of the read-only
+tools most likely to spin.
+
+Reading **different windows of the same file** still counts as the same thing
+(`read_file` can return 15K chars at a time, `AGENTS.md` 44.6KB in one go, so
+re-reading it in slices is the textbook way to burn context) ⇒ window parameters like
+`start` / `lines` are excluded from the identity.
+
+### One profile, fed to both the model and the user
+
+The tier 2/3 wording injected into the model used to say only "repeated read-only
+calls of the same kind will not bring new information" — **without naming which
+kind**. It now names it: "the most repeated action is read_file(src/main.ets) × 9".
+
+Both sides share **the same structured data** (the backend `StallProfile`), so the
+banner can never say `read_file` while the model sees `grep_files`.
+(The prose is two versions on purpose: the model's prompt is Chinese, the UI goes
+through i18n in Chinese and English.)
+
+### Also added: frontend ⇄ backend event **payload field** reconciliation
+
+While adding a field to an event, this batch ran into a spot **nobody was guarding**:
+event names are string literals, and **payload field names are strings too** — the
+frontend hand-writes `listen<{ conversation_id: string }>`, the backend hand-writes
+`pub struct XxxEvent { … }`, and **neither compiler can see the other**.
+⇒ With a mistyped field name: type check green, unit tests green, build green, no
+runtime error — the field is **permanently `undefined`** ⇒ the feature silently dies.
+And the 21st gate only checked **event names**, so it was completely blind to field
+mismatches.
+
+⇒ The 21st gate grew a **payload field reconciliation** pass: every field the
+frontend declares in `listen<{…}>` must exist in the backend event struct's
+serialized output. The judgment only looks in one direction — **frontend ⊆ backend**
+(the backend sending extra fields is not a defect, and checking it would misfire).
+
+**24** frontend/backend payload field sets are compared today, all consistent.
+`json!` payloads and named types cannot be compared yet (they would need cross-file
+type resolution); every skip leaves a note, and there is a **lower bound on the number
+of comparisons** — if the extraction rules ever break, the gate goes red instead of
+silently having nothing to check.
+
+### Verification
+
+Rust unit tests **21/21** (10 new: profile accumulation / only real repeats /
+cross-target aggregation / cleared on progress / progress actions excluded /
+per-tool identity / window params ignored / deterministic order / wording names the
+action / hint carries the profile) · frontend vitest **6/6** (new `HomeBars.test.tsx`) ·
+21st gate self-test **64/64** (was 41; 23 new payload-reconciliation cases) ·
+mutation **13/13** (2 of them are **reverse-evidence** cases that must go green) ·
+plus 2 no-change control runs · full gate suite **48/48**.
+
 ## Unreleased — Batch 32: making stalls visible — so the user can see the Agent going in circles (2026-10-19)
 
 This batch is a **product feature** (the previous one was a gate). It adds a user-visible

@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use serde::Serialize;
+
 /// 触发"同文件反复编辑后强制构建"的连续编辑次数阈值（默认值；运行时以 agent_limits 配置为准）
 pub const REPEAT_EDIT_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_REPEAT_EDIT_THRESHOLD as usize;
 /// 触发失速检测的"无进展"工具调用次数（默认值；运行时以 agent_limits 配置为准）
@@ -23,6 +25,29 @@ pub const GOAL_REINJECT_INTERVAL: usize = crate::services::agent_limits::DEFAULT
 pub const BUILD_FAIL_CONVERGE_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_BUILD_FAIL_CONVERGE_THRESHOLD as usize;
 /// 失败动作黑名单阈值（默认值；运行时以 agent_limits 配置为准）
 pub const BLACKLIST_FAIL_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_BLACKLIST_FAIL_THRESHOLD as usize;
+
+/// 失速画像里最多列出几个「重复动作」。
+///
+/// 三个是上限而不是恰好三个：再多的条目会把提示条撑成一堵墙，
+/// 而用户真正要看的永远只是「最重复的那几件事」。
+pub const STALL_PROFILE_TOP_N: usize = 3;
+
+/// 标识「同一件事」的参数名，**按优先级排列**。
+///
+/// ## 为什么需要这张表
+///
+/// 不同工具用来标识「同一件事」的参数**并不一样**：
+/// `read_file` 看 `path`、`grep_files` 看 `pattern`、`codebase_search` 看 `query`、
+/// `run_command` 看 `command`。
+///
+/// 只认 `path` 的话，20 次 `grep_files` 会因为**都带了 `path`（缺省项目根）**
+/// 而塌成「同一个动作」——画像就废了（而 grep 恰恰是最容易打转的只读工具之一）。
+///
+/// 优先级 = 「最像标识符」在前：命令 / 搜索词 > 符号名 > 路径 > 模块。
+const IDENTITY_ARGS: &[&str] = &[
+    "command", "pattern", "query", "name", "path", "file", "module",
+];
+
 
 #[derive(Default, Debug)]
 struct ConversationGuard {
@@ -46,6 +71,22 @@ struct ConversationGuard {
     /// 若每次都发事件，前端会被同一条提示刷屏；反过来，
     /// 用户真正需要知道的是「级别变了」和「恢复了」这两个时刻。
     notified_stage: u8,
+    /// 停滞窗口内的**动作画像**：身份键 → (工具名, 展示目标, 次数)
+    ///
+    /// ## 为什么要有它
+    ///
+    /// 第三十二批把失速**摆到用户眼前**了，但摆出来的还是一句没有信息量的话：
+    /// 「连续 24 次工具调用没有实质进展」——**24 次是什么？**
+    /// 用户分不清两种完全不同的情况：
+    /// - 反复读**同一个文件** 9 次（真打转，该叫停）
+    /// - 读了 **24 个不同文件**（是探索，也在烧钱但不是打转）
+    ///
+    /// 而护栏**本来就拿到了**工具名与参数（`record_tool` 的入参），
+    /// 只是从来只用来算次数、没留下「它做了什么」。
+    ///
+    /// 与 `stalled_bytes` **同一生命周期**：发生实质进展即清零
+    /// （它描述的是「这一次停滞」，不是整个任务）。
+    stall_actions: HashMap<String, StallActionEntry>,
     /// 文件 → 连续编辑次数（发生其他进展动作时清零）
     edit_counts: HashMap<String, usize>,
     /// 最近一次被编辑的文件（用于连续计数）
@@ -54,6 +95,55 @@ struct ConversationGuard {
     failed_actions: HashMap<String, usize>,
     /// 连续构建失败次数（构建成功时清零）
     build_fail_streak: usize,
+}
+
+/// 停滞窗口内的一个动作（内部记账用）。
+#[derive(Clone, Debug)]
+struct StallActionEntry {
+    /// 工具名
+    tool: String,
+    /// 展示用的目标（路径 / 搜索词 / 命令…）；工具没有标识参数时为 None
+    target: Option<String>,
+    /// 该动作在本次停滞窗口内出现的次数
+    count: usize,
+}
+
+/// 画像里的一个**重复动作**（对外）。
+///
+/// 「重复」= 同一工具 + 同一标识参数（同一文件 / 同一搜索词 / 同一条命令）。
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StallActionStat {
+    /// 工具名
+    pub tool: String,
+    /// 展示用的目标；工具没有标识参数时为 None
+    pub target: Option<String>,
+    /// 重复次数
+    pub count: usize,
+}
+
+/// 画像里的**主导工具**（对外）：停滞窗口内被调用最多的工具。
+///
+/// 与 [`StallActionStat`] 的区别：这里是**跨目标聚合**的
+/// （读 24 个不同文件都算 `read_file` 的 24 次），
+/// 而那里是**单个目标**的重复次数。
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StallToolStat {
+    /// 工具名
+    pub tool: String,
+    /// 该工具在窗口内的总调用次数
+    pub count: usize,
+}
+
+/// 失速画像：**它到底在干什么**。
+///
+/// 第三十二批让失速可见了（级别 + 停滞字节），
+/// 这一批补上**最关键的那一半**——不是「卡了 24 次」，而是「在重复 read_file 同一个文件」。
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StallProfile {
+    /// 重复次数 ≥ 2 的动作（次数降序，最多 [`STALL_PROFILE_TOP_N`] 条）
+    pub repeats: Vec<StallActionStat>,
+    /// 窗口内调用最多的工具（跨目标聚合）；窗口为空时为 None
+    pub top_tool: Option<StallToolStat>,
 }
 
 static GUARDS: OnceLock<Mutex<HashMap<String, ConversationGuard>>> = OnceLock::new();
@@ -107,17 +197,34 @@ pub fn stall_stage(since_progress: usize, threshold: Option<usize>) -> u8 {
 /// **成本几乎全在「每个字节进上下文」**。而预算只按轮次与时长计价，
 /// 从不按字节计价 ⇒ 护栏此前对这笔钱完全失明。
 ///
+/// ## 画像：点名「它在重复什么」
+///
+/// 光说「连续 N 次无实质进展」对模型是**空信息**——它并不知道自己这 N 次
+/// 到底干了什么，于是只能换个说法再问一次。
+/// 把「你在重复 read_file 同一个文件 9 次」直接写进提示词，
+/// 模型才有可能据此换动作。
+///
 /// ## 边界：这里**只升级措辞，不强制收尾**
 ///
 /// 「该在哪一轮强制中断」是产品判断（见台账 T-8 的待定部分），**本函数不碰它**：
 /// 三级文案最重也只是要求模型「本轮必须二选一」，**不会真的终止循环**。
 /// 越过这条线就不是工程判断而是替用户做产品决定了。
-fn stall_message(since_progress: usize, threshold: usize, stalled_bytes: usize) -> String {
+fn stall_message(
+    since_progress: usize,
+    threshold: usize,
+    stalled_bytes: usize,
+    profile: &StallProfile,
+) -> String {
     let kb = stalled_bytes / 1024;
+    // 画像句：有重复动作时点名重复最多的几件；没有重复就退到「主要在用什么工具」。
+    let profile_clause = profile_line(profile)
+        .map(|line| format!("**你在重复做同一件事**：{line}。\n"))
+        .unwrap_or_default();
     match stall_stage(since_progress, Some(threshold)) {
         2 => format!(
             "【失速提醒 · 第 2 级】已连续 {since_progress} 次无实质进展（阈值 {threshold}），\
              本次停滞期间工具结果已累计约 {kb} KB 进上下文。\n\
+             {profile_clause}\
              **重复的同类只读调用不会再带来新信息**——请在本轮内做一个**可验证**的动作：\
              build_project / run_tests / deploy，或明确写出你接下来要验证的那**一个**假设，\
              然后去验证它。不要再增加同类只读调用。"
@@ -125,6 +232,7 @@ fn stall_message(since_progress: usize, threshold: usize, stalled_bytes: usize) 
         3 => format!(
             "【失速提醒 · 第 3 级】已连续 {since_progress} 次无实质进展（阈值 {threshold}，\
              累计约 {kb} KB 进上下文）。\n\
+             {profile_clause}\
              **本轮必须二选一**：① 产出一个可验证的进展（构建 / 测试 / 部署）；\
              ② 向用户汇报当前现状、已排除的可能、以及建议的下一步。\n\
              继续只读探索是**纯成本**——每次这样的调用都在消耗上下文预算却不产生结论。"
@@ -134,11 +242,36 @@ fn stall_message(since_progress: usize, threshold: usize, stalled_bytes: usize) 
         //    但纯函数不该在不可达分支上写出「第 3 级」这种与级别自相矛盾的文案——
         //    变异验证正是靠这一点抓出过一个**真隐患**（旧写法把 0 落进第 3 级分支）。
         _ => format!(
-            "已连续 {since_progress} 次工具调用未产生实质进展（无写文件/构建/部署/测试）。\
+            "已连续 {since_progress} 次工具调用未产生实质进展（无写文件/构建/部署/测试）。\n\
+             {profile_clause}\
              若仍在排查请继续推进，但建议尽快进入验证环节（有代码改动就 build_project，\
              能部署就 deploy）；不要长时间停留在只读探索上。"
         ),
     }
+}
+
+/// 画像的一句话描述（**模型侧**）。
+///
+/// 与前端提示条**不是同一段文案**：前端那一版要走 i18n（中英两套），
+/// 而这一版是注入模型的提示词，**必须是中文**。
+/// 两边共用的是**同一份结构化数据**（`StallProfile`），
+/// 所以不会出现「提示条说 read_file、模型看到 grep_files」。
+fn profile_line(profile: &StallProfile) -> Option<String> {
+    if !profile.repeats.is_empty() {
+        let items: Vec<String> = profile
+            .repeats
+            .iter()
+            .map(|r| match &r.target {
+                Some(target) => format!("{}({target}) × {}", r.tool, r.count),
+                None => format!("{} × {}", r.tool, r.count),
+            })
+            .collect();
+        return Some(format!("重复最多的操作是 {}", items.join("、")));
+    }
+    profile
+        .top_tool
+        .as_ref()
+        .map(|t| format!("这段时间主要在用 {}（共 {} 次）", t.tool, t.count))
 }
 
 /// 任务开始时重置护栏状态并记录目标
@@ -206,12 +339,29 @@ pub fn record_tool(
             // 停滞期累计的字节同样要清零：它只描述「这一次停滞」花了多少上下文，
             // 发生过进展后这个数字就不再有意义（否则会一直涨成一个无关的总数）。
             g.stalled_bytes = 0;
+            // 动作画像同生命周期：它描述的也是「这一次停滞」。
+            //
+            // ⚠️ 必须在进展时清零，否则第二段停滞的画像会**混进第一段**——
+            // 用户会看到「你已经重复 read_file 25 次」，而其中 9 次发生在
+            // 上一段停滞里、那次其实是有进展的。
+            g.stall_actions.clear();
             // 发生构建/部署/测试等强验证动作后，清空文件连续编辑计数
             if matches!(tool, "build_project" | "deploy" | "run_tests") {
                 g.edit_counts.clear();
             }
         } else {
             g.since_progress += 1;
+            // 记下「它到底在干什么」。
+            //
+            // ⚠️ 只在**无进展**分支里记：进展动作本身不属于「停滞期内的调用」，
+            // 记进去会让画像把「刚刚那个成功的 build」也算成打转的一部分。
+            let (identity, target) = action_identity(tool, args);
+            let entry = g.stall_actions.entry(identity).or_insert_with(|| StallActionEntry {
+                tool: tool.to_string(),
+                target,
+                count: 0,
+            });
+            entry.count += 1;
         }
 
         // 组装提示
@@ -227,6 +377,9 @@ pub fn record_tool(
         hint.since_progress = g.since_progress;
         hint.stall_threshold = stall_threshold.unwrap_or(0);
         g.notified_stage = stage;
+        // 失速画像：**它到底在干什么**（同一份喂给模型文案与用户提示条）
+        let profile = build_profile(&g.stall_actions);
+        hint.stall_profile = profile.clone();
         if let Some(f) = &g.last_edited {
             if let Some(n) = g.edit_counts.get(f) {
                 if let Some(threshold) = limits.repeat_edit_threshold() {
@@ -246,6 +399,7 @@ pub fn record_tool(
                     g.since_progress,
                     threshold,
                     g.stalled_bytes,
+                    &profile,
                 ));
             }
         }
@@ -313,6 +467,8 @@ pub struct GuardHint {
     pub since_progress: usize,
     /// 当前失速阈值（0 表示该护栏未启用）
     pub stall_threshold: usize,
+    /// 失速画像：**它到底在干什么**（重复最多的动作 + 主导工具）
+    pub stall_profile: StallProfile,
 }
 
 impl GuardHint {
@@ -391,6 +547,115 @@ fn action_signature(tool: &str, args: &serde_json::Value) -> String {
     tool.to_string()
 }
 
+/// 失败黑名单用的**动作签名**：同一命令 / 同一路径算同一个动作。
+///
+/// ⚠️ 与 [`action_identity`] **不是一回事**，别混用：
+/// - 黑名单要的是「**原样重试**」（命令与路径都相同）⇒ 用 `command` / `path` 就够；
+/// - 失速画像要的是「**同一件事**」（同一工具 + 同一标识参数）
+///   ⇒ `grep_files(pattern=foo, path=a)` 与 `grep_files(pattern=foo, path=b)`
+///   在黑名单眼里是同一个动作（都只看 path），在画像眼里**不是**。
+///
+/// 两者口径不同是有意的：黑名单管「别再撞同一堵墙」，画像管「它在重复干什么」。
+fn action_identity(tool: &str, args: &serde_json::Value) -> (String, Option<String>) {
+    let parts = identity_parts(args);
+    // 身份键 = 工具名 + 全部标识参数（**按固定优先级**拼接，与 JSON 字段顺序无关）
+    let mut key = String::from(tool);
+    for (name, value) in &parts {
+        key.push('\u{1f}');
+        key.push_str(name);
+        key.push('=');
+        key.push_str(value);
+    }
+    // 展示目标 = 优先级最高的那个标识参数（没有则 None）
+    let target = parts.first().map(|(_, value)| value.clone());
+    (key, target)
+}
+
+/// 该调用里「标识同一件事」的全部参数，按 [`IDENTITY_ARGS`] 的优先级排列。
+///
+/// ⚠️ **按固定优先级遍历、而不是按 JSON 对象的字段顺序**——
+/// 后者取决于调用方怎么写的，同一件事会算出不同的身份键。
+fn identity_parts(args: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+    let mut parts = Vec::new();
+    for name in IDENTITY_ARGS {
+        let Some(value) = obj.get(*name).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        parts.push(((*name).to_string(), value.to_string()));
+    }
+    parts
+}
+
+/// 由窗口内的动作累积算出**失速画像**（纯函数，便于单测与变异验证）。
+///
+/// ## 两条输出为什么都要有
+///
+/// - 只有「重复动作」：24 次读**不同**文件时列表为空 ⇒ 提示条又退回
+///   「卡了 24 次」这种没有信息量的话。
+/// - 只有「主导工具」：24 次全读**同一个**文件时只显示 `read_file × 24`，
+///   看不出是哪个文件。
+///
+/// ⇒ 两个都给：既说清「哪一类工具」，又说清「具体哪一件事」。
+///
+/// ## 为什么对 hasher 泛型
+///
+/// 默认的 `RandomState` **每个进程种子不同** ⇒ `HashMap` 的迭代序每次运行都变。
+/// 若排序被删掉，输出顺序就跟着变 ⇒ 「顺序确定」这条判据会变成**概率性**的
+/// （多跑几次可能碰巧通过）。单测用**确定性 hasher** 构造输入，
+/// 就能把这条判据变成**确定性**的：删掉排序 ⇒ 必然失败。
+fn build_profile<S: std::hash::BuildHasher>(
+    actions: &HashMap<String, StallActionEntry, S>,
+) -> StallProfile {
+    // 重复动作：只报**真的重复过**的（count ≥ 2）——只出现一次的不是「重复」
+    let mut repeats: Vec<StallActionStat> = actions
+        .values()
+        .filter(|e| e.count >= 2)
+        .map(|e| StallActionStat {
+            tool: e.tool.clone(),
+            target: e.target.clone(),
+            count: e.count,
+        })
+        .collect();
+    // 确定性排序：次数降序 → 工具名升序 → 目标名升序。
+    // ⚠️ 后两级**不能省**：并列时若交给 HashMap 迭代序，
+    // 同一份数据每次显示的顺序会变（这与 T-11 里 `rrf_fuse` 的并列问题同源）。
+    repeats.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.tool.cmp(&b.tool))
+            .then_with(|| {
+                a.target.as_deref().unwrap_or("").cmp(b.target.as_deref().unwrap_or(""))
+            })
+    });
+    repeats.truncate(STALL_PROFILE_TOP_N);
+
+    // 主导工具：跨目标聚合（读 24 个不同文件也算 read_file 的 24 次）
+    let mut agg: HashMap<&str, usize> = HashMap::new();
+    for e in actions.values() {
+        *agg.entry(e.tool.as_str()).or_insert(0) += e.count;
+    }
+    let mut agg: Vec<StallToolStat> = agg
+        .into_iter()
+        .map(|(tool, count)| StallToolStat {
+            tool: tool.to_string(),
+            count,
+        })
+        .collect();
+    // 同样要确定性：次数降序 → 工具名升序，取第一条。
+    // ⚠️ 不用 `max_by`：它在并列时保留**最后一个**最大值，顺序会随迭代序漂。
+    agg.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tool.cmp(&b.tool)));
+    let top_tool = agg.into_iter().next();
+
+    StallProfile { repeats, top_tool }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,9 +679,9 @@ mod tests {
     #[test]
     fn stall_warning_escalates_in_three_stages() {
         let t = 10;
-        let s1 = stall_message(t, t, 0);
-        let s2 = stall_message(t * 2, t, 100 * 1024);
-        let s3 = stall_message(t * 3, t, 100 * 1024);
+        let s1 = stall_message(t, t, 0, &StallProfile::default());
+        let s2 = stall_message(t * 2, t, 100 * 1024, &StallProfile::default());
+        let s3 = stall_message(t * 3, t, 100 * 1024, &StallProfile::default());
         // 前提：三段确实都存在（否则「两两不等」可能是靠 None 蒙混）
         assert!(!s1.is_empty() && !s2.is_empty() && !s3.is_empty());
         assert_ne!(s1, s2, "第 1、2 级文案相同 ⇒ 模型会把重复文本当噪声跳过");
@@ -433,12 +698,12 @@ mod tests {
     #[test]
     fn stall_stage_follows_the_configured_threshold() {
         for t in [3usize, 10, 30] {
-            assert!(!stall_message(t, t, 0).contains("第 2 级"), "阈值 {t}");
-            assert!(stall_message(t * 2, t, 0).contains("第 2 级"), "阈值 {t}");
-            assert!(stall_message(t * 3, t, 0).contains("第 3 级"), "阈值 {t}");
+            assert!(!stall_message(t, t, 0, &StallProfile::default()).contains("第 2 级"), "阈值 {t}");
+            assert!(stall_message(t * 2, t, 0, &StallProfile::default()).contains("第 2 级"), "阈值 {t}");
+            assert!(stall_message(t * 3, t, 0, &StallProfile::default()).contains("第 3 级"), "阈值 {t}");
         }
         // 阈值为 0 时不能除零 panic（agent_limits 允许 0=不限制，但纯函数不该假设）
-        assert!(!stall_message(5, 0, 0).is_empty());
+        assert!(!stall_message(5, 0, 0, &StallProfile::default()).is_empty());
     }
 
     /// 停滞期字节累计：**有实质进展即清零**。
@@ -508,7 +773,7 @@ mod tests {
         let t = 10usize;
         for since in [0, 1, t - 1, t, t + 1, t * 2 - 1, t * 2, t * 2 + 1, t * 3 - 1, t * 3, t * 4, t * 9] {
             let level = stall_stage(since, Some(t));
-            let msg = stall_message(since, t, 0);
+            let msg = stall_message(since, t, 0, &StallProfile::default());
             // 文案里的级别标记：带「第 N 级」的是 2/3，不带的是「未分级」（0 或 1）
             let msg_level = if msg.contains("第 3 级") {
                 3
@@ -645,5 +910,273 @@ mod tests {
         record_tool(cid, "build_project", &args, true, 0);
         let h = record_tool(cid, "build_project", &args, false, 0);
         assert!(h.converge_warning.is_none());
+    }
+
+    // ========================================================================
+    // 失速画像（第三十三批）：**它到底在干什么**
+    // ========================================================================
+
+    /// 画像的核心：**同一个动作**被重复调用才算「重复」。
+    ///
+    /// 「同一动作」= 同一工具 + 同一标识参数（同一文件 / 同一搜索词 / 同一条命令）。
+    #[test]
+    fn stall_profile_counts_repeated_actions() {
+        let cid = "test-conv-profile";
+        begin_task(cid, "查一个问题");
+        let same = serde_json::json!({"path":"src/main.ets"});
+        let other = serde_json::json!({"path":"src/other.ets"});
+
+        // 同一个文件读 3 次 → 一个 count=3 的重复动作
+        for _ in 0..3 {
+            record_tool(cid, "read_file", &same, true, 0);
+        }
+        // 另一个文件读 1 次 → **不算重复**（只出现一次的不是重复）
+        record_tool(cid, "read_file", &other, true, 0);
+
+        let h = record_tool(cid, "read_file", &same, true, 0);
+        let repeats = &h.stall_profile.repeats;
+        assert_eq!(repeats.len(), 1, "只应有一条重复动作：{repeats:?}");
+        assert_eq!(repeats[0].tool, "read_file");
+        assert_eq!(repeats[0].count, 4, "同一文件共 4 次：{repeats:?}");
+        assert_eq!(repeats[0].target.as_deref(), Some("src/main.ets"));
+    }
+
+    /// 单次调用**不进**重复列表，但仍进主导工具统计。
+    ///
+    /// 这两条输出是互补的：24 次读**不同**文件时重复列表为空，
+    /// 但「主要在用 read_file × 24」仍要显示出来。
+    #[test]
+    fn stall_profile_only_reports_actual_repeats() {
+        let cid = "test-conv-profile-single";
+        begin_task(cid, "查一个问题");
+        for i in 0..5 {
+            let args = serde_json::json!({"path": format!("src/f{i}.ets")});
+            record_tool(cid, "read_file", &args, true, 0);
+        }
+        let h = record_tool(cid, "read_file", &serde_json::json!({"path":"src/x.ets"}), true, 0);
+        assert!(
+            h.stall_profile.repeats.is_empty(),
+            "每个文件只读一次 ⇒ 不该有重复动作：{:?}",
+            h.stall_profile.repeats
+        );
+        let top = h.stall_profile.top_tool.expect("主导工具应存在");
+        assert_eq!(top.tool, "read_file");
+        assert_eq!(top.count, 6, "跨目标聚合 ⇒ 6 次：{top:?}");
+    }
+
+    /// 主导工具是**跨目标聚合**的：同一工具读 3 个不同文件也算它的 3 次。
+    ///
+    /// ⚠️ 判据要卡住「取重复列表里的第一条」这种改法——
+    /// 那会给出 `read_file × 1` 而不是 `read_file × 3`。
+    #[test]
+    fn stall_profile_top_tool_aggregates_across_targets() {
+        let cid = "test-conv-profile-agg";
+        begin_task(cid, "查一个问题");
+        for path in ["a.ets", "b.ets", "c.ets"] {
+            for _ in 0..2 {
+                record_tool(cid, "read_file", &serde_json::json!({"path": path}), true, 0);
+            }
+        }
+        let h = record_tool(cid, "list_dir", &serde_json::Value::Null, true, 0);
+        let top = h.stall_profile.top_tool.expect("主导工具应存在");
+        assert_eq!(top.tool, "read_file", "read_file 6 次 > list_dir 1 次");
+        assert_eq!(top.count, 6, "跨目标聚合，不是单目标次数：{top:?}");
+        assert_eq!(h.stall_profile.repeats.len(), 3, "三个文件各 2 次 ⇒ 三条重复");
+    }
+
+    /// 画像随**实质进展**清零（与 `stalled_bytes` 同一生命周期）。
+    ///
+    /// ⚠️ 判据不能只到「第二段也有画像」为止：若不清零，
+    /// 第二段会把**第一段**的动作一起算进来 ⇒ 用户看到
+    /// 「你已经重复 read_file 9 次」，而其中几次发生在**有进展**的那一段里。
+    #[test]
+    fn stall_profile_resets_on_progress() {
+        let cid = "test-conv-profile-reset";
+        begin_task(cid, "查一个问题");
+        let a = serde_json::json!({"path":"src/a.ets"});
+        let b = serde_json::json!({"path":"src/b.ets"});
+
+        // 第一段停滞：a.ets 读 5 次
+        for _ in 0..5 {
+            record_tool(cid, "read_file", &a, true, 0);
+        }
+        // 一次实质进展 ⇒ 窗口重置
+        record_tool(cid, "build_project", &serde_json::Value::Null, true, 0);
+        // 第二段停滞：b.ets 读 3 次
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(record_tool(cid, "read_file", &b, true, 0));
+        }
+        let h = last.expect("应有最后一次");
+        let repeats = &h.stall_profile.repeats;
+        assert_eq!(repeats.len(), 1, "只剩第二段的动作：{repeats:?}");
+        assert_eq!(repeats[0].count, 3, "第二段重新起算，不是 5+3：{repeats:?}");
+        assert_eq!(repeats[0].target.as_deref(), Some("src/b.ets"));
+        assert!(
+            !repeats.iter().any(|r| r.target.as_deref() == Some("src/a.ets")),
+            "第一段的 a.ets 不该混进第二段：{repeats:?}"
+        );
+    }
+
+    /// **有进展的动作本身不算进画像**。
+    ///
+    /// 它是「刚刚那个成功的 build」，不是「停滞期内的调用」。
+    #[test]
+    fn stall_profile_excludes_progress_actions() {
+        let cid = "test-conv-profile-progress";
+        begin_task(cid, "查一个问题");
+        // 先让窗口里有点内容
+        record_tool(cid, "list_dir", &serde_json::Value::Null, true, 0);
+        // 一次成功构建 = 实质进展 ⇒ 窗口重置 ⇒ 画像里不该有它
+        let h = record_tool(cid, "build_project", &serde_json::Value::Null, true, 0);
+        assert!(
+            h.stall_profile.repeats.is_empty(),
+            "进展动作不该进重复列表：{:?}",
+            h.stall_profile.repeats
+        );
+        assert!(
+            h.stall_profile.top_tool.is_none(),
+            "进展动作不该进主导工具：{:?}",
+            h.stall_profile.top_tool
+        );
+    }
+
+    /// 「同一件事」的判定**因工具而异**：不能一律看 `path`。
+    ///
+    /// `grep_files` 带 `pattern` 与可选 `path`（缺省项目根）：
+    /// 只看 `path` 的话，20 次不同关键词的 grep 会因为都带同一个 path
+    /// 而塌成「同一个动作」⇒ 画像直接废掉。
+    #[test]
+    fn stall_profile_identity_uses_tool_specific_args() {
+        let cid = "test-conv-profile-identity";
+        begin_task(cid, "查一个问题");
+
+        // 同一关键词、同一路径 → 同一个动作
+        let g1 = serde_json::json!({"pattern":"payment","path":"src"});
+        // 同一关键词、**不同**路径 → 不是同一个动作
+        let g2 = serde_json::json!({"pattern":"payment","path":"lib"});
+        // 不同关键词、同一路径 → 也不是同一个动作
+        let g3 = serde_json::json!({"pattern":"refund","path":"src"});
+
+        record_tool(cid, "grep_files", &g1, true, 0);
+        record_tool(cid, "grep_files", &g2, true, 0);
+        record_tool(cid, "grep_files", &g3, true, 0);
+        record_tool(cid, "grep_files", &g1, true, 0);
+
+        let h = record_tool(cid, "grep_files", &g1, true, 0);
+        let repeats = &h.stall_profile.repeats;
+        assert_eq!(repeats.len(), 1, "只有 g1 重复过：{repeats:?}");
+        assert_eq!(repeats[0].count, 3, "g1 调了 3 次：{repeats:?}");
+        assert_eq!(repeats[0].target.as_deref(), Some("payment"));
+    }
+
+    /// 读**同一个文件的不同行段**仍算同一件事。
+    ///
+    /// T-8 实测里 `read_file` 单次可返回 15K 字、`AGENTS.md` 一次 44.6KB——
+    /// 分段反复读同一个文件是最典型的烧上下文方式，
+    /// 所以 `start` / `lines` 这类**窗口参数不能进身份键**。
+    #[test]
+    fn stall_profile_ignores_window_params() {
+        let cid = "test-conv-profile-window";
+        begin_task(cid, "查一个问题");
+        record_tool(cid, "read_file", &serde_json::json!({"path":"a.ets","start":1}), true, 0);
+        record_tool(cid, "read_file", &serde_json::json!({"path":"a.ets","start":200}), true, 0);
+        let h = record_tool(cid, "read_file", &serde_json::json!({"path":"a.ets","lines":50}), true, 0);
+        let repeats = &h.stall_profile.repeats;
+        assert_eq!(repeats.len(), 1, "同一文件的三种窗口 ⇒ 一个动作：{repeats:?}");
+        assert_eq!(repeats[0].count, 3, "{repeats:?}");
+    }
+
+    /// 输出的顺序**必须是确定的**：次数降序 → 工具名升序 → 目标名升序。
+    ///
+    /// ⚠️ 判据用**确定性 hasher** 构造输入，并额外断言
+    /// 「输入的迭代序 ≠ 期望的输出序」——
+    /// 否则删掉排序后，输出会退化成 `HashMap` 的迭代序，
+    /// 而默认 `RandomState` 每进程种子不同 ⇒ 这条判据会变成**概率性**的。
+    #[test]
+    fn stall_profile_order_is_deterministic() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::BuildHasherDefault;
+
+        type DetMap = HashMap<String, StallActionEntry, BuildHasherDefault<DefaultHasher>>;
+        let mut map: DetMap = HashMap::default();
+        for (tool, count) in [("zeta", 9usize), ("alpha", 5), ("beta", 5)] {
+            map.insert(
+                tool.to_string(),
+                StallActionEntry {
+                    tool: tool.to_string(),
+                    target: None,
+                    count,
+                },
+            );
+        }
+        // 前提：输入的迭代序**不等于**期望的输出序（否则删掉排序也可能碰巧通过）
+        let iteration_order: Vec<&str> = map.values().map(|e| e.tool.as_str()).collect();
+        assert_ne!(
+            iteration_order,
+            vec!["zeta", "alpha", "beta"],
+            "这条判据的前提不成立：迭代序恰好等于期望序，换一组数据"
+        );
+
+        let profile = build_profile(&map);
+        let order: Vec<&str> = profile.repeats.iter().map(|r| r.tool.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["zeta", "alpha", "beta"],
+            "次数降序 → 工具名升序：{order:?}"
+        );
+        // 主导工具同样确定：次数降序 → 工具名升序
+        let top = profile.top_tool.expect("主导工具应存在");
+        assert_eq!(top.tool, "zeta");
+        assert_eq!(top.count, 9);
+    }
+
+    /// 画像要**点名**给模型看：不然模型不知道自己这 N 次到底干了什么。
+    #[test]
+    fn stall_message_names_the_repeated_action() {
+        let profile = StallProfile {
+            repeats: vec![StallActionStat {
+                tool: "read_file".to_string(),
+                target: Some("src/main.ets".to_string()),
+                count: 9,
+            }],
+            top_tool: Some(StallToolStat {
+                tool: "read_file".to_string(),
+                count: 9,
+            }),
+        };
+        let t = 10usize;
+        for since in [t, t * 2, t * 3] {
+            let msg = stall_message(since, t, 0, &profile);
+            assert!(
+                msg.contains("read_file"),
+                "文案应点名工具名（since={since}）：{msg}"
+            );
+            assert!(
+                msg.contains("src/main.ets"),
+                "文案应点名目标（since={since}）：{msg}"
+            );
+            assert!(msg.contains('9'), "文案应写出重复次数（since={since}）：{msg}");
+        }
+        // 画像为空时不许留下空行/残句
+        let empty = stall_message(t * 2, t, 0, &StallProfile::default());
+        assert!(!empty.contains("**你在重复做同一件事**"), "{empty}");
+        assert!(!empty.contains("\n\n\n"), "不该有空行：{empty}");
+    }
+
+    /// 提示里要带上画像（前端据此显示「它在干什么」）。
+    #[test]
+    fn hint_carries_profile() {
+        let cid = "test-conv-hint-profile";
+        begin_task(cid, "查一个问题");
+        let args = serde_json::json!({"path":"src/main.ets"});
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(record_tool(cid, "read_file", &args, true, 0));
+        }
+        let h = last.expect("应有最后一次");
+        assert_eq!(h.stall_profile.repeats.len(), 1);
+        assert_eq!(h.stall_profile.repeats[0].count, 3);
+        assert_eq!(h.stall_profile.repeats[0].tool, "read_file");
     }
 }

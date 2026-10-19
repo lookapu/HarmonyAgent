@@ -215,6 +215,8 @@
     "guardCount": "{{count}} consecutive tool calls without real progress",
     "guardBytes": "{{kb}} added to context during the stall",
     "guardAdvice": "Stop it to redirect, or just tell it what you want",
+    "guardRepeats": "Most repeated:",
+    "guardTopTool": "Mostly using:",
     "shortcutSearchPlaceholder": "Search shortcuts (by action or key)",
     "shortcutNoResults": "No matching shortcuts",
     "shortcutCopyHint": "Click to copy the key combination",

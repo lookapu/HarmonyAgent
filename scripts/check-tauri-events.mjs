@@ -609,6 +609,280 @@ export function parseLanUiSubscriptions(src) {
 }
 
 // ===========================================================================
+// 载荷字段对账：前端 `listen<{…}>` 声明的字段 ⇄ 后端事件结构体的序列化字段
+// ===========================================================================
+//
+// ## 为什么事件名对上了还不够
+//
+// 事件名是**字符串字面量** ⇒ 改名会静默失效。
+// 但**载荷字段名同样是字符串**：前端 `listen<{ conversation_id: string }>` 手写，
+// 后端 `pub struct XxxEvent { pub conversation_id: String }` 也是手写，
+// **两侧编译器互不相识**（TypeScript 看不到 Rust，Rust 看不到 TS）。
+// ⇒ 字段名拼错时：类型检查绿、单测绿、构建绿、运行时不报错，
+// 那个字段**恒为 undefined** ⇒ 功能静默失效。
+//
+// 这在「事件名对账」这一层完全看不见——名字对了，字段错了，照样全绿。
+//
+// ## 判据方向：**前端字段 ⊆ 后端字段**
+//
+// - 后端多发字段 → 前端不声明 ⇒ **没问题**（前端只是不用它）。
+// - 前端声明了后端不发的字段 ⇒ **有问题**（那个值恒为 undefined）。
+//
+// ⇒ 只查这一个方向。另一个方向（后端多发）不是缺陷，查了会误报。
+//
+// ## 只在**两侧都解得出**时比对
+//
+// - 前端：泛型必须是**内联对象类型**（`listen<{…}>`）；
+//   命名类型（`listen<SomeType>`）需要跨文件解析类型定义 ⇒ 本门不做。
+// - 后端：载荷必须是**结构体字面量**（`app.emit("x", XxxEvent { … })`）；
+//   `serde_json::json!({…})` 与表达式载荷 ⇒ 本门不做。
+//
+// 跳过不是「通过」，所以比对数量带**非空下限**——抽取规则失效时报红。
+
+/** 抽取下限：低于这个数量说明抽取规则已失效，需要修门禁而不是放行。 */
+export const MIN_PAYLOAD_COMPARISONS = 10
+
+/**
+ * 前端：`listen<{…}>` 的**内联对象类型**里声明的顶层字段。
+ *
+ * ⚠️ 只取**顶层**成员：`profile: { repeats: { tool: string }[] }` 的顶层字段是
+ * `profile`，`tool` 是嵌套类型里的字段——用「全文找 `ident:`」会把它们混进来，
+ * 于是后端没有 `tool` 字段时报红（假阳性）。
+ */
+export function collectSubscriptionPayloads(files, perFile) {
+  const out = new Map()
+  for (const [file, locals] of perFile) {
+    const sf = parseTs(file)
+    const rel = relative(REPO, file).split('\\').join('/')
+    collectPayloadsFromSf(sf, locals, rel, out)
+  }
+  return out
+}
+
+/**
+ * 从一个**已解析**的 TS 源文件里收集 `listen<{…}>` 的内联对象类型。
+ *
+ * 拆出来是为了让自测能在**内存**里跑（不必往磁盘写临时文件）。
+ */
+export function collectPayloadsFromSf(sf, locals, rel, out) {
+  const visit = (node) => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+        && locals.has(node.expression.text)) {
+      const arg = node.arguments[0]
+      if (arg && (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg))) {
+        // TS 5+ 用 typeArguments；旧版是 typeParameters
+        const typeArgs = node.typeArguments ?? node.typeParameters
+        const t = typeArgs && typeArgs[0]
+        if (t && ts.isTypeLiteralNode(t)) {
+          const fields = new Set()
+          for (const member of t.members) {
+            if (!ts.isPropertySignature(member)) continue
+            const name = member.name
+            if (ts.isIdentifier(name)) fields.add(name.text)
+            else if (ts.isStringLiteral(name)) fields.add(name.text)
+          }
+          const at = `${rel}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`
+          if (!out.has(arg.text)) out.set(arg.text, [])
+          out.get(arg.text).push({ fields, at })
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sf)
+  return out
+}
+
+/** serde 的 `rename_all` 规则 → 字段名。 */
+export function applyRenameAll(name, rule) {
+  if (!rule || rule === 'none') return name
+  const parts = name.split('_').filter(Boolean)
+  switch (rule) {
+    case 'camelCase':
+      if (!parts.length) return name
+      return parts[0] + parts.slice(1).map((p) => p[0].toUpperCase() + p.slice(1)).join('')
+    case 'PascalCase':
+      return parts.map((p) => p[0].toUpperCase() + p.slice(1)).join('')
+    case 'SCREAMING_SNAKE_CASE':
+      return name.toUpperCase()
+    case 'kebab-case':
+      return name.replace(/_/g, '-')
+    case 'lowercase':
+      return name.toLowerCase()
+    case 'UPPERCASE':
+      return name.toUpperCase()
+    default:
+      return name
+  }
+}
+
+/**
+ * 解析一个结构体体 ⇒ 序列化后的字段名列表。
+ *
+ * ⚠️ **私有字段也要算**：serde 的派生实现与结构体同模块，
+ * `conversation_id: String`（没有 `pub`）照样会被序列化。
+ * 只认 `pub` 字段会把它们全漏掉 ⇒ 门禁误报「前端声明的字段后端没有」。
+ * 代价是**曾经的真误报**：`GenDoneEvent` 等 4 个结构体的字段全是私有的。
+ *
+ * 返回 `null` 表示**算不出来**（有 `#[serde(flatten)]`：顶层字段来自内层结构，
+ * 逐字段枚举不成立）⇒ 调用方跳过这个结构体，而不是当成「没有字段」。
+ */
+export function parseStructBody(body) {
+  const masked = maskComments(body)
+  // 属性块（可能跨行）：先把它们挖出来并**原地留白**（保持行数与位置）
+  const attrs = []
+  // ⚠️ `String.replace` 的 replacer 签名是 `(match, ...captures, offset, string)`——
+  //    **没有 `.index`**（那是 `RegExp.exec` 才有的）。
+  //    写成 `m.index` 会得到 undefined ⇒ `a.end` 算成 NaN ⇒
+  //    「属性是否属于本字段」的比较永远为假 ⇒ skip/rename 会**串到上一个字段**上。
+  const flat = masked.replace(/#\[[^\]]*\]/g, (m, offset) => {
+    attrs.push({ start: offset, end: offset + m.length, text: m })
+    return m.replace(/[^\n]/g, ' ')
+  })
+  // 结构体级 rename_all：取**第一个**（Rust 惯例是放在最上面）
+  let renameAll = 'none'
+  for (const a of attrs) {
+    const hit = /rename_all\s*=\s*"([^"]+)"/.exec(a.text)
+    if (hit) { renameAll = hit[1]; break }
+  }
+  // 字段：逐行找「标识符 + 冒号」
+  const fields = []
+  let offset = 0
+  for (const line of flat.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed) {
+      // 用「前缀组 + 名字组」分开，才能拿到名字的**准确列号**
+      //（`line.indexOf(name)` 会命中前缀里的字母：`pub b` 里的 b 其实在 "pub" 里）
+      const fm = /^((?:pub(?:\([^)]*\))?\s+)?)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*/.exec(trimmed)
+      if (fm) {
+        const lead = line.length - line.trimStart().length
+        fields.push({ name: fm[2], start: offset + lead + fm[1].length })
+      }
+    }
+    offset += line.length + 1
+  }
+  // 字段 ⇄ 属性：属性归属于「它与本字段之间没有别的字段」的那一个
+  const fieldsOut = []
+  let prevStart = 0
+  for (const f of fields) {
+    let rename = null
+    let skip = false
+    let flatten = false
+    for (const a of attrs) {
+      if (a.start < prevStart) continue
+      if (a.end > f.start) break
+      const rn = /\brename\s*=\s*"([^"]+)"/.exec(a.text)
+      if (rn) { rename = rn[1]; continue }
+      if (/(^|[\s,(])skip(_serializing)?\s*([,\)])/.test(a.text)) { skip = true; continue }
+      if (/(^|[\s,(])flatten\s*([,\)])/.test(a.text)) { flatten = true; continue }
+    }
+    prevStart = f.start
+    if (skip) continue
+    if (flatten) return null
+    fieldsOut.push(rename ?? applyRenameAll(f.name, renameAll))
+  }
+  return fieldsOut
+}
+
+/** 解析一个 Rust 源文件里的所有结构体 ⇒ 名字 → 序列化字段名列表。 */
+export function parseStructFields(src) {
+  const masked = maskComments(src)
+  const out = new Map()
+  const re = /(?:pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*\{/g
+  let m
+  while ((m = re.exec(masked))) {
+    const openIdx = m.index + m[0].length - 1
+    const closeIdx = matchPair(masked, openIdx, '{', '}')
+    if (closeIdx < 0) continue
+    const fields = parseStructBody(masked.slice(openIdx + 1, closeIdx))
+    if (fields) out.set(m[1], fields)
+  }
+  return out
+}
+
+/**
+ * 后端：事件名 ⇒ 该事件用的**载荷结构体名**。
+ *
+ * 只认**字面量事件名** + **结构体字面量载荷**：
+ * `app.emit("chat-guard", ChatGuardEvent { … })`。
+ */
+export function collectEventPayloadTypes(modules) {
+  const out = new Map()
+  for (const mod of modules) {
+    const masked = mod.masked
+    const re = /\.emit\(\s*("(?:[^"\\]|\\.)*")/g
+    let m
+    while ((m = re.exec(masked))) {
+      const eventName = m[1].slice(1, -1)
+      const openIdx = m.index + 5
+      if (masked[openIdx] !== '(') continue
+      const { ranges } = splitArgRanges(masked, openIdx)
+      const payload = ranges[1]
+      if (!payload) continue
+      const text = masked.slice(payload[0], payload[1]).trim()
+      const pm = /^&?\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)\s*\{/.exec(text)
+      if (!pm) continue
+      const structName = pm[1]
+      if (!out.has(eventName)) out.set(eventName, new Set())
+      out.get(eventName).add(structName)
+    }
+  }
+  return out
+}
+
+/**
+ * 判据：前端声明的载荷字段必须在后端结构体的序列化结果里存在。
+ *
+ * @param {object} p
+ * @param {Map} p.listenedPayloads 前端 `listen<{…}>` 的字段集合
+ * @param {Map} p.payloadTypes      事件名 → 后端载荷结构体名集合
+ * @param {Map} p.structFields      结构体名 → 序列化字段名数组
+ */
+export function auditPayloads(
+  { listenedPayloads, payloadTypes, structFields },
+  minComparisons = MIN_PAYLOAD_COMPARISONS,
+) {
+  const problems = []
+  const notes = []
+  let compared = 0
+  for (const [event, entries] of [...listenedPayloads.entries()].sort()) {
+    const types = payloadTypes.get(event)
+    if (!types || types.size === 0) {
+      notes.push(`事件 ${event} 的后端载荷形态本门解不出（不是结构体字面量）⇒ 载荷字段未比对`)
+      continue
+    }
+    if (types.size > 1) {
+      notes.push(`事件 ${event} 有 ${types.size} 种载荷结构体（${[...types].join('、')}）⇒ 本门只比对单一结构体的情况，已跳过`)
+      continue
+    }
+    const structName = [...types][0]
+    const fields = structFields.get(structName)
+    if (!fields) {
+      notes.push(`事件 ${event} 的载荷结构体 ${structName} 在后端源码里找不到（或用了 flatten）⇒ 载荷字段未比对`)
+      continue
+    }
+    const backendFields = new Set(fields)
+    for (const entry of entries) {
+      compared += 1
+      const missing = [...entry.fields].filter((f) => !backendFields.has(f)).sort()
+      if (missing.length) {
+        problems.push(
+          `前端订阅 ${event} 时声明的载荷字段 ${missing.join('、')} `
+          + `在后端 ${structName} 的序列化结果里不存在（${entry.at}）`
+          + ` ⇒ 该字段运行时恒为 undefined，功能静默失效`
+        )
+      }
+    }
+  }
+  if (compared < minComparisons) {
+    problems.push(
+      `只比对了 ${compared} 组前后端载荷字段，抽取规则可能已失效（下限 ${minComparisons}）`
+    )
+  }
+  return { problems, notes, compared }
+}
+
+// ===========================================================================
 // 判据
 // ===========================================================================
 
@@ -720,9 +994,20 @@ export function scan() {
   }
   if (exists(LAN_UI)) lanUi = parseLanUiSubscriptions(readFileSync(LAN_UI, 'utf-8'))
 
+  // 载荷字段对账用的三张表
+  const listenedPayloads = collectSubscriptionPayloads(tsFiles, perFile)
+  const payloadTypes = collectEventPayloadTypes(modules)
+  const structFields = new Map()
+  for (const mod of modules) {
+    for (const [name, fields] of parseStructFields(mod.masked)) {
+      if (!structFields.has(name)) structFields.set(name, fields)
+    }
+  }
+
   return {
     listened, listenDynamic, emitted, undetermined, whitelist, directSse, lanUi,
     importFiles: perFile.size, sources: sources.length,
+    listenedPayloads, payloadTypes, structFields,
   }
 }
 
@@ -931,6 +1216,86 @@ fn install(app: &AppHandle) {
   ok('发射集合完整时同一组数据必须判红',
     String(mk(['node-runtime-progress'], ['chat-stream']).problems.length), '1')
 
+  // --- 载荷字段对账：结构体解析 ---
+  ok('公有字段被解析',
+    String(parseStructBody('pub conversation_id: String,\npub stage: u8,')), 'conversation_id,stage')
+  // ⚠️ **私有字段也要算**：serde 的派生实现与结构体同模块，私有字段照样会被序列化。
+  //    只认 `pub` 会把 `GenDoneEvent` 等 4 个结构体的字段全漏掉 ⇒ 门禁误报。
+  ok('私有字段也必须被解析（serde 照样序列化它们）',
+    String(parseStructBody('conversation_id: String,\nmessage: ChatMessage,')), 'conversation_id,message')
+  ok('pub(crate) 字段被解析',
+    String(parseStructBody('pub(crate) kind: String,')), 'kind')
+  ok('结构体级 rename_all=camelCase 生效',
+    String(parseStructBody('#[serde(rename_all = "camelCase")]\npub conversation_id: String,')),
+    'conversationId')
+  ok('字段级 rename 覆盖 rename_all',
+    String(parseStructBody('#[serde(rename_all = "camelCase")]\n#[serde(rename = "conv")]\npub conversation_id: String,')),
+    'conv')
+  ok('serde(skip) 的字段不参与序列化',
+    String(parseStructBody('pub a: String,\n#[serde(skip)]\npub b: String,')), 'a')
+  ok('serde(flatten) ⇒ 算不出来（返回 null）',
+    String(parseStructBody('pub a: String,\n#[serde(flatten)]\npub rest: Rest,')), 'null')
+  ok('注释里的字段行不得被算成字段',
+    String(parseStructBody('// pub fake: String,\npub real: String,')), 'real')
+  ok('rename_all 规则换算正确',
+    `${applyRenameAll('conversation_id', 'camelCase')}|${applyRenameAll('a_b', 'kebab-case')}`
+    + `|${applyRenameAll('a_b', 'SCREAMING_SNAKE_CASE')}|${applyRenameAll('a_b', 'none')}`,
+    'conversationId|a-b|A_B|a_b')
+
+  // --- 载荷字段对账：前端内联对象类型 ---
+  const payloadFromSource = (src) => {
+    const sf = ts.createSourceFile('p.ts', src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    return collectPayloadsFromSf(sf, new Set(['listen']), 'p.ts', new Map())
+  }
+  const pl = payloadFromSource(`listen<{ conversation_id: string; profile: { repeats: { tool: string }[] } }>('chat-guard', () => {})`)
+  ok('内联对象类型的事件被收集', String(pl.has('chat-guard')), 'true')
+  ok('只取**顶层**字段（嵌套类型里的字段不得混进来）',
+    String([...pl.get('chat-guard')[0].fields].sort().join(',')), 'conversation_id,profile')
+  ok('命名类型不产出载荷（跨文件解析类型定义本门不做）',
+    String(payloadFromSource(`listen<SomeType>('x', () => {})`).has('x')), 'false')
+  ok('没有泛型的 listen 不产出载荷',
+    String(payloadFromSource(`listen('x', () => {})`).has('x')), 'false')
+
+  // --- 载荷字段对账：事件 ⇄ 结构体 ---
+  const payloadMod = mkMod('/fake/p.rs', `fn go(app: &AppHandle) {
+  let _ = app.emit("chat-guard", ChatGuardEvent {
+    conversation_id: c,
+    stage: 1,
+  });
+  let _ = app.emit("chat-other", serde_json::json!({ "a": 1 }));
+}`)
+  const pt = collectEventPayloadTypes([payloadMod])
+  ok('结构体字面量载荷的事件被收集', String([...pt.keys()].sort().join(',')), 'chat-guard')
+  ok('json! 载荷不产出结构体', String(pt.has('chat-other')), 'false')
+
+  // --- 载荷字段对账：判据 ---
+  // ⚠️ 下限传 0：自测要能单独验证「字段缺失判红」，
+  //    不能被「比对组数不足」这条守卫混在一起（否则测的是守卫不是判据）。
+  const structFields = new Map([
+    ['ChatGuardEvent', ['conversation_id', 'stage', 'profile']],
+  ])
+  const mkPayload = (listenedPayloads, types = new Map([['chat-guard', new Set(['ChatGuardEvent'])]])) =>
+    auditPayloads({ listenedPayloads, payloadTypes: types, structFields }, 0)
+  const good = mkPayload(new Map([['chat-guard', [{ fields: new Set(['conversation_id', 'stage']), at: 'x.ts:1' }]]]))
+  ok('字段一致时零问题', String(good.problems.length), '0')
+  const bad = mkPayload(new Map([['chat-guard', [{ fields: new Set(['conversation_id', 'profileX']), at: 'x.ts:1' }]]]))
+  ok('前端多声明的字段必须报出', String(bad.problems.length), '1')
+  ok('报出的信息必须含字段名与事件名',
+    String(bad.problems[0]?.includes('profileX') && bad.problems[0]?.includes('chat-guard')), 'true')
+  ok('后端多发字段不得误报（只查前端 ⊆ 后端这一个方向）',
+    String(mkPayload(new Map([['chat-guard', [{ fields: new Set(['conversation_id']), at: 'x.ts:1' }]]])).problems.length), '0')
+  ok('比对了 0 组必须报红（假全绿守卫）',
+    String(auditPayloads({ listenedPayloads: new Map(), payloadTypes: new Map(), structFields }, 10).problems.length), '1')
+  ok('后端载荷形态解不出时只留 note 不判红',
+    String(mkPayload(new Map([['chat-guard', [{ fields: new Set(['x']), at: 'x.ts:1' }]]]),
+      new Map([['chat-guard', new Set()]])).problems.length), '0')
+  ok('同一事件多个载荷结构体时跳过并留 note',
+    String(mkPayload(new Map([['chat-guard', [{ fields: new Set(['x']), at: 'x.ts:1' }]]]),
+      new Map([['chat-guard', new Set(['A', 'B'])]])).problems.length), '0')
+  ok('跳过的情形必须留下 note（不能静默跳过）',
+    String(mkPayload(new Map([['chat-guard', [{ fields: new Set(['x']), at: 'x.ts:1' }]]]),
+      new Map([['chat-guard', new Set()]])).notes.length > 0), 'true')
+
   let passed = 0
   for (const c of cases) {
     if (String(c.got) === String(c.want)) passed += 1
@@ -949,6 +1314,10 @@ function main() {
 
   const s = scan()
   const { problems, notes } = audit(s)
+  // 载荷字段对账：**事件名对上了、字段名对不上**是另一类静默失效
+  const payloadAudit = auditPayloads(s)
+  problems.push(...payloadAudit.problems)
+  notes.push(...payloadAudit.notes)
 
   const sayNotes = () => { for (const n of notes) console.log(`注：${n}`) }
 
@@ -983,6 +1352,9 @@ function main() {
   console.log(
     `Tauri 事件对齐：桌面端订阅 ${s.listened.size} 个事件，全部有后端 emit`
     + `（后端共发射 ${s.emitted.size} 个）· LAN 白名单 ${(s.whitelist ?? []).length} 条 · 动态订阅点 ${s.listenDynamic.length} 处`
+  )
+  console.log(
+    `载荷字段对齐：比对了 ${payloadAudit.compared} 组前后端载荷字段，全部一致`
   )
   return 0
 }

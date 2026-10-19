@@ -11,7 +11,7 @@ import { useTranslation } from 'react-i18next'
 import { NOTE_MAX_LEN, useNoteStore } from '../../stores/noteStore'
 import { usePinStore } from '../../stores/pinStore'
 import { useProjectStore } from '../../stores/projectStore'
-import { formatBytes, useGuardStore } from '../../stores/guardStore'
+import { formatBytes, truncateTarget, useGuardStore } from '../../stores/guardStore'
 import { setConversationContextPin } from '../../api/project'
 import Icon from '../../icons/Icon'
 import { Button } from '../ui/Button'
@@ -39,6 +39,15 @@ export function GuardBar({ convId }: { convId: string }) {
   // 没失速（或已恢复）就不渲染——空占位会给对话流留一条无意义的白边
   if (!guard || guard.stage <= 0) return null
   const stage = Math.min(3, Math.max(1, guard.stage)) as 1 | 2 | 3
+  // 失速画像：**它到底在干什么**。
+  //
+  // 「连续 24 次」是个没有信息量的数字——用户分不清
+  // 「反复读同一个文件」（真打转，该叫停）与「读了 24 个不同文件」（是探索）。
+  // ⇒ 有重复动作就点名重复的；没有重复就退到「主要在用什么工具」
+  //    （跨目标聚合：读 24 个不同文件也是 read_file × 24）。
+  const profile = guard.profile
+  const repeats = profile?.repeats ?? []
+  const topTool = profile?.topTool ?? null
   return (
     <div
       role="status"
@@ -58,6 +67,27 @@ export function GuardBar({ convId }: { convId: string }) {
         {' · '}
         {t('home.guardBytes', { kb: formatBytes(guard.stalledBytes) })}
       </div>
+      {/* 它到底在干什么：有重复动作就点名重复的，没有就退到主导工具 */}
+      {repeats.length > 0 ? (
+        <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
+          <span className="shrink-0">{t('home.guardRepeats')}</span>
+          {repeats.map((r) => (
+            <span key={`${r.tool}:${r.target ?? ''}`} className="tnum">
+              <span className="font-medium opacity-90">{r.tool}</span>
+              {r.target && <span className="opacity-70"> {truncateTarget(r.target)}</span>}
+              <span className="opacity-70"> ×{r.count}</span>
+            </span>
+          ))}
+        </div>
+      ) : topTool ? (
+        <div className="mt-1 flex flex-wrap items-baseline gap-x-2 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
+          <span className="shrink-0">{t('home.guardTopTool')}</span>
+          <span className="tnum">
+            <span className="font-medium opacity-90">{topTool.tool}</span>
+            <span className="opacity-70"> ×{topTool.count}</span>
+          </span>
+        </div>
+      ) : null}
       <div className="mt-0.5 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
         {t('home.guardAdvice')}
       </div>

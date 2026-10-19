@@ -215,6 +215,8 @@
     "guardCount": "连续 {{count}} 次工具调用没有实质进展",
     "guardBytes": "停滞期已累计 {{kb}} 进上下文",
     "guardAdvice": "可以点「停止」让它换个思路，或直接告诉它你要什么",
+    "guardRepeats": "重复最多：",
+    "guardTopTool": "主要在用：",
     "shortcutSearchPlaceholder": "搜索快捷键（功能名或键位）",
     "shortcutNoResults": "没有匹配的快捷键",
     "shortcutCopyHint": "点击复制键位组合",
