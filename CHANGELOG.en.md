@@ -6,6 +6,70 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 45: force wrap-up — stop the tool loop when level 3 is ignored (2026-10-21)
+
+Batches 32–34 made stalls visible and actionable, but the guard itself was still **only
+text**: level 3 said "choose one of two", and the model could keep exploring until the
+budget ran out. This batch adds the missing piece: once the force-wrap-up line is crossed,
+the tool loop **actually stops** and the model may only produce one text report.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### Why "strictly greater", not "stop on arrival"
+
+The level-3 warning is appended to the tool result in the round where
+`since_progress = 3 × threshold`; the model only sees it on the next request.
+Stopping on arrival would mean the strongest warning never gets a chance to work — it
+would turn "warn, then act" back into "act immediately".
+⇒ The force condition is `since_progress > stall_force_wrapup_threshold`: the model gets
+one full round of action after seeing the highest warning; only a round with no real
+progress after that is cut off.
+
+### Wrap-up is not a silent stop
+
+- A **stall-specific** wrap-up prompt names the consecutive count, the stalled context
+  bytes and the repeated actions, and asks for text only: confirmed facts / ruled-out
+  possibilities / what is still missing / suggested next step.
+- Whether or not the model produces a summary, the assistant message always carries a
+  visible reason: "N consecutive tool calls without real progress (about X KB entered the
+  context during this stall); the guard forced a wrap-up."
+- If the summary request fails, a fixed notice is used instead and points to "Change
+  approach" or a new instruction — the user is never left with a stop and no explanation.
+
+### Configurable, defaulting after level 3
+
+Settings now expose **Stall Force Wrap-up** (`stall_force_wrapup_threshold`), default
+**30** — 3× the default stall threshold of 10: the task passes the 1× / 2× / 3× warnings
+and is forced to wrap up only **after more than** 30 stalled calls. Set 0 or -1 to disable;
+it also stays inactive when stall detection itself is off.
+
+An absolute N alone is not enough: if the user raises the stall threshold to 30, call 30
+is exactly level 3, and a fixed N=30 would wrap up in that same round — **the strongest
+warning would never be shown**. ⇒ The effective threshold is `max(N, 3 × stall threshold)`.
+With defaults it is still 30; raising the stall threshold moves the wrap-up line with it,
+so "warn before acting" holds under every configuration.
+
+Configs saved by older versions lack this field: `AgentLimits` now uses `serde(default)`,
+so missing fields fall back to their defaults instead of failing the whole deserialization
+and resetting every guard.
+
+### Boundary
+
+- Only the **current task's** tool loop is stopped; produced content and the ledger are
+  kept. The task finishes as **not completed** (`exhausted=true`), so acceptance cannot
+  count it as done.
+- The check runs **after all tools in a round finish**: progress actions (edit / build /
+  test) clear the counter and reset the signal first, so a correct action the model just
+  made is never cut off.
+- No new tools, migrations or frontend events; just one setting and two i18n strings.
+
+### Verification
+
+`task_guard` tests **23/23** (2 new: strictly-greater + disabled when the guard is off /
+fires once + resets after progress) · `agent_limits` **5/5** (missing-field fallback) ·
+`cargo check` / clippy warnings stay at the **57** baseline · frontend `tsc` / `eslint`
+green · i18n keys **2286** (+2, zh/en aligned; union **2288**) · wording, key-usage and
+duplicate-key gates green.
+
 ## Unreleased — Batch 34: make a stall actionable — one click to send "change approach" into the running task (2026-10-21)
 
 The previous two batches made stalls **visible** (batch 32) and made the banner

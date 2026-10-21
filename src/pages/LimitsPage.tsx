@@ -23,6 +23,7 @@ const DEFAULT_LIMITS: AgentLimits = {
   blacklist_fail_threshold: 4,
   repeat_edit_threshold: 3,
   stall_tool_threshold: 10,
+  stall_force_wrapup_threshold: 30,
   build_fail_converge_threshold: 5,
   goal_reinject_interval: 8,
 }
@@ -45,6 +46,7 @@ const FIELD_GROUPS: { groupKey: string; fields: LimitField[] }[] = [
       { key: 'blacklist_fail_threshold', labelKey: 'limits.blacklist', descKey: 'limits.blacklistDesc', defaultVal: DEFAULT_LIMITS.blacklist_fail_threshold },
       { key: 'repeat_edit_threshold', labelKey: 'limits.repeatEdit', descKey: 'limits.repeatEditDesc', defaultVal: DEFAULT_LIMITS.repeat_edit_threshold },
       { key: 'stall_tool_threshold', labelKey: 'limits.stall', descKey: 'limits.stallDesc', defaultVal: DEFAULT_LIMITS.stall_tool_threshold },
+      { key: 'stall_force_wrapup_threshold', labelKey: 'limits.stallWrapup', descKey: 'limits.stallWrapupDesc', defaultVal: DEFAULT_LIMITS.stall_force_wrapup_threshold },
       { key: 'build_fail_converge_threshold', labelKey: 'limits.buildFail', descKey: 'limits.buildFailDesc', defaultVal: DEFAULT_LIMITS.build_fail_converge_threshold },
       { key: 'goal_reinject_interval', labelKey: 'limits.goalReinject', descKey: 'limits.goalReinjectDesc', defaultVal: DEFAULT_LIMITS.goal_reinject_interval },
     ],

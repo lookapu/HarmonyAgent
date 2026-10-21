@@ -35,6 +35,9 @@ pub const DEFAULT_BLACKLIST_FAIL_THRESHOLD: i64 = 4;
 pub const DEFAULT_REPEAT_EDIT_THRESHOLD: i64 = 3;
 /// 失速检测阈值：连续无实质进展的工具调用次数
 pub const DEFAULT_STALL_TOOL_THRESHOLD: i64 = 10;
+/// 失速强制收尾阈值：连续无进展调用**超过**此次数后强制结束任务
+/// （严格大于——到达阈值的那一轮正是第 3 级警告写进工具结果的一轮，模型还没看到它）
+pub const DEFAULT_STALL_FORCE_WRAPUP_THRESHOLD: i64 = 30;
 /// 构建连续失败达到此次数时强制收敛（停止盲目重试）
 pub const DEFAULT_BUILD_FAIL_CONVERGE_THRESHOLD: i64 = 5;
 /// 目标锚定重注入间隔（每 N 轮工具调用把用户目标重注入系统提示）
@@ -44,7 +47,11 @@ pub const DEFAULT_GOAL_REINJECT_INTERVAL: i64 = 8;
 const MAX_LIMIT_VALUE: i64 = 1_000_000;
 
 /// Agent 护栏参数。字段为 0 或 -1 表示不限制（关闭该项护栏）。
+///
+/// `serde(default)`：设置页保存的 JSON 里没有后加字段时按默认值补齐。
+/// 否则升级后旧配置整份反序列化失败，会把所有护栏一起退回默认值。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AgentLimits {
     /// 单任务工具调用总预算
     pub tool_call_limit: i64,
@@ -64,6 +71,8 @@ pub struct AgentLimits {
     pub repeat_edit_threshold: i64,
     /// 失速检测阈值（无实质进展的工具调用次数）
     pub stall_tool_threshold: i64,
+    /// 失速强制收尾阈值（连续无进展调用超过 N 次后强制结束任务）
+    pub stall_force_wrapup_threshold: i64,
     /// 构建连续失败收敛阈值
     pub build_fail_converge_threshold: i64,
     /// 目标锚定重注入间隔（每 N 轮工具调用）
@@ -82,6 +91,7 @@ impl Default for AgentLimits {
             blacklist_fail_threshold: DEFAULT_BLACKLIST_FAIL_THRESHOLD,
             repeat_edit_threshold: DEFAULT_REPEAT_EDIT_THRESHOLD,
             stall_tool_threshold: DEFAULT_STALL_TOOL_THRESHOLD,
+            stall_force_wrapup_threshold: DEFAULT_STALL_FORCE_WRAPUP_THRESHOLD,
             build_fail_converge_threshold: DEFAULT_BUILD_FAIL_CONVERGE_THRESHOLD,
             goal_reinject_interval: DEFAULT_GOAL_REINJECT_INTERVAL,
         }
@@ -102,6 +112,7 @@ impl AgentLimits {
             &mut self.blacklist_fail_threshold,
             &mut self.repeat_edit_threshold,
             &mut self.stall_tool_threshold,
+            &mut self.stall_force_wrapup_threshold,
             &mut self.build_fail_converge_threshold,
             &mut self.goal_reinject_interval,
         ];
@@ -160,6 +171,10 @@ impl AgentLimits {
     /// 失速检测阈值（None = 关闭失速检测）
     pub fn stall_tool_threshold(&self) -> Option<usize> {
         Self::opt(self.stall_tool_threshold)
+    }
+    /// 失速强制收尾阈值（None = 不强制收尾）
+    pub fn stall_force_wrapup_threshold(&self) -> Option<usize> {
+        Self::opt(self.stall_force_wrapup_threshold)
     }
     /// 构建连续失败收敛阈值（None = 关闭收敛提示）
     pub fn build_fail_converge_threshold(&self) -> Option<usize> {
@@ -238,8 +253,22 @@ mod tests {
         assert_eq!(d.blacklist_fail_threshold(), Some(DEFAULT_BLACKLIST_FAIL_THRESHOLD as usize));
         assert_eq!(d.repeat_edit_threshold(), Some(DEFAULT_REPEAT_EDIT_THRESHOLD as usize));
         assert_eq!(d.stall_tool_threshold(), Some(DEFAULT_STALL_TOOL_THRESHOLD as usize));
+        assert_eq!(d.stall_force_wrapup_threshold(), Some(DEFAULT_STALL_FORCE_WRAPUP_THRESHOLD as usize));
         assert_eq!(d.build_fail_converge_threshold(), Some(DEFAULT_BUILD_FAIL_CONVERGE_THRESHOLD as usize));
         assert_eq!(d.goal_reinject_interval(), Some(DEFAULT_GOAL_REINJECT_INTERVAL as usize));
+    }
+
+    /// 旧版本保存的配置没有后加字段：缺字段按默认值补齐，不能整份退回默认。
+    #[test]
+    fn missing_fields_fall_back_to_defaults() {
+        let l: AgentLimits = serde_json::from_str(r#"{"tool_call_limit":100}"#).unwrap();
+        assert_eq!(l.tool_call_limit, 100);
+        assert_eq!(
+            l.stall_force_wrapup_threshold,
+            DEFAULT_STALL_FORCE_WRAPUP_THRESHOLD,
+            "旧配置缺新字段时应补默认值，而不是反序列化失败"
+        );
+        assert_eq!(l.stall_tool_threshold, DEFAULT_STALL_TOOL_THRESHOLD);
     }
 
     #[test]

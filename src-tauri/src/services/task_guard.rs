@@ -3,7 +3,7 @@
 //! 设计目标：
 //! - **目标锚定**：记录本轮任务的用户目标，每 N 轮把目标重注入系统提示，防止模型跑题。
 //! - **失速检测**：连续多次工具调用没有"实质进展信号"（写文件/构建/部署/测试）时，
-//!   触发一次强制建议（构建验证 / 重新规划 / 终止）。
+//!   逐级升级提示；越过强制收尾线后由调用方终止工具循环，让模型只做一次文字汇报。
 //! - **同文件反复修改**：同一文件被连续编辑达到阈值时，强制要求先构建验证再继续改。
 //! - **失败方案黑名单**：记录已失败的命令/动作签名，阻止模型用完全相同的方式重试。
 //!
@@ -19,6 +19,9 @@ use serde::Serialize;
 pub const REPEAT_EDIT_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_REPEAT_EDIT_THRESHOLD as usize;
 /// 触发失速检测的"无进展"工具调用次数（默认值；运行时以 agent_limits 配置为准）
 pub const STALL_TOOL_THRESHOLD: usize = crate::services::agent_limits::DEFAULT_STALL_TOOL_THRESHOLD as usize;
+/// 失速强制收尾阈值（默认值；运行时以 agent_limits 配置为准）
+pub const STALL_FORCE_WRAPUP_THRESHOLD: usize =
+    crate::services::agent_limits::DEFAULT_STALL_FORCE_WRAPUP_THRESHOLD as usize;
 /// 目标锚定重注入间隔（每 N 轮工具调用，默认值；运行时以 agent_limits 配置为准）
 pub const GOAL_REINJECT_INTERVAL: usize = crate::services::agent_limits::DEFAULT_GOAL_REINJECT_INTERVAL as usize;
 /// 构建连续失败达到此次数时强制收敛（默认值；运行时以 agent_limits 配置为准）
@@ -95,6 +98,12 @@ struct ConversationGuard {
     failed_actions: HashMap<String, usize>,
     /// 连续构建失败次数（构建成功时清零）
     build_fail_streak: usize,
+    /// 本任务是否已触发过强制收尾（一次性；发生实质进展时复位）
+    ///
+    /// 调用方在**一轮工具执行完之后**取这个信号。到达阈值的那一轮正是
+    /// 第 3 级警告写进工具结果的一轮，模型还没看到它；因此取信号的判据是
+    /// **严格大于**阈值（多给一轮宽限），否则第 3 级文案永远没有生效机会。
+    wrapup_forced: bool,
 }
 
 /// 停滞窗口内的一个动作（内部记账用）。
@@ -144,6 +153,78 @@ pub struct StallProfile {
     pub repeats: Vec<StallActionStat>,
     /// 窗口内调用最多的工具（跨目标聚合）；窗口为空时为 None
     pub top_tool: Option<StallToolStat>,
+}
+
+/// 强制收尾信号（越线时取一次）。
+#[derive(Clone, Debug, Default)]
+pub struct StallWrapup {
+    /// 越线时的连续无进展次数
+    pub since_progress: usize,
+    /// 本次停滞累计进上下文的字节数
+    pub stalled_bytes: usize,
+    /// 生效的强制收尾阈值
+    pub threshold: usize,
+    /// 本次停滞的动作画像（收尾提示里点名它在重复什么）
+    pub profile: StallProfile,
+}
+
+/// 实际生效的强制收尾阈值。
+///
+/// 取 `max(配置值, 3 × 失速阈值)`：配置值是**下限之上的偏好**，而三级警告必须先
+/// 全部走完。否则用户把失速阈值调到 30、收尾阈值仍是默认 30 时，任务会在第 1 级
+/// 刚出现时就被掐断，第 2/3 级文案永远没有机会出现。
+/// 任一护栏关闭（None/0）时返回 None。
+pub fn effective_force_wrapup_threshold(
+    stall_threshold: Option<usize>,
+    force_threshold: Option<usize>,
+) -> Option<usize> {
+    let (Some(stall), Some(force)) = (stall_threshold, force_threshold) else {
+        return None;
+    };
+    if stall == 0 || force == 0 {
+        return None;
+    }
+    Some(force.max(stall.saturating_mul(3)))
+}
+
+/// 是否已越过强制收尾线。
+///
+/// **严格大于**生效阈值：到达阈值的那一轮正是第 3 级警告写进工具结果的
+/// 一轮，模型还没看到它；当场掐断会让第 3 级文案永远没有生效机会。
+/// 失速检测本身被关闭（`stall_threshold` 为 None/0）时永不强制收尾——
+/// 强制收尾是失速护栏的一部分，不该在护栏关掉后单独生效。
+pub fn should_force_wrapup(
+    since_progress: usize,
+    stall_threshold: Option<usize>,
+    force_threshold: Option<usize>,
+) -> bool {
+    let Some(threshold) = effective_force_wrapup_threshold(stall_threshold, force_threshold) else {
+        return false;
+    };
+    since_progress > threshold
+}
+
+/// 取强制收尾信号：越线时返回快照并记账，同一任务不再重复返回。
+///
+/// 调用点必须在**一轮工具执行完之后**：写/构建/测试等进展动作会把
+/// `since_progress` 清零并复位本信号，先检查后执行会把模型刚做的正确动作掐掉。
+pub fn take_force_wrapup(conversation_id: &str) -> Option<StallWrapup> {
+    let limits = crate::services::agent_limits::current();
+    let stall = limits.stall_tool_threshold();
+    let force = limits.stall_force_wrapup_threshold();
+    let effective = effective_force_wrapup_threshold(stall, force);
+    guard_mut(conversation_id, |g| {
+        if g.wrapup_forced || !should_force_wrapup(g.since_progress, stall, force) {
+            return None;
+        }
+        g.wrapup_forced = true;
+        Some(StallWrapup {
+            since_progress: g.since_progress,
+            stalled_bytes: g.stalled_bytes,
+            threshold: effective.unwrap_or(0),
+            profile: build_profile(&g.stall_actions),
+        })
+    })
 }
 
 static GUARDS: OnceLock<Mutex<HashMap<String, ConversationGuard>>> = OnceLock::new();
@@ -204,11 +285,11 @@ pub fn stall_stage(since_progress: usize, threshold: Option<usize>) -> u8 {
 /// 把「你在重复 read_file 同一个文件 9 次」直接写进提示词，
 /// 模型才有可能据此换动作。
 ///
-/// ## 边界：这里**只升级措辞，不强制收尾**
+/// ## 边界：文案只升级措辞；真正的强制收尾在 [`take_force_wrapup`]
 ///
-/// 「该在哪一轮强制中断」是产品判断（见台账 T-8 的待定部分），**本函数不碰它**：
-/// 三级文案最重也只是要求模型「本轮必须二选一」，**不会真的终止循环**。
-/// 越过这条线就不是工程判断而是替用户做产品决定了。
+/// 三级文案最重也只是要求模型「本轮必须二选一」，本身**不会终止循环**。
+/// 终止循环由调用方在越过 `stall_force_wrapup_threshold` 后执行，
+/// 这样提示与中断各自只有一个真源，不会出现「文案说该停了、循环还在跑」。
 fn stall_message(
     since_progress: usize,
     threshold: usize,
@@ -256,7 +337,7 @@ fn stall_message(
 /// 而这一版是注入模型的提示词，**必须是中文**。
 /// 两边共用的是**同一份结构化数据**（`StallProfile`），
 /// 所以不会出现「提示条说 read_file、模型看到 grep_files」。
-fn profile_line(profile: &StallProfile) -> Option<String> {
+pub(crate) fn profile_line(profile: &StallProfile) -> Option<String> {
     if !profile.repeats.is_empty() {
         let items: Vec<String> = profile
             .repeats
@@ -336,6 +417,9 @@ pub fn record_tool(
         let is_progress = is_progress_action(tool, ok, !edited_files.is_empty());
         if is_progress {
             g.since_progress = 0;
+            // 发生进展就复位强制收尾信号：若之后再次失速，应重新给满整段宽限，
+            // 而不是继承上一段停滞已经用掉的「一次性」额度。
+            g.wrapup_forced = false;
             // 停滞期累计的字节同样要清零：它只描述「这一次停滞」花了多少上下文，
             // 发生过进展后这个数字就不再有意义（否则会一直涨成一个无关的总数）。
             g.stalled_bytes = 0;
@@ -758,6 +842,62 @@ mod tests {
         assert_eq!(stall_stage(t * 9, Some(t)), 3, "再往上封顶在第 3 级");
         assert_eq!(stall_stage(100, None), 0, "护栏被关掉时恒为 0");
         assert_eq!(stall_stage(100, Some(0)), 3, "阈值为 0 不该除零 panic");
+    }
+
+    /// 强制收尾线是**严格大于**，且失速护栏关闭时不能单独生效。
+    #[test]
+    fn force_wrapup_threshold_is_strict_and_requires_stall_guard() {
+        assert!(should_force_wrapup(31, Some(10), Some(30)));
+        assert!(!should_force_wrapup(30, Some(10), Some(30)), "到达阈值仍要留一轮宽限");
+        assert!(!should_force_wrapup(31, None, Some(30)), "失速护栏关闭时不该强制收尾");
+        assert!(!should_force_wrapup(31, Some(10), None), "收尾阈值关闭时不强制");
+        assert!(!should_force_wrapup(31, Some(0), Some(30)));
+        assert!(!should_force_wrapup(31, Some(10), Some(0)));
+        // 下限：失速阈值 30 时，配置的 30 不能让任务在第 1 级就被掐断
+        assert_eq!(effective_force_wrapup_threshold(Some(30), Some(30)), Some(90));
+        assert_eq!(effective_force_wrapup_threshold(Some(10), Some(10)), Some(30));
+        assert!(!should_force_wrapup(90, Some(30), Some(30)));
+        assert!(should_force_wrapup(91, Some(30), Some(30)));
+    }
+
+    /// 强制收尾信号：越线取一次、带画像；发生进展后重新获得完整额度。
+    #[test]
+    fn force_wrapup_fires_once_and_resets_after_progress() {
+        let cid = "test-conv-force-wrapup";
+        begin_task(cid, "查一个问题");
+        let v = serde_json::Value::Null;
+
+        // 到达阈值时不触发（第 3 级警告刚写进这一轮的工具结果，模型还没看到）
+        for _ in 0..STALL_FORCE_WRAPUP_THRESHOLD {
+            record_tool(cid, "list_dir", &v, true, 1024);
+        }
+        assert!(take_force_wrapup(cid).is_none(), "到达阈值仍要留一轮宽限");
+
+        let h = record_tool(cid, "list_dir", &v, true, 1024);
+        assert_eq!(h.stall_stage, 3);
+        let info = take_force_wrapup(cid).expect("超过阈值必须返回强制收尾信号");
+        assert_eq!(info.since_progress, STALL_FORCE_WRAPUP_THRESHOLD + 1);
+        assert_eq!(
+            info.threshold,
+            STALL_FORCE_WRAPUP_THRESHOLD.max(STALL_TOOL_THRESHOLD * 3)
+        );
+        assert!(
+            info.stalled_bytes >= (STALL_FORCE_WRAPUP_THRESHOLD + 1) * 1024,
+            "收尾信号应带上这次停滞的上下文成本：{}",
+            info.stalled_bytes
+        );
+        assert!(info.profile.top_tool.is_some(), "收尾提示应带上动作画像");
+        assert!(take_force_wrapup(cid).is_none(), "同一段停滞只触发一次");
+
+        // 实质进展复位信号：新的一段停滞应重新给满额度
+        record_tool(cid, "build_project", &serde_json::Value::Null, true, 0);
+        for _ in 0..=STALL_FORCE_WRAPUP_THRESHOLD {
+            record_tool(cid, "list_dir", &v, true, 0);
+        }
+        assert!(
+            take_force_wrapup(cid).is_some(),
+            "进展后再次失速应能再次强制收尾"
+        );
     }
 
     /// 级别与文案**同源**：文案里出现的级别必须与 `stall_stage` 算出来的一致。

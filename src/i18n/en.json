@@ -1604,6 +1604,8 @@
     "repeatEditDesc": "Forces a build verification after editing the same file N times without one",
     "stall": "Stall Detection",
     "stallDesc": "Escalating reminder after N tool calls with no real progress: advisory at N, stronger wording at 2N / 3N plus the context the stall has already consumed",
+    "stallWrapup": "Stall Force Wrap-up",
+    "stallWrapupDesc": "After more than N consecutive tool calls without real progress, end the task and let the Agent report once in text (0 or -1 disables). The effective threshold is the larger of N and 3× the stall threshold, so raising the stall threshold never skips the warnings",
     "buildFail": "Build-Fail Converge",
     "buildFailDesc": "Forces a new approach or a user report after N consecutive build failures",
     "goalReinject": "Goal Reinject Interval",

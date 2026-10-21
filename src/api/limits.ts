@@ -20,6 +20,8 @@ export interface AgentLimits {
   repeat_edit_threshold: number
   /** 失速检测阈值（无实质进展的工具调用次数） */
   stall_tool_threshold: number
+  /** 失速强制收尾阈值（连续无进展调用超过 N 次后强制结束任务） */
+  stall_force_wrapup_threshold: number
   /** 构建连续失败收敛阈值 */
   build_fail_converge_threshold: number
   /** 目标锚定重注入间隔（每 N 轮工具调用） */

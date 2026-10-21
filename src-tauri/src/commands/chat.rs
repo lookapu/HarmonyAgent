@@ -4711,6 +4711,7 @@ async fn enforce_tool_budget_limit(
         inputs.stats,
         inputs.state,
         &mut inputs.round_state.placeholder_msg_id,
+        FinalSummaryCause::ToolLimit,
     )
     .await;
     if !summary.trim().is_empty() {
@@ -4753,7 +4754,7 @@ struct DesktopRoundState {
     last_model_text: String,
     /// 上次未完成任务落库的账本（断点续跑继承，结束时保存或清空）
     prev_ledger: Option<TaskLedger>,
-    /// 是否已被护栏强制收尾（上限/预算/用户拒绝拦截）
+    /// 是否已被护栏强制收尾（上限/预算/用户拒绝拦截/失速）
     exhausted: bool,
     /// 统一执行循环当前阶段（变化时写 Durable Run 事件并注入本轮提示）
     workflow_stage: Option<crate::agent::execution_loop::LoopStage>,
@@ -7149,9 +7150,48 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
     Ok(())
 }
 
-/// 工具轮次/预算耗尽时的收尾总结：追加提示消息请求模型直接总结（禁止再调工具）。
-/// 返回剥离标记后的总结文本；请求失败返回空串（由调用方用固定说明兜底），
-/// 保证任务结束时用户总能得到明确收尾而不是静默停止。
+/// 收尾总结的触发原因（决定注入模型的那句话）。
+enum FinalSummaryCause<'a> {
+    /// 工具轮次/预算耗尽
+    ToolLimit,
+    /// 失速强制收尾：模型已经越过护栏线，只允许做一次文字汇报
+    Stall {
+        since_progress: usize,
+        stalled_bytes: usize,
+        profile: &'a crate::services::task_guard::StallProfile,
+    },
+}
+
+impl FinalSummaryCause<'_> {
+    fn prompt(&self) -> String {
+        match self {
+            Self::ToolLimit => {
+                "（系统提示：工具调用已达上限，无法继续执行工具。请直接基于以上已获取的信息总结当前进展与结论，或给出后续建议步骤；不要再调用任何工具。）".to_string()
+            }
+            Self::Stall {
+                since_progress,
+                stalled_bytes,
+                profile,
+            } => {
+                let kb = stalled_bytes / 1024;
+                let profile_clause = crate::services::task_guard::profile_line(profile)
+                    .map(|line| format!("；本次停滞主要在重复：{line}"))
+                    .unwrap_or_default();
+                format!(
+                    "（系统提示：强制收尾。你已连续 {since_progress} 次工具调用没有实质进展，\
+                     本次停滞已累计约 {kb} KB 进入上下文{profile_clause}。\
+                     护栏已终止后续工具调用。请不要再调用任何工具，直接向用户汇报：\
+                     ① 已经确认的事实；② 已排除的可能；③ 当前还缺什么；④ 建议的下一步。\
+                     汇报要具体，不要重复探索过程。）"
+                )
+            }
+        }
+    }
+}
+
+/// 工具轮次/预算耗尽或失速强制收尾时的收尾总结：追加提示消息请求模型直接总结
+/// （禁止再调工具）。返回剥离标记后的总结文本；请求失败返回空串（由调用方用固定
+/// 说明兜底），保证任务结束时用户总能得到明确收尾而不是静默停止。
 async fn request_final_summary(
     app: &AppHandle,
     client: &reqwest::Client,
@@ -7166,11 +7206,12 @@ async fn request_final_summary(
     stats: &mut ChatRunStats,
     state: &tauri::State<'_, DbState>,
     placeholder: &mut Option<String>,
+    cause: FinalSummaryCause<'_>,
 ) -> String {
     let mut msgs = messages.to_vec();
     msgs.push(serde_json::json!({
         "role": "user",
-        "content": "（系统提示：工具调用已达上限，无法继续执行工具。请直接基于以上已获取的信息总结当前进展与结论，或给出后续建议步骤；不要再调用任何工具。）",
+        "content": cause.prompt(),
     }));
     match stream_once(
         app,
@@ -10696,6 +10737,7 @@ async fn apply_tool_batch(
                     stats,
                     state,
                     &mut local_placeholder,
+                    FinalSummaryCause::ToolLimit,
                 )
                 .await;
                 if !summary.trim().is_empty() {
@@ -11036,6 +11078,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
                             stats,
                             state,
                             &mut round_state.placeholder_msg_id,
+                            FinalSummaryCause::ToolLimit,
                         )
                         .await;
                         if !summary.trim().is_empty() {
@@ -11351,7 +11394,7 @@ async fn run_one_tool(inputs: ToolExecInputs<'_>) -> Result<ToolExecOutcome, Cha
 
 /// 一轮工具执行的结论（替代原内联代码末尾的 `break` / `continue`）。
 enum ToolRoundOutcome {
-    /// 被护栏强制收尾（上限/预算/用户拒绝拦截）：调用方置位 `exhausted` 并结束任务
+    /// 被护栏强制收尾（上限/预算/用户拒绝拦截/失速）：调用方置位 `exhausted` 并结束任务
     Finish,
     /// 本轮工具执行完毕：调用方进入下一轮
     ContinueRound,
@@ -11416,7 +11459,7 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
         mcp,
         task_started,
     } = inputs;
-    // 本轮是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾）
+    // 本轮是否被上限/预算/用户拒绝拦截/失速（拦截后给模型总结机会并结束任务，不静默收尾）
     let mut exhausted = false;
             // 工具循环是否被上限/预算/用户拒绝拦截（拦截后给模型总结机会并结束任务，不静默收尾；
             // 本函数内的 exhausted 一旦置位即返回 Finish，由调用方结束任务——强制收尾时账本需保留）
@@ -11658,6 +11701,60 @@ async fn run_tool_calls(inputs: ToolRoundInputs<'_>) -> Result<ToolRoundOutcome,
                 })
                 .await?;
                 if intercepted {
+                    exhausted = true;
+                }
+            }
+            // 失速强制收尾：**必须在本轮工具全部执行完之后**检查。
+            // 写/构建/测试等进展动作会把 since_progress 清零并复位信号；
+            // 在工具执行前检查会把模型刚做的正确动作掐掉。
+            if !exhausted {
+                if let Some(wrapup) = crate::services::task_guard::take_force_wrapup(conversation_id) {
+                    crate::utils::logger::log_event(
+                        "stall_force_wrapup",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "since_progress": wrapup.since_progress,
+                            "stalled_bytes": wrapup.stalled_bytes,
+                            "threshold": wrapup.threshold,
+                        }),
+                    );
+                    // 只允许一次文字总结（禁止再调工具），并给用户留下「为什么停」。
+                    let summary = request_final_summary(
+                        app,
+                        client,
+                        protocol,
+                        provider,
+                        model_choice,
+                        opts,
+                        messages,
+                        conversation_id,
+                        cancel,
+                        registry,
+                        stats,
+                        state,
+                        &mut round_state.placeholder_msg_id,
+                        FinalSummaryCause::Stall {
+                            since_progress: wrapup.since_progress,
+                            stalled_bytes: wrapup.stalled_bytes,
+                            profile: &wrapup.profile,
+                        },
+                    )
+                    .await;
+                    if !summary.trim().is_empty() {
+                        round_state.full.push_str("\n\n");
+                        round_state.full.push_str(&summary);
+                        round_state.full.push_str(&format!(
+                            "\n\n> ⚠️ 已连续 {} 次工具调用没有实质进展（本次停滞累计约 {} KB 进上下文），护栏已强制收尾。",
+                            wrapup.since_progress,
+                            wrapup.stalled_bytes / 1024
+                        ));
+                    } else {
+                        round_state.full.push_str(&format!(
+                            "\n\n> ⚠️ 已连续 {} 次工具调用没有实质进展（本次停滞累计约 {} KB 进上下文），护栏已强制收尾；可点「换个思路」或重新发送指令继续。",
+                            wrapup.since_progress,
+                            wrapup.stalled_bytes / 1024
+                        ));
+                    }
                     exhausted = true;
                 }
             }
