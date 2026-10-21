@@ -1768,6 +1768,47 @@ fn message_by_id_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<O
     .map_err(|e| e.to_string())
 }
 
+/// 最近一次发送的对话选项在 settings 里的键。
+fn chat_options_key(conversation_id: &str) -> String {
+    format!("chat_options:{conversation_id}")
+}
+
+/// 保存会话最近一次发送的对话选项：空闲自动拉起没有前端请求可带参数，
+/// 必须复用用户最后一次显式选择，否则模型、审批策略与「一起提交」都会悄悄
+/// 退回默认值。`resume_run_id` 是一次性恢复指令，不能随偏好回放。
+fn save_chat_options_conn(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    options: &ChatOptions,
+) -> Result<(), String> {
+    let mut snapshot = options.clone();
+    snapshot.resume_run_id = None;
+    let raw = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![chat_options_key(conversation_id), raw],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 读取最近一次发送的对话选项；缺失或损坏时返回 None（走后端默认值）。
+fn load_chat_options_conn(conn: &rusqlite::Connection, conversation_id: &str) -> Option<ChatOptions> {
+    let raw = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [chat_options_key(conversation_id)],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let mut options = serde_json::from_str::<ChatOptions>(&raw).ok()?;
+    options.resume_run_id = None;
+    Some(options)
+}
+
 /// 空闲队列能否自动拉起：任务刚被停止时队列保留给用户决定（与任务内
 /// 自动续跑一致），项目正被其他会话占用时也不抢先——否则消息会从排队条
 /// 消失却在项目锁后静默等待。
@@ -1794,7 +1835,7 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
             .map(|set| set.contains(conversation_id))
             .unwrap_or(true);
     let state = app.state::<DbState>();
-    let (project_id, queued) = {
+    let (project_id, queued, options) = {
         let Ok(conn) = state.0.lock() else { return };
         let project_id = match conn
             .query_row("SELECT project_id FROM conversations WHERE id = ?1", [conversation_id], |r| {
@@ -1809,7 +1850,9 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
             Ok(Some(message)) => message,
             _ => return,
         };
-        (project_id, queued)
+        // 自动拉起没有前端请求可带参数：复用该会话最后一次发送的选项
+        let options = load_chat_options_conn(&conn, conversation_id);
+        (project_id, queued, options)
     };
     let project_busy = app
         .state::<ChatLock>()
@@ -1838,7 +1881,7 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
             plan,
             conv_for_task,
             String::new(),
-            None,
+            options,
             Some(false),
             None,
             None,
@@ -2385,7 +2428,10 @@ mod history_order_tests {
 
 #[cfg(test)]
 mod queued_claim_tests {
-    use super::{claim_queued_message, first_queued_message_conn, idle_queue_start_allowed, queue_batch_conn};
+    use super::{
+        chat_options_key, claim_queued_message, first_queued_message_conn, idle_queue_start_allowed,
+        load_chat_options_conn, queue_batch_conn, save_chat_options_conn, ChatOptions,
+    };
 
     fn setup() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2408,6 +2454,7 @@ mod queued_claim_tests {
                 created_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE conversations (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT INTO conversations (id, updated_at) VALUES ('c1', 0);",
         )
         .unwrap();
@@ -2521,6 +2568,50 @@ mod queued_claim_tests {
         assert!(!idle_queue_start_allowed(true, false), "项目正被其他会话占用时不抢先");
         assert!(!idle_queue_start_allowed(false, true), "用户刚停止时队列保留");
         assert!(!idle_queue_start_allowed(true, true));
+    }
+
+    #[test]
+    fn chat_options_roundtrip_keeps_choices_but_drops_one_shot_resume() {
+        let conn = setup();
+        let saved = ChatOptions {
+            model_id: Some("model-a".into()),
+            temperature: Some(0.3),
+            tool_approval: Some("ask".into()),
+            plan_mode: Some(true),
+            batch_queued: Some(true),
+            reply_language: Some("zh".into()),
+            resume_run_id: Some("run-old".into()),
+            ..Default::default()
+        };
+        save_chat_options_conn(&conn, "c1", &saved).unwrap();
+
+        let loaded = load_chat_options_conn(&conn, "c1").expect("必须读回");
+        assert_eq!(loaded.model_id.as_deref(), Some("model-a"));
+        assert_eq!(loaded.temperature, Some(0.3));
+        assert_eq!(loaded.tool_approval.as_deref(), Some("ask"));
+        assert_eq!(loaded.plan_mode, Some(true));
+        assert_eq!(loaded.batch_queued, Some(true), "一起提交不能退回逐个续跑");
+        assert_eq!(loaded.reply_language.as_deref(), Some("zh"));
+        assert_eq!(loaded.resume_run_id, None, "一次性恢复指令不得随偏好回放");
+
+        // 同一会话只保留最新一份
+        save_chat_options_conn(&conn, "c1", &ChatOptions { model_id: Some("model-b".into()), ..Default::default() }).unwrap();
+        assert_eq!(load_chat_options_conn(&conn, "c1").unwrap().model_id.as_deref(), Some("model-b"));
+        let rows: i64 = conn.query_row("SELECT COUNT(1) FROM settings", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn chat_options_absent_or_corrupt_falls_back_to_defaults() {
+        let conn = setup();
+        assert!(load_chat_options_conn(&conn, "c1").is_none());
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, '{not-json')",
+            [chat_options_key("c1")],
+        )
+        .unwrap();
+        assert!(load_chat_options_conn(&conn, "c1").is_none(), "损坏快照不得阻止自动拉起");
+        assert!(load_chat_options_conn(&conn, "c2").is_none(), "选项按会话隔离");
     }
 }
 
@@ -2999,7 +3090,7 @@ fn resolve_aux_economy(
 }
 
 /// 对话级设置（来自对话框，随每次请求覆盖 Provider/模型默认值）
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct ChatOptions {
     /// 指定模型记录 ID（跨 Provider 选择；缺省用当前默认模型）
     pub model_id: Option<String>,
@@ -3242,6 +3333,13 @@ pub async fn stream_chat(
 ) -> Result<(), String> {
     // 任一前台消息到达都使旧后台语义批次在当前批结束后退出；新的空闲窗口由本任务收尾重建。
     let foreground_generation = crate::agent::lsp_client::note_foreground_activity();
+    // 记住本次显式选择：任务收尾/入队窗口的自动拉起没有前端请求可带参数，
+    // 必须复用最后一次选择（模型、审批策略、一起提交等）。写入失败不阻断发送。
+    if let Some(opts) = options.as_ref() {
+        if let Ok(conn) = state.0.lock() {
+            let _ = save_chat_options_conn(&conn, &conversation_id, opts);
+        }
+    }
     // 认领在注册任务之前完成：注册失败时把 queued 恢复，消息仍在队列里可重试，
     // 不会变成"已显示为普通人消息、却没有任务回答"的孤儿。
     let claimed = match queued_message_id.as_deref() {

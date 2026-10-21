@@ -6,6 +6,35 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 62: auto-start reuses the last conversation options (2026-10-22)
+
+The idle auto-start added in the previous batch has no frontend request to carry
+parameters, so it started with defaults: the selected model, temperature, tool approval
+policy, plan mode, and "submit together" were all lost. A conversation set to confirm
+every tool would auto-approve L1 tools under `auto`, and queued messages with
+"submit together" enabled would run one by one. Task starts now remember the explicit
+options per conversation:
+
+- When `stream_chat` receives options it writes them to `settings` (key
+  `chat_options:<conversation id>`); a failed write never blocks the send;
+- Idle auto-start reads that snapshot back and passes it to the task, matching the
+  semantics of a normal in-task continuation;
+- The one-shot `resume_run_id` is cleared on both save and load, so auto-start cannot
+  resume an old Run by accident;
+- A missing or corrupt snapshot silently falls back to backend defaults without
+  affecting queue startup.
+
+### Verification
+
+Two new Rust unit tests: model/temperature/approval/plan/submit-together/reply-language
+survive a round trip with only the latest snapshot kept per conversation, and the
+one-shot resume id is stripped; missing, corrupt, and other-conversation snapshots all
+return None. Rust **1275/1275** (+2) · frontend vitest **239/239** unchanged · `tsc` /
+`eslint` / clippy baseline green · i18n keys unchanged (**2297**, union **2299**) ·
+i18n gates, all 21 gate self-tests, `check-docs` and the production build pass. Tool
+count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 61: messages queued after a task ends start on their own (2026-10-22)
 
 There was a narrow window at task end: the backend had already checked that the queue
