@@ -1299,7 +1299,12 @@ export default function Home() {
     const a = runtimeAnomaly
     const prompt = `应用运行时检测到异常（${a.category}），请自行修复：\n${a.summary}\n\n相关日志：\n${a.detail}\n\n请用 read_runtime_logs 读取完整运行日志，定位源码后修复，然后重新构建并部署验证。`
     if (!currentConversation) {
-      await newConversation()
+      try {
+        await newConversation()
+      } catch (e) {
+        notifyActionNotSent(e)
+        return
+      }
     }
     // 投递成功才收起卡片：失败时保留卡片，用户可再次点「立即修复」
     if (await deliverActionText(prompt, modelOptions)) setRuntimeAnomaly(null)
@@ -2160,7 +2165,12 @@ export default function Home() {
     if (errors.length === 0) return
     if (!currentProject) return
     if (!currentConversation) {
-      await newConversation()
+      try {
+        await newConversation()
+      } catch (e) {
+        notifyActionNotSent(e)
+        return
+      }
     }
     const lines = errors.map((e) => {
       const loc = e.file ? `${e.file}${e.line ? `:${e.line}` : ''}${e.column ? `:${e.column}` : ''}` : '未知位置'
@@ -2587,7 +2597,17 @@ export default function Home() {
     }
     if (!currentProject) return
     if (!currentConversation) {
-      await newConversation()
+      try {
+        await newConversation()
+      } catch (e) {
+        // 草稿尚未清空：创建失败时原样留在输入框，只需明确告知
+        useNotificationStore.getState().push({
+          tone: 'error',
+          title: t('home.sendFailed'),
+          body: String(e ?? ''),
+        })
+        return
+      }
     }
     const targetConversation = useProjectStore.getState().currentConversation
     if (!targetConversation) return
@@ -2631,7 +2651,16 @@ export default function Home() {
     if (!genMode || stopRequested || currentGen) return
     if (!currentProject) return
     if (!currentConversation) {
-      await newConversation()
+      try {
+        await newConversation()
+      } catch (e) {
+        useNotificationStore.getState().push({
+          tone: 'error',
+          title: t('home.sendFailed'),
+          body: String(e ?? ''),
+        })
+        return
+      }
     }
     const targetConversation = useProjectStore.getState().currentConversation
     if (!targetConversation) return
@@ -3490,7 +3519,12 @@ export default function Home() {
       .map((l) => `> ${l}`)
       .join('\n')
     if (!currentConversation) {
-      await newConversation()
+      try {
+        await newConversation()
+      } catch (e) {
+        notifyActionNotSent(e)
+        return
+      }
     }
     const delivered = await sendUserMessage(`${instruction}\n\n${quote}`, modelOptions)
     if (delivered) setDraft('')

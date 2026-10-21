@@ -6,6 +6,32 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 51: conversation-creation failures no longer swallow actions (2026-10-22)
+
+Batch 48 fixed silent failures after an instruction was sent but not accepted. This
+batch covers an earlier link in the same chain: **the conversation was never created**.
+`newConversation` calls `create_conversation` / `list_conversations` and rejects on
+failure, while several entry points only did `await newConversation()` with no catch:
+
+- Main composer send: the click produced no task and no feedback (the draft was still
+  there because it is cleared later, but the user could not tell why);
+- Media generation send: same;
+- Selection instruction: the selected-text instruction vanished silently;
+- Runtime anomaly "Fix now": the card stayed, but nothing was reported;
+- Build errors "Auto-fix": the fix request vanished silently.
+
+All now catch the failure and report it: composer and media sends use
+`home.sendFailed` (the draft is indeed still in the composer); button-generated
+instructions use `home.actionNotSent` (the anomaly card is kept as well).
+
+### Verification
+
+Frontend vitest **237/237** (no new unit tests: error-handling wiring only) with
+`tsc` / `eslint` green · Rust **1251/1251** unaffected · i18n keys **2295**
+(no additions, union **2297**) · i18n gates, `check-docs` and the production build pass.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 50: the batch dialog's shortcut submits the latest text (2026-10-22)
 
 The batch-task dialog registered its Ctrl+Enter listener with a dependency on
