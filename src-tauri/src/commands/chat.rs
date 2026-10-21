@@ -1695,10 +1695,14 @@ fn append_queued_user_event(
     );
 }
 
-/// 批量取出全部排队消息（“一起提交”模式）：删除原文（避免与合并消息重复），
-/// 按时间顺序拼接为一条带编号的指令块返回，作为下一次任务的内容。
+/// 批量取出全部排队消息（“一起提交”模式）：按时间顺序拼接为一条带编号的指令块，
+/// **同一事务内**把合并消息落库并删除原文，返回合并正文与引用。
 ///
-/// `references_json` 必须一并带出：原文删除后，合并消息是**唯一**留存的历史行，
+/// 先删原文、等新任务启动后再入库会留下丢消息窗口：项目锁排队超时（10 分钟）、
+/// 恢复校验、调度登记或 Provider 解析任一失败，合并内容就只存在于内存里。
+/// 合并行与原文删除必须同生共死。
+///
+/// `references_json` 必须随合并行一并落库：原文删除后它是**唯一**留存的历史行，
 /// 引用列表若丢掉，@文件/@会话 的内容就再也不会被 inject_references 注入。
 fn take_all_queued(
     state: &tauri::State<'_, DbState>,
@@ -1713,20 +1717,24 @@ fn take_all_queued_conn(
     conn: &rusqlite::Connection,
     conversation_id: &str,
 ) -> Result<Option<(String, Vec<String>)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, content, references_json FROM messages
-             WHERE conversation_id = ?1 AND queued = 1 AND role = 'user' AND hidden = 0
-             ORDER BY created_at ASC, rowid ASC",
-        )
-        .map_err(|e| e.to_string())?;
-    let items: Vec<(String, String, Option<String>)> = stmt
-        .query_map(rusqlite::params![conversation_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let items: Vec<(String, String, Option<String>)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, content, references_json FROM messages
+                 WHERE conversation_id = ?1 AND queued = 1 AND role = 'user' AND hidden = 0
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(rusqlite::params![conversation_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        items
+    };
     if items.is_empty() {
         return Ok(None);
     }
@@ -1741,11 +1749,6 @@ fn take_all_queued_conn(
             }
         }
     }
-    // 删除全部排队原文（合并消息稍后由 stream_chat_inner 入库，避免历史重复）
-    for (id, _, _) in &items {
-        conn.execute("DELETE FROM messages WHERE id = ?1", [id])
-            .map_err(|e| e.to_string())?;
-    }
     let merged = if items.len() == 1 {
         items[0].1.clone()
     } else {
@@ -1756,10 +1759,31 @@ fn take_all_queued_conn(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+    let refs_json = (!refs.is_empty()).then(|| serde_json::to_string(&refs).unwrap_or_default());
+    let merged_id = Uuid::new_v4().to_string();
+    let ts = now();
+    tx.execute(
+        "INSERT INTO messages (id, conversation_id, role, content, references_json, queued, created_at)
+         VALUES (?1, ?2, 'user', ?3, ?4, 0, ?5)",
+        params![merged_id, conversation_id, merged, refs_json, ts],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+        params![ts, conversation_id],
+    )
+    .map_err(|e| e.to_string())?;
+    // 删除全部排队原文，避免与合并行重复
+    for (id, _, _) in &items {
+        tx.execute("DELETE FROM messages WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
     crate::utils::logger::log_event(
         "queued_batch_consumed",
         serde_json::json!({
             "conversation_id": conversation_id,
+            "message_id": merged_id,
             "count": items.len(),
             "refs": refs.len(),
         }),
@@ -1777,7 +1801,9 @@ mod take_all_queued_tests {
             "CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
              role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
              references_json TEXT, queued INTEGER NOT NULL DEFAULT 0,
-             hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);",
+             hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+             CREATE TABLE conversations (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO conversations (id, updated_at) VALUES ('c1', 0);",
         )
         .unwrap();
         conn
@@ -1815,10 +1841,31 @@ mod take_all_queued_tests {
             .query_row("SELECT COUNT(1) FROM messages WHERE queued = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "排队原文删除，避免与合并消息重复");
+        let originals: i64 = conn
+            .query_row("SELECT COUNT(1) FROM messages WHERE id IN ('q1','q2','q3')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(originals, 0, "原文必须真的被删除");
         let kept: i64 = conn
             .query_row("SELECT COUNT(1) FROM messages WHERE id = 'm0'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kept, 1, "非排队历史不能被批量消费波及");
+        let (row_content, row_refs): (String, Option<String>) = conn
+            .query_row(
+                "SELECT content, references_json FROM messages WHERE queued = 0 AND role = 'user'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_content, merged, "合并消息必须与消费时返回的正文一致");
+        assert_eq!(
+            row_refs.as_deref(),
+            Some(r#"["src/a.ets","conv:x","msg:42"]"#),
+            "引用随合并行落库，原文删除后仍可注入"
+        );
+        let updated: i64 = conn
+            .query_row("SELECT updated_at FROM conversations WHERE id = 'c1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(updated > 0, "会话更新时间随合并消息推进");
     }
 
     #[test]
@@ -1828,6 +1875,15 @@ mod take_all_queued_tests {
         let (merged, refs) = take_all_queued_conn(&conn, "c1").unwrap().unwrap();
         assert_eq!(merged, "只有一条", "单条不添加编号前缀");
         assert_eq!(refs, vec!["src/b.ets"]);
+        let (row_content, row_refs): (String, Option<String>) = conn
+            .query_row(
+                "SELECT content, references_json FROM messages WHERE queued = 0 AND role = 'user'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_content, "只有一条");
+        assert_eq!(row_refs.as_deref(), Some(r#"["src/b.ets"]"#));
     }
 
     #[test]
@@ -1837,6 +1893,30 @@ mod take_all_queued_tests {
         insert(&conn, "q2", "user", "b", Some(r#"["","src/c.ets"]"#), 1, 2);
         let (_, refs) = take_all_queued_conn(&conn, "c1").unwrap().unwrap();
         assert_eq!(refs, vec!["src/c.ets"], "损坏/空引用不影响其余引用");
+        let row_refs: Option<String> = conn
+            .query_row(
+                "SELECT references_json FROM messages WHERE queued = 0 AND role = 'user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_refs.as_deref(), Some(r#"["src/c.ets"]"#));
+    }
+
+    #[test]
+    fn all_corrupt_refs_store_no_json() {
+        let conn = setup();
+        insert(&conn, "q1", "user", "a", Some("not-json"), 1, 1);
+        let (_, refs) = take_all_queued_conn(&conn, "c1").unwrap().unwrap();
+        assert!(refs.is_empty());
+        let row_refs: Option<String> = conn
+            .query_row(
+                "SELECT references_json FROM messages WHERE queued = 0 AND role = 'user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_refs, None, "没有有效引用时不写空 JSON 数组");
     }
 
     #[test]
@@ -1844,6 +1924,39 @@ mod take_all_queued_tests {
         let conn = setup();
         insert(&conn, "m0", "user", "已执行", None, 0, 0);
         assert!(take_all_queued_conn(&conn, "c1").unwrap().is_none());
+        let total: i64 = conn
+            .query_row("SELECT COUNT(1) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "空队列不得写入任何合并行");
+        let updated: i64 = conn
+            .query_row("SELECT updated_at FROM conversations WHERE id = 'c1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(updated, 0, "空队列不得推进会话时间");
+    }
+
+    #[test]
+    fn failed_delete_rolls_back_merged_row() {
+        let conn = setup();
+        insert(&conn, "q1", "user", "原文", None, 1, 1);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_delete BEFORE DELETE ON messages
+             BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;",
+        )
+        .unwrap();
+
+        assert!(take_all_queued_conn(&conn, "c1").is_err());
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(1) FROM messages WHERE queued = 1", [], |r| r.get(0))
+            .unwrap();
+        let merged_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM messages WHERE queued = 0 AND role = 'user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1, "删除失败时原文必须保持排队，不能被吞掉");
+        assert_eq!(merged_rows, 0, "删除失败时已插入的合并行必须回滚");
     }
 }
 
@@ -2828,8 +2941,10 @@ async fn stream_chat_body(
                 Ok(Some((merged_content, merged_refs))) => {
                     current_content = merged_content;
                     current_regenerate = Some(false);
-                    persist_user = true;
-                    // 原文已删，引用随合并消息重新落库（历史组装再注入文件/会话内容）
+                    // 合并行已在取队列的同一事务里落库，内层不再重复插入；
+                    // 引用仍传给内层用于"当前聚焦模块"提示（历史注入读的是库里的
+                    // references_json）
+                    persist_user = false;
                     current_refs = (!merged_refs.is_empty()).then_some(merged_refs);
                     continue;
                 }
@@ -5467,7 +5582,9 @@ async fn stream_chat_inner(
         if is_cancelled(cancel, &conversation_id) {
             // 尚未取得项目锁时普通 user 消息还未走到下方入库；停止前先持久化，
             // 避免前端乐观消息刷新后消失。重新生成/自动续跑的 user 消息已在库，不重复写。
-            let user_message_id = if !regenerate.unwrap_or(false) && persist_user {
+            let user_message_id = if regenerate.unwrap_or(false) {
+                None
+            } else if persist_user {
                 let id = Uuid::new_v4().to_string();
                 let ts = now();
                 let content_with_images = match &images {
@@ -5500,7 +5617,20 @@ async fn stream_chat_inner(
                 );
                 Some(id)
             } else {
-                None
+                // 自动续跑/批量合并的消息已在库：把真实 id 带回前端，
+                // 停止后界面能立刻对齐（否则要等下次刷新才看得到这一条）。
+                // 这只是一次对齐用的查询，失败不能阻断停止事件本身。
+                state.0.lock().ok().and_then(|conn| {
+                    conn.query_row(
+                        "SELECT id FROM messages
+                         WHERE conversation_id = ?1 AND role = 'user'
+                           AND queued = 0 AND hidden = 0
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        [&conversation_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                })
             };
             stats.stopped = true;
             let _ = app.emit(

@@ -6,6 +6,34 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 56: batch-merge rows and original deletions share one transaction (2026-10-22)
+
+"Submit together" used to happen in two steps: `take_all_queued_conn` deleted all
+queued originals first and returned the merged text, while the real merged message
+row was only written once the next task started and `stream_chat_inner` reached its
+user-message insert. In between sat project-lock queueing (up to 10 minutes),
+recovery validation, scheduler registration and provider resolution — any failure or
+a user cancellation left the merged text only in memory, with **originals deleted and
+no replacement row**, permanently losing every queued instruction.
+
+The merged row and the original deletions now happen in **one transaction**: merged
+text, deduplicated references, `conversations.updated_at` and the deletions either
+commit together or roll back together. On failure the queued messages stay exactly as
+they were and the user can retry; after success the inner task no longer inserts a
+duplicate, while the references still feed the focused-module hint (history injection
+reads `references_json` from the merged row). The stop path also returns the already
+persisted user message id so the UI does not need a reload to reconcile.
+
+### Verification
+
+Rust **1263/1263** (+2: merged row content/references/timestamp match the original
+deletion; a failing delete rolls back the merged row and leaves originals queued) ·
+frontend vitest **237/237** unaffected · `tsc` / `eslint` / clippy baseline green ·
+i18n keys **2297** (no changes, union **2299**) · i18n gates, `check-docs` and the
+production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 55: failures when stopping the running tool are no longer silent (2026-10-22)
 
 "Stop the running tool" is a two-step backend action: first the conversation's stop
