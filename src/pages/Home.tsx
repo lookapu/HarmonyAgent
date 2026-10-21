@@ -2015,7 +2015,16 @@ export default function Home() {
     if (Date.now() - insertQueuedAtRef.current < 2000) return
     insertQueuedAtRef.current = Date.now()
     if (isStreaming) {
-      void insertQueuedNow()
+      try {
+        await insertQueuedNow()
+      } catch (e) {
+        // 任务可能恰在点击时结束（后端按任务代次拒绝）：排队消息仍在，但点击未生效要说清楚
+        useNotificationStore.getState().push({
+          tone: 'error',
+          title: t('home.insertQueuedFailed'),
+          body: String(e ?? ''),
+        })
+      }
       return
     }
     const first = queuedList[0]

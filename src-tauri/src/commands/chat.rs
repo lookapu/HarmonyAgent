@@ -309,13 +309,41 @@ pub struct ChatLock(pub StdMutex<HashMap<String, String>>);
 #[derive(Default)]
 pub struct ChatCancel(pub StdMutex<HashSet<String>>);
 
-/// 「立即插入」请求集合：用户点排队条上的"立即插入"时置位，安全点无条件把排队消息并入当前任务。
+/// 「立即插入」请求表：conversation_id -> 发起请求时的任务代次。
+/// 用户点排队条上的"立即插入"时置位，安全点无条件把排队消息并入当前任务。
 /// 与"发送到 Agent"（agent_owned 消息在安全点并入）的区别只在**不由模型决定**：这里是用户
 /// 点了就并，且不看 agent_owned（普通排队的消息也提前并）。一次性，消费即清除。
 ///
+/// 必须绑定代次：请求可能在任务最后一个安全点之后到达（或任务恰在此时结束），
+/// 若只按会话记一个布尔，标志会留到**下一个任务**，让它突然把旧队列全部强制并入。
+///
 /// 刻意不是停止：并入后当前任务照原目标继续跑，不中断也不丢弃已做的工作。
 #[derive(Default)]
-pub struct ChatForceMerge(pub StdMutex<HashSet<String>>);
+pub struct ChatForceMerge(pub StdMutex<HashMap<String, u64>>);
+
+impl ChatForceMerge {
+    fn request(&self, conversation_id: &str, generation: u64) -> Result<(), String> {
+        let mut map = self.0.lock().map_err(|e| e.to_string())?;
+        map.insert(conversation_id.to_string(), generation);
+        Ok(())
+    }
+
+    /// 取出请求并判定是否属于当前任务；无论是否生效都消费掉（一次性）。
+    /// 返回 `(是否生效, 请求时的代次)`。
+    fn take(&self, conversation_id: &str, current_generation: Option<u64>) -> Option<(bool, u64)> {
+        let requested = self.0.lock().ok()?.remove(conversation_id)?;
+        Some((current_generation == Some(requested), requested))
+    }
+
+    /// 任务收尾清理：只删自己代次的请求，避免误删随后启动的新任务刚写入的请求。
+    fn clear_for(&self, conversation_id: &str, generation: u64) {
+        if let Ok(mut map) = self.0.lock() {
+            if map.get(conversation_id) == Some(&generation) {
+                map.remove(conversation_id);
+            }
+        }
+    }
+}
 
 /// 工具权限待审核表：request_id -> (用户选择通道, 工具名, 会话 id, 参数)
 /// 通道值：true=允许执行 / false=拒绝；携带工具名与会话 id 用于“本会话始终允许”记忆落表，
@@ -1506,25 +1534,84 @@ pub fn stop_chat(
 pub fn insert_queued_now(
     conversation_id: String,
     merge: State<'_, ChatForceMerge>,
+    registry: State<'_, TaskRegistry>,
 ) -> Result<(), String> {
-    let mut set = merge.0.lock().map_err(|e| e.to_string())?;
-    set.insert(conversation_id.clone());
+    let Some(generation) = registry.generation(&conversation_id) else {
+        crate::utils::logger::log_event(
+            "insert_queued_rejected",
+            serde_json::json!({ "conversation_id": conversation_id, "reason": "no_running_task" }),
+        );
+        return Err("当前没有正在执行的任务，排队消息会保留并照常续跑".into());
+    };
+    merge.request(&conversation_id, generation)?;
     crate::utils::logger::log_event(
         "insert_queued_requested",
-        serde_json::json!({ "conversation_id": conversation_id }),
+        serde_json::json!({ "conversation_id": conversation_id, "generation": generation }),
     );
     Ok(())
 }
 
 /// 消费「立即插入」标志（一次性）：true 表示本安全点要无条件并入排队消息。
+/// 代次不一致说明标志属于已经结束的任务，直接丢弃。
 fn take_force_merge(app: &AppHandle, conversation_id: &str) -> bool {
-    let state = app.state::<ChatForceMerge>();
+    let merge = app.state::<ChatForceMerge>();
+    let current = app.state::<TaskRegistry>().generation(conversation_id);
     // 先落到具名局部再返回：match 的临时值若留在尾表达式，会活过 state 的析构点
-    let hit = match state.0.lock() {
-        Ok(mut set) => set.remove(conversation_id),
-        Err(_) => false,
-    };
-    hit
+    let hit = merge.take(conversation_id, current);
+    match hit {
+        Some((true, _)) => true,
+        Some((false, requested)) => {
+            crate::utils::logger::log_event(
+                "insert_queued_stale",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "requested_generation": requested,
+                    "current_generation": current,
+                }),
+            );
+            false
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod force_merge_tests {
+    use super::ChatForceMerge;
+
+    #[test]
+    fn request_is_consumed_once_by_the_same_task() {
+        let merge = ChatForceMerge::default();
+        merge.request("c1", 7).unwrap();
+        assert_eq!(merge.take("c1", Some(7)), Some((true, 7)), "同一代次应立即生效");
+        assert_eq!(merge.take("c1", Some(7)), None, "一次性：消费后不再生效");
+    }
+
+    #[test]
+    fn stale_request_never_leaks_into_the_next_task() {
+        let merge = ChatForceMerge::default();
+        merge.request("c1", 7).unwrap();
+        assert_eq!(merge.take("c1", Some(8)), Some((false, 7)), "旧任务请求不得作用于新任务");
+        assert_eq!(merge.take("c1", Some(8)), None, "陈旧请求同样只能被消费一次");
+    }
+
+    #[test]
+    fn request_without_running_task_is_rejected() {
+        let merge = ChatForceMerge::default();
+        merge.request("c1", 7).unwrap();
+        assert_eq!(merge.take("c1", None), Some((false, 7)), "无运行任务时不生效");
+    }
+
+    #[test]
+    fn clear_for_only_removes_matching_generation() {
+        let merge = ChatForceMerge::default();
+        merge.request("c1", 7).unwrap();
+        merge.clear_for("c1", 6);
+        assert_eq!(merge.take("c1", Some(7)), Some((true, 7)), "别的代次收尾不能清掉本请求");
+        merge.request("c1", 9).unwrap();
+        merge.clear_for("c1", 9);
+        assert_eq!(merge.take("c1", Some(9)), None, "本任务收尾应清掉未消费的请求");
+    }
 }
 
 /// 停止当前正在执行的工具（不终止整个任务）：中断标志被长任务命令执行器轮询消费，
@@ -2447,6 +2534,9 @@ pub async fn stream_chat(
     // 登记成功后才放行；接收端若已异常退出，join 会返回实际错误。
     let _ = start_tx.send(());
     let result = join.await;
+    // 「立即插入」属于发起的那个任务：任务结束仍未消费就作废。
+    // 否则下一个任务的首轮安全点会突然把旧队列全部强制并入，并提示"已按你的要求插入"。
+    app.state::<ChatForceMerge>().clear_for(&conversation_id, generation);
     if matches!(&result, Err(e) if !e.is_cancelled()) {
         let run_id = app.state::<TaskRegistry>().run_id(&conversation_id);
         if !run_id.is_empty() {

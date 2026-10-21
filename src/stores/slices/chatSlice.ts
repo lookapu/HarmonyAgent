@@ -1960,11 +1960,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     insertQueuedNow: async () => {
       const conv = get().currentConversation
       if (!conv) return
-      try {
-        await insertQueuedNowApi(conv.id)
-      } catch {
-        // 失败静默：消息仍在队列里，任务收尾时会照常逐条续跑，不会丢
-      }
+      // 失败需上抛：任务恰好结束时后端会拒绝，用户至少要知道点击未生效
+      await insertQueuedNowApi(conv.id)
     },
 
     /** 停止当前正在执行的工具：强杀子进程，模型拿到中断反馈后继续生成结论（不终止任务） */

@@ -142,6 +142,14 @@ impl TaskRegistry {
         }
     }
 
+    /// 读取当前任务代次（无运行任务时 None）：供「立即插入」等一次性请求绑定到具体任务。
+    pub fn generation(&self, conversation_id: &str) -> Option<u64> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|m| m.get(conversation_id).map(|h| h.generation))
+    }
+
     /// 读取当前任务代次，供工具/子 Agent 的过程事件绑定到正确运行。
     pub fn run_id(&self, conversation_id: &str) -> String {
         self.0

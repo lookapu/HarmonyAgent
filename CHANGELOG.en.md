@@ -6,6 +6,37 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 53: "Insert now" only affects the task it was requested for (2026-10-22)
+
+"Insert now" on the queued-message bar used to store a per-conversation boolean.
+When the click arrived after the task's last safety point (or just as the task
+ended), the flag was never consumed and **leaked into the conversation's next task**:
+
+- the new task's first round force-merged the whole old queue, including ordinary
+  messages that should have been processed one by one;
+- the UI announced "inserted into the current task as requested" even though the
+  user never clicked it for that task;
+- multiple messages were poured into one round instead of being continued in order.
+
+The flag now carries the **task generation** that requested it:
+
+- `insert_queued_now` rejects the request when no task is running and stores nothing;
+- the safety point validates the generation and drops stale requests with an
+  `insert_queued_stale` log entry;
+- task teardown clears only its own generation, never a request from a newer task.
+
+The frontend no longer fails silently: clicking just as the task ends now shows
+`home.insertQueuedFailed` and states that the queued messages are still kept.
+
+### Verification
+
+Rust **1259/1259** (+4: one-shot consumption, stale request, no-running-task
+rejection, generation-scoped cleanup) · frontend vitest **237/237** unaffected ·
+`tsc` / `eslint` / clippy baseline green · i18n keys **2296**
+(+1, union **2298**) · i18n gates, `check-docs` and the production build pass.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 52: batch submission keeps queued messages' @ references (2026-10-22)
 
 "Submit together" merges all queued messages into one numbered message and then
