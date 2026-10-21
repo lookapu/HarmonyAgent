@@ -6,6 +6,38 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 54: queued messages no longer vanish from the session event log (2026-10-22)
+
+`session_events` is the append-only source shared by the timeline panel,
+`replay_trace`, eval trajectory export and reflexion. Queued messages have two
+consumption paths that **do not insert a new message row**:
+
+- auto-continue after a successful task: the original row is already stored, only
+  `queued` is cleared before it becomes the next round's input;
+- safety-point merge mid-task: injected as an additional user instruction without
+  being stored again.
+
+Neither path wrote a `UserMessage` event, so:
+
+- the timeline and trajectory showed assistant/tool events for the continuation
+  round with no corresponding user input;
+- reflexion splits rounds at the last `UserMessage`, so failures from the
+  continuation round were counted into the previous round, potentially producing
+  duplicated or inflated reflection cards.
+
+Both paths now append a `UserMessage` event: the payload carries `queued: true`,
+and safety-point merges add `merged: true`. Auto-continue uses the **new task's own
+trace_id**, so that round's user input and tool calls share one trace.
+
+### Verification
+
+Rust **1261/1261** (+2: continuation event type/flags/trace ownership, merge flag
+and projection order) · frontend vitest **237/237** unaffected · `tsc` / `eslint` /
+clippy baseline green · i18n keys **2296** (no changes, union **2298**) · i18n
+gates, `check-docs` and the production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 53: "Insert now" only affects the task it was requested for (2026-10-22)
 
 "Insert now" on the queued-message bar used to store a per-conversation boolean.

@@ -5917,3 +5917,43 @@ Rust 全量 **1259/1259**（+4：一次性消费、陈旧请求、无任务拒�
 前端 vitest **237/237** 不受影响 · `tsc` / `eslint` / clippy 基线绿 ·
 i18n 键 **2296**（+1，并集 2298）· 三道 i18n 门禁与 `check-docs` 绿；
 工具数 / 迁移数不变（204 / 86）。
+
+### 6.71 第五十四批：排队消息补写会话事件（2026-10-22）
+
+#### 6.71.1 起点：两条消费路径都不重新入库，也都不写事件
+
+`session_events` 的回放被时间线、`replay_trace`、eval trajectory 与 reflexion 共用。
+排队消息（`queued=1`）有两种被消费的方式，恰好都绕开了
+`stream_chat_inner` 的「新消息入库 + `UserMessage` 事件」分支：
+
+- **任务结束后自动续跑**：`take_next_queued` 把 `queued` 置 0，正文原样作为下一轮输入，
+  `persist_user=false`，于是既不插消息也不写事件；
+- **任务运行中安全点并入**：消息被塞进 `merged_instructions`，作为附加 user 注入
+  本轮上下文，同样只留在 `messages` 表里。
+
+结果：事件回放（`derive_messages`）与 trajectory 导出缺这一轮用户输入；
+reflexion 用「最后一条 UserMessage」定位本轮起点，续跑轮的失败会被并进上一轮，
+可能把上一轮已有的模式重复计数。
+
+#### 6.71.2 修法：消费路径就地补事件，trace 归属当前任务
+
+新增 `append_queued_user_event`：
+
+```rust
+payload = { "content": ..., "queued": true }              // 自动续跑
+payload = { "content": ..., "queued": true, "merged": true } // 安全点并入
+```
+
+- 自动续跑在 `stream_chat_inner` 的 `else`（`persist_user=false`）分支写事件，
+  `trace_id` 用**本次新任务**的 ID——续跑轮的工具调用与用户输入落在同一 trace；
+- 安全点并入在 `assemble_round` 消费排队消息后立即写，归属当前任务 trace；
+  它在 `merged_instructions.clear()` 之前落日志，压缩重启导致的重装也不会漏记。
+
+消息表不动：自动续跑的原文仍是既有行，并入的指令仍只进入本轮注入。
+
+#### 6.71.3 验证
+
+Rust 全量 **1261/1261**（+2：续跑事件类型/标记/trace 归属、并入标记与投影顺序）·
+前端 vitest **237/237** 不受影响 · `tsc` / `eslint` / clippy 基线绿 ·
+i18n 键 **2296**（无新增，并集 2298）· 三道 i18n 门禁与 `check-docs` 绿；
+工具数 / 迁移数不变（204 / 86）。

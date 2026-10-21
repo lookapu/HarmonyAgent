@@ -1668,6 +1668,33 @@ fn take_next_queued(
     Ok(Some((id, content)))
 }
 
+/// 排队消息补写 UserMessage 事件。
+///
+/// 排队消息的两条消费路径都不走"新消息入库 + 事件"分支：任务结束后的自动续跑
+/// 原文已在库（queued 置 0），任务运行中的安全点并入只作为附加 user 注入。
+/// 不补事件时，事件回放 / trajectory 导出会缺这一轮用户输入，reflexion 按
+/// "最后一条 UserMessage" 划分轮次时也会把续跑轮并进上一轮。
+fn append_queued_user_event(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    content: &str,
+    trace_id: &str,
+    merged_into_task: bool,
+) {
+    let payload = if merged_into_task {
+        serde_json::json!({ "content": content, "queued": true, "merged": true })
+    } else {
+        serde_json::json!({ "content": content, "queued": true })
+    };
+    let _ = crate::agent::session_events::append_event(
+        conn,
+        conversation_id,
+        crate::agent::session_events::SessionEventType::UserMessage,
+        payload,
+        Some(trace_id),
+    );
+}
+
 /// 批量取出全部排队消息（“一起提交”模式）：删除原文（避免与合并消息重复），
 /// 按时间顺序拼接为一条带编号的指令块返回，作为下一次任务的内容。
 ///
@@ -1817,6 +1844,65 @@ mod take_all_queued_tests {
         let conn = setup();
         insert(&conn, "m0", "user", "已执行", None, 0, 0);
         assert!(take_all_queued_conn(&conn, "c1").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod queued_user_event_tests {
+    use super::append_queued_user_event;
+    use crate::agent::session_events::{derive_messages, replay, SessionEventType};
+
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                trace_id TEXT,
+                created_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn auto_continue_records_user_message_in_task_trace() {
+        let conn = setup();
+        append_queued_user_event(&conn, "c1", "继续处理排队项", "trace-1", false);
+
+        let events = replay(&conn, "c1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, SessionEventType::UserMessage);
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"), "续跑事件归属新任务 trace");
+        assert_eq!(events[0].payload["content"], "继续处理排队项");
+        assert_eq!(events[0].payload["queued"], true);
+        assert!(events[0].payload.get("merged").is_none(), "自动续跑不是并入当前任务");
+
+        let derived = derive_messages(&conn, "c1").unwrap();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].role, "user");
+        assert_eq!(derived[0].content, "继续处理排队项");
+    }
+
+    #[test]
+    fn merged_instruction_is_marked_and_keeps_order() {
+        let conn = setup();
+        append_queued_user_event(&conn, "c1", "第一条", "trace-1", false);
+        append_queued_user_event(&conn, "c1", "并入的指令", "trace-1", true);
+
+        let events = replay(&conn, "c1").unwrap();
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(events[1].payload["merged"], true, "安全点并入需可区分");
+        let derived = derive_messages(&conn, "c1").unwrap();
+        assert_eq!(
+            derived.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["第一条", "并入的指令"],
+            "事件投影保持会话内顺序"
+        );
     }
 }
 
@@ -3947,6 +4033,17 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         let Some((pending_id, pending_content)) = next else {
             break;
         };
+        // 安全点并入同样是用户输入：写进事件日志（归属当前任务），
+        // 否则回放与轨迹导出里这条指令凭空消失。
+        if let Ok(conn) = inputs.state.0.lock() {
+            append_queued_user_event(
+                &conn,
+                inputs.conversation_id,
+                &pending_content,
+                inputs.trace_id,
+                true,
+            );
+        }
         inputs.round_state.merged_instructions.push(pending_content);
         // 明确告知前端"这条已并入"：此前只推一句提示、消息气泡上的"待并入"标记一直不消，
         // 用户会以为这条根本没被执行（本机实际反馈）。
@@ -5525,7 +5622,6 @@ async fn stream_chat_inner(
         )
         .map_err(|e| e.to_string())?;
     } else if persist_user {
-        // 续跑（persist_user=false）时消息已在库（排队原文），不再重复入库
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         // 图片只随本次请求发送：正文追加附图标记，历史重放时模型可见该说明（图片数据不落库）
         let content_with_images = match &images {
@@ -5556,6 +5652,11 @@ async fn stream_chat_inner(
             params![ts, conversation_id],
         )
         .map_err(|e| e.to_string())?;
+    } else {
+        // 自动续跑：排队原文已在库（queued=0），不重复入库，但事件日志要补上这一轮
+        // 用户输入；trace_id 用本次新任务，续跑轮的工具调用才能归到同一 trace 下。
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        append_queued_user_event(&conn, &conversation_id, &content, &trace_id, false);
     }
 
     // 用户指明路径 → 并入会话路径提示根（文件工具相对路径解析优先），并自动沉淀为项目记忆
