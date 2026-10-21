@@ -474,6 +474,59 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     })
   }).catch(() => {})
 
+  // 单条排队消息被自动续跑消费：后端的 queued 已置 0，气泡上的"排队中"
+  // 标记必须同步清除，否则这条消息会一直显示成未提交。
+  listen<{ conversation_id: string; message_id: string }>('chat-queued-consumed', (event) => {
+    const { conversation_id, message_id } = event.payload
+    if (get().currentConversation?.id !== conversation_id) return
+    const state = get()
+    if (!state.messages.some((m) => m.id === message_id) && !state.queuedList.some((q) => q.id === message_id)) {
+      return
+    }
+    set({
+      messages: state.messages.map((m) => (m.id === message_id ? { ...m, queued: 0 } : m)),
+      queuedList: state.queuedList.filter((q) => q.id !== message_id),
+    })
+  }).catch(() => {})
+
+  // 批量合并（"一起提交"）：后端在同一事务里写入合并行并删除全部原文。
+  // 前端要同步换成合并后的那一条，否则原文气泡带着排队标记留在时间线上，
+  // 而真正提交的指令要等重新加载会话才出现。
+  listen<{
+    conversation_id: string
+    message_id: string
+    content: string
+    references: string[]
+    consumed_ids: string[]
+    created_at: number
+  }>('chat-queued-batch-merged', (event) => {
+    const { conversation_id, message_id, content, references, consumed_ids, created_at } = event.payload
+    if (get().currentConversation?.id !== conversation_id) return
+    const state = get()
+    if (state.messages.some((m) => m.id === message_id)) return
+    const consumed = new Set(consumed_ids)
+    const merged: ChatMessage = {
+      id: message_id,
+      conversation_id,
+      role: 'user',
+      content,
+      references_json: references.length ? JSON.stringify(references) : null,
+      model: null,
+      tokens_in: null,
+      tokens_out: null,
+      created_at,
+      reasoning: null,
+      queued: 0,
+      agent_owned: 0,
+      modified_files_json: null,
+      duration_ms: null,
+    }
+    set({
+      messages: [...state.messages.filter((m) => !consumed.has(m.id)), merged],
+      queuedList: state.queuedList.filter((q) => !consumed.has(q.id)),
+    })
+  }).catch(() => {})
+
   // Rust 侧已按 32ms/8KB 合并模型 token，进一步降低 Tauri IPC 压力；
   // 仍进入同一个前端帧级队列，统一保证后台窗口和多会话行为。
   listen<{ conversation_id: string; run_id?: string; content: string; reasoning: string; checkpoint_seq?: number | null }>('chat-stream-batch', (event) => {

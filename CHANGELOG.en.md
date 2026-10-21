@@ -6,6 +6,42 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 57: the timeline follows queued-message consumption immediately (2026-10-22)
+
+Queued messages can be consumed in two ways. Both took effect in the database, but the
+frontend was **notified of neither**:
+
+- single auto-continue: `take_next_queued` clears `queued`, yet the bubble kept
+  showing "queued" until the whole conversation was reloaded;
+- "Submit together" batch merge: the backend deleted the originals and wrote the
+  merged row in one transaction, while the frontend kept stale queued bubbles (whose
+  rows no longer existed) and never showed the instructions that were actually
+  submitted — they appeared only after switching away and back.
+
+Users could conclude the message was never submitted, send it twice, or delete a
+running task by mistake.
+
+Two events now report consumption:
+
+- `chat-queued-consumed` (single): the frontend clears `queued` on that bubble and
+  removes it from the queue bar;
+- `chat-queued-batch-merged` (batch): carries the merged row id, content, references,
+  the deleted original ids and the stored timestamp; the frontend drops the originals
+  by id and inserts the merged message, with no conversation reload.
+
+The batch payload comes from the row actually committed in the transaction (unit
+tests assert id / content / timestamp match), so the UI cannot build a shadow message
+that differs from the database.
+
+### Verification
+
+Rust **1263/1263** unaffected (batch-consumption tests now also assert the returned
+merged id, original-id order and timestamp match the stored row) · frontend vitest
+**237/237** unaffected · `tsc` / `eslint` / clippy baseline green · i18n keys **2297**
+(no changes, union **2299**) · i18n gates, `check-docs` and the production build pass.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 56: batch-merge rows and original deletions share one transaction (2026-10-22)
 
 "Submit together" used to happen in two steps: `take_all_queued_conn` deleted all
