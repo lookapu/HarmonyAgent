@@ -6,6 +6,80 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 34: make a stall actionable — one click to send "change approach" into the running task (2026-10-21)
+
+The previous two batches made stalls **visible** (batch 32) and made the banner
+**name what the Agent is doing** (batch 33). But the last line still said
+"stop it to redirect, or just tell it what you want" — **both suggestions require
+the user to do the work**. This batch turns the first suggestion into a button.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### What users want is not "see the stall", but "make it stop stalling"
+
+The banner can already name "Most repeated: read_file src/main.ets × 9". After seeing it,
+the user has only two options:
+
+- click **Stop** — **terminates the whole task**, including work already done;
+- compose a message in the composer — **the user has to translate the profile into
+  an instruction**, which is exactly what the feature already computed.
+
+⇒ A new **Change approach** button sends a **profile-bearing user instruction** into the
+running task. It is still a user message, not a system prompt and not a decision made on
+the user's behalf — it only removes the wording burden.
+
+### The instruction names the profile, not just "stop stalling"
+
+The body is generated from **the same `StallProfile` as the banner**:
+
+> Let's change approach. You have gone 24 consecutive tool calls without real progress,
+> most repeated: read_file(src/main.ets) × 9 · list_dir × 6.
+> First state in one or two sentences what you know for certain and what is missing,
+> then do one verifiable thing (edit code, build, test, or deploy) and report the result.
+> Do not repeat the same read-only calls.
+
+With no repeated action, the profile clause falls back to "mostly repeating grep_files
+(24 times)". If the profile is missing entirely (older backend), only the consecutive
+count remains — no empty parentheses or `undefined`.
+
+### Why not `insert_queued_now`
+
+The first attempt reused "insert now", but the backend command **unconditionally merges
+every message queued at that moment** (the `ChatForceMerge` flag is per conversation, and
+`assemble_round` drains the whole queue into the current round).
+⇒ The user clicks "change approach" and accidentally promotes their other queued messages too.
+
+Instead the nudge is queued as an **`agent_owned=1` message**: at the next safe point the
+backend consumes exactly one Agent instruction and merges it, without stopping the task and
+without touching the user's own queue. Same granularity (round boundary), no side effect.
+
+Another path is impossible: `sendUserMessage` **returns early while the same conversation is
+streaming** (duplicate-send guard), so clicking it during a run would do nothing. That is
+precisely the gap between a "suggestion" and a "button" — **it looks clickable, but there is
+no channel behind it**.
+
+### State and failure
+
+- One nudge per stall level: after success the button reads "Nudged" and is disabled;
+  a level escalation (or a recovery followed by a new stall) yields a new stage and
+  re-enables it.
+- On failure a notification appears and the button becomes clickable again — a failure is
+  **never latched as "Nudged"**.
+- If the task ends between render and click (`isStreaming` is already false), it degrades to
+  a normal send; the message is not lost.
+
+### Boundary: still does not stop the task for the user
+
+The button only delivers the user's intent faster. It **does not terminate the loop or force
+a wrap-up**. "At which round to force-stop" remains the pending product decision in ledger
+T-8; this batch continues to leave it alone.
+
+### Verification
+
+Frontend vitest **13/13** (7 new: profile in the body / dominant-tool fallback / no dirty
+characters when the profile is missing / no button without a callback / one nudge per level /
+failure allows retry / level escalation re-enables) · `tsc` / `eslint` green ·
+i18n keys **2284** (+6, zh/en aligned) · wording, key-usage and duplicate-key gates green.
+
 ## Unreleased — Batch 33: the stall profile — so the user can see *what it is doing* (2026-10-19)
 
 This batch continues the previous one. Batch 32 made stalls **visible** (level + stalled

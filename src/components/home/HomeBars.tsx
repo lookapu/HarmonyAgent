@@ -8,10 +8,11 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
 import { NOTE_MAX_LEN, useNoteStore } from '../../stores/noteStore'
 import { usePinStore } from '../../stores/pinStore'
 import { useProjectStore } from '../../stores/projectStore'
-import { formatBytes, truncateTarget, useGuardStore } from '../../stores/guardStore'
+import { formatBytes, truncateTarget, useGuardStore, type GuardProfile } from '../../stores/guardStore'
 import { setConversationContextPin } from '../../api/project'
 import Icon from '../../icons/Icon'
 import { Button } from '../ui/Button'
@@ -33,12 +34,64 @@ const GUARD_STAGE_CLS = {
   3: 'border-[var(--danger)]/50 bg-[var(--danger)]/12 text-[var(--danger)]',
 } as const
 
-export function GuardBar({ convId }: { convId: string }) {
+/**
+ * 「换个思路」的用户指令正文（**作为用户消息**发送，不是系统提示）。
+ *
+ * 为什么要由前端生成：用户点按钮时，画像就在手上（与提示条、模型侧提示同一份数据）。
+ * 让用户自己把这句写一遍，等于把「看懂画像」的负担又推回给他。
+ */
+export function buildGuardNudgeText(
+  t: TFunction,
+  sinceProgress: number,
+  profile: GuardProfile | undefined,
+): string {
+  const repeats = profile?.repeats ?? []
+  const topTool = profile?.topTool ?? null
+  const items = repeats
+    .map((r) =>
+      r.target ? `${r.tool}(${truncateTarget(r.target)}) × ${r.count}` : `${r.tool} × ${r.count}`,
+    )
+    .join(' · ')
+  const detail =
+    repeats.length > 0
+      ? t('home.guardNudgeRepeats', { items })
+      : topTool
+        ? t('home.guardNudgeTopTool', { tool: topTool.tool, count: topTool.count })
+        : ''
+  return t('home.guardNudgeText', { count: sinceProgress, detail })
+}
+
+export function GuardBar({
+  convId,
+  onNudge,
+}: {
+  convId: string
+  /** 把「换个思路」送进当前任务；不传则不显示按钮（纯展示用法） */
+  onNudge?: (text: string) => Promise<void> | void
+}) {
   const { t } = useTranslation()
   const guard = useGuardStore((s) => s.guards[convId])
+  // 一个级别只提醒一次：提醒后按钮显示「已提醒」并禁用，
+  // 级别升级（或恢复后重新失速）时组件拿到新的 stage，按钮自动恢复可用。
+  const [nudgedKey, setNudgedKey] = useState<string | null>(null)
+  const [nudging, setNudging] = useState(false)
   // 没失速（或已恢复）就不渲染——空占位会给对话流留一条无意义的白边
   if (!guard || guard.stage <= 0) return null
   const stage = Math.min(3, Math.max(1, guard.stage)) as 1 | 2 | 3
+  const nudgeKey = `${convId}:${stage}`
+  const nudged = nudgedKey === nudgeKey
+  const handleNudge = async () => {
+    if (!onNudge || nudging || nudged) return
+    setNudging(true)
+    try {
+      await onNudge(buildGuardNudgeText(t, guard.sinceProgress, guard.profile))
+      setNudgedKey(nudgeKey)
+    } catch {
+      // 发送失败由调用方提示；这里只恢复按钮，允许重试
+    } finally {
+      setNudging(false)
+    }
+  }
   // 失速画像：**它到底在干什么**。
   //
   // 「连续 24 次」是个没有信息量的数字——用户分不清
@@ -88,8 +141,23 @@ export function GuardBar({ convId }: { convId: string }) {
           </span>
         </div>
       ) : null}
-      <div className="mt-0.5 text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
-        {t('home.guardAdvice')}
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">
+          {t('home.guardAdvice')}
+        </div>
+        {onNudge && (
+          <Button
+            variant="secondary"
+            size="xs"
+            icon={nudged ? 'check' : 'lightbulb'}
+            loading={nudging}
+            disabled={nudged}
+            onClick={() => void handleNudge()}
+            className="shrink-0"
+          >
+            {nudged ? t('home.guardNudged') : t('home.guardNudge')}
+          </Button>
+        )}
       </div>
     </div>
   )

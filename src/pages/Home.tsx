@@ -2023,6 +2023,22 @@ export default function Home() {
     void sendUserMessage(first.content, modelOptions, refs)
   }
 
+  /** 失速提示条「换个思路」：运行中作为 Agent 指令并入当前任务（agent_owned=1，
+   * 不停止当前任务，也不惊动用户自己排队的消息）；任务刚好已结束时退化为普通发送。
+   * 走队列而不是 sendUserMessage：后者在流式中会直接 return（同会话防重）。 */
+  const handleGuardNudge = useCallback(async (text: string) => {
+    try {
+      if (isStreaming) {
+        await queueUserMessage(text, true)
+      } else {
+        await sendUserMessage(text, modelOptions)
+      }
+    } catch (e) {
+      useNotificationStore.getState().push({ tone: 'warn', title: t('home.guardNudgeFailed') })
+      throw e
+    }
+  }, [isStreaming, modelOptions, queueUserMessage, sendUserMessage, t])
+
   /** 构建错误一键修复：将结构化错误摘要注入对话输入框并聚焦，让用户直接交给 Agent 修复 */
   const handleFixBuildErrors = (errors: AnalyzedBuildError[]) => {
     const lines = errors.map((e) => {
@@ -5113,7 +5129,7 @@ export default function Home() {
               {/* 失速提示：Agent 连续多次工具调用没有实质进展时出现。
                * 后端只在**级别变化**时发事件（stage=0 表示恢复），
                * 任务结束时后端也会发一次 stage=0 清掉它。 */}
-              <GuardBar convId={currentConversation.id} />
+              <GuardBar convId={currentConversation.id} onNudge={handleGuardNudge} />
               <PinnedBar convId={currentConversation.id} onJump={(msgId) => {
                 const el = document.querySelector(`[data-msg-id="${msgId}"]`) as HTMLElement | null
                 if (el) {
