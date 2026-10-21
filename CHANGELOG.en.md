@@ -6,6 +6,30 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 52: batch submission keeps queued messages' @ references (2026-10-22)
+
+"Submit together" merges all queued messages into one numbered message and then
+**deletes the originals**. The merged message was re-inserted with only its body,
+so `references_json` disappeared along with the originals:
+
+- @file references on queued messages were no longer injected by `inject_references`;
+  the model only saw the path text;
+- @conversation references lost their title and latest summary;
+- the reference chips under the message bubble disappeared as well.
+
+`take_all_queued` now collects references while reading the bodies (deduplicated
+across messages, preserving queue order) and persists them with the merged message.
+History assembly then injects file/conversation content as usual.
+
+### Verification
+
+Rust **1255/1255** (+4: reference merge/dedup, single message, corrupt refs,
+empty queue) · frontend vitest **237/237** unaffected · `tsc` / `eslint` /
+clippy baseline green · i18n keys **2295** (no additions, union **2297**) ·
+i18n gates, `check-docs` and the production build pass.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 51: conversation-creation failures no longer swallow actions (2026-10-22)
 
 Batch 48 fixed silent failures after an instruction was sent but not accepted. This
