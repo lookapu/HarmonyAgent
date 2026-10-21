@@ -1695,6 +1695,27 @@ fn append_queued_user_event(
     );
 }
 
+/// 排队消息还没等到项目锁就被停止：消息行已在库（queued 已置 0 或是批量合并行），
+/// 这一轮任务也已在事件流里宣布开始过，必须把用户输入补进日志并带回消息 id；
+/// 否则停止后时间线缺这条提问，前端也拿不到可对齐的真实 id。
+fn record_queued_user_on_cancel(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    content: &str,
+    trace_id: &str,
+) -> Option<String> {
+    append_queued_user_event(conn, conversation_id, content, trace_id, false);
+    conn.query_row(
+        "SELECT id FROM messages
+         WHERE conversation_id = ?1 AND role = 'user'
+           AND queued = 0 AND hidden = 0
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        [conversation_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
 /// 批量消费结果：合并行本身 + 被删除的原文 id，供事件让前端即时对齐。
 struct QueuedBatch {
     content: String,
@@ -2036,6 +2057,76 @@ mod queued_user_event_tests {
             vec!["第一条", "并入的指令"],
             "事件投影保持会话内顺序"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancel_queued_alignment_tests {
+    use super::record_queued_user_on_cancel;
+    use crate::agent::session_events::{replay, SessionEventType};
+
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                queued INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE session_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                trace_id TEXT,
+                created_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert(conn: &rusqlite::Connection, id: &str, queued: i64, hidden: i64, created_at: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, hidden, created_at)
+             VALUES (?1, 'c1', 'user', ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, format!("内容-{id}"), queued, hidden, created_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn records_event_and_returns_latest_visible_user() {
+        let conn = setup();
+        insert(&conn, "u1", 0, 0, 1);
+        insert(&conn, "u2", 0, 0, 2);
+        insert(&conn, "hidden", 0, 1, 3);
+
+        let id = record_queued_user_on_cancel(&conn, "c1", "续跑内容", "trace-9");
+        assert_eq!(id.as_deref(), Some("u2"), "隐藏行不参与对齐，取最新可见 user");
+
+        let events = replay(&conn, "c1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, SessionEventType::UserMessage);
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-9"));
+        assert_eq!(events[0].payload["content"], "续跑内容");
+        assert_eq!(events[0].payload["queued"], true, "取消时补的事件仍标记来源为排队");
+    }
+
+    #[test]
+    fn records_event_even_when_no_row_can_be_aligned() {
+        let conn = setup();
+        let id = record_queued_user_on_cancel(&conn, "c1", "孤立内容", "trace-10");
+        assert!(id.is_none(), "没有可对齐的消息行时只返回 None");
+
+        let events = replay(&conn, "c1").unwrap();
+        assert_eq!(events.len(), 1, "用户输入本身不能因为对齐失败而丢失");
+        assert_eq!(events[0].payload["content"], "孤立内容");
     }
 }
 
@@ -5660,19 +5751,10 @@ async fn stream_chat_inner(
                 );
                 Some(id)
             } else {
-                // 自动续跑/批量合并的消息已在库：把真实 id 带回前端，
-                // 停止后界面能立刻对齐（否则要等下次刷新才看得到这一条）。
-                // 这只是一次对齐用的查询，失败不能阻断停止事件本身。
+                // 自动续跑/批量合并的消息已在库：补事件并带回真实 id。
+                // 这只是一次对齐用的写入，失败不能阻断停止事件本身。
                 state.0.lock().ok().and_then(|conn| {
-                    conn.query_row(
-                        "SELECT id FROM messages
-                         WHERE conversation_id = ?1 AND role = 'user'
-                           AND queued = 0 AND hidden = 0
-                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                        [&conversation_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .ok()
+                    record_queued_user_on_cancel(&conn, &conversation_id, &content, &trace_id)
                 })
             };
             stats.stopped = true;

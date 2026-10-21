@@ -6076,4 +6076,39 @@ Rust 全量 **1263/1263** 不变（6 条批量消费单测补断言：返回 id�
 `tsc` / `eslint` / clippy 基线绿 · i18n 键无变化（2297，并集 2299）·
 三道 i18n 门禁与 `check-docs` 绿；工具数 / 迁移数不变（204 / 86）。
 
+### 6.75 第五十八批：排队等待时停止也补用户事件（2026-10-22）
+
+#### 6.75.1 起点：取消分支只查 id，不写事件
+
+任务在取得项目锁之前要排队（同项目串行，上限 10 分钟），此时
+`chat-run-started` 已经发出。若用户在这段时间点停止：
+
+- `persist_user = true` 的首轮消息会入库并补事件；
+- 自动续跑 / 批量合并（`persist_user = false`）只回查最新 user 消息 id，**不写事件**。
+
+结果：库里有这条 user 消息（续跑行 `queued = 0` 或批量合并行），
+`session_events` 里却没有对应 `UserMessage`。时间线、轨迹导出缺这一轮提问，
+reflexion 按最后一条 `UserMessage` 划分轮次时也会把这段算进上一轮。
+
+#### 6.75.2 修法：事件与 id 对齐合并成一个动作
+
+抽出 `record_queued_user_on_cancel(conn, conversation_id, content, trace_id)`：
+
+1. `append_queued_user_event` 补一条 `UserMessage`（`queued: true`，
+   归属本次任务 trace）；
+2. 回查该会话最新一条 `role = 'user' AND queued = 0 AND hidden = 0`
+   的消息 id 并返回。
+
+取消分支在 `persist_user = false` 时调用它。任一写入/查询失败都只返回 `None`，
+不阻断 `chat-stopped`：停止是用户意图，不能被对齐逻辑拖住。
+
+#### 6.75.3 验证
+
+新增 2 条 Rust 单测（`cancel_queued_alignment_tests`）：事件写入且隐藏行不参与
+id 对齐；无可对齐行时事件仍保留、id 为 `None`。Rust 全量 **1265/1265**（+2）·
+前端 vitest **237/237** 不受影响 · `tsc` / `eslint` / clippy 基线绿 ·
+i18n 键无变化（2297，并集 2299）· 三道 i18n 门禁与 `check-docs` 绿；
+工具数 / 迁移数不变（204 / 86）。
+
+
 

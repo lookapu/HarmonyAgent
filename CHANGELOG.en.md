@@ -6,6 +6,35 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 58: stopping during the project-lock wait still keeps the user event (2026-10-22)
+
+Auto-continue and "Submit together" tasks wait **before acquiring the project lock**
+(one task per project, up to 10 minutes). If the user stops during that window,
+`stream_chat_inner`'s cancellation branch only looked up the latest user message id:
+
+- queued messages (`persist_user = false`) are not re-inserted and got no
+  `UserMessage` event;
+- `chat-run-started` had already been emitted for this task, so the timeline and
+  trajectory were missing that round's user input, and reflexion's round boundary
+  lost a segment as well;
+- the continuation message is a normal `queued = 0` history row, so the UI and the
+  event log disagreed.
+
+The cancellation branch now calls `record_queued_user_on_cancel`: it first appends a
+`UserMessage` event (`queued: true`, owned by this task's trace), then returns the
+latest visible `queued = 0` user message id. If either the event write or the lookup
+fails, the stop itself still proceeds — stopping wins; only the id alignment is lost.
+
+### Verification
+
+Two new Rust unit tests: the event is appended and hidden rows are skipped when
+picking the latest visible user; with no alignable row the event is still written and
+the id is `None`. Rust **1265/1265** (+2) · frontend vitest **237/237** unaffected ·
+`tsc` / `eslint` / clippy baseline green · i18n keys **2297** (no changes, union
+**2299**) · i18n gates, `check-docs` and the production build pass. Tool count
+unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 57: the timeline follows queued-message consumption immediately (2026-10-22)
 
 Queued messages can be consumed in two ways. Both took effect in the database, but the
