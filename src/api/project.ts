@@ -801,11 +801,17 @@ export const streamChat = (
   references?: string[],
   images?: string[],
   regenerateUserId?: string,
-) => invokeWithError<void>('stream_chat', { conversationId, content, options, regenerate, references, images, regenerateUserId })
+  /** 批量发送的首条：后端认领这条已入队消息，不再重复入库（保证顺序） */
+  queuedMessageId?: string,
+) => invokeWithError<void>('stream_chat', { conversationId, content, options, regenerate, references, images, regenerateUserId, queuedMessageId })
 
 /** 运行中提交消息进入排队：agentOwned=true 由 Agent 安全点并入当前任务；false 任务结束后自动续跑 */
 export const queueMessage = (conversationId: string, content: string, agentOwned: boolean, references?: string[], images?: string[]) =>
   invokeWithError<ChatMessage>('queue_message', { conversationId, content, agentOwned, references, images })
+
+/** 批量入队：整批按顺序写入（同一事务），失败整批回滚 */
+export const queueMessages = (conversationId: string, contents: string[]) =>
+  invokeWithError<ChatMessage[]>('queue_messages', { conversationId, contents })
 
 /** 会话排队中消息（前端“排队中”条展示） */
 export interface QueuedMessageInfo {

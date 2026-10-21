@@ -296,7 +296,7 @@ export interface ChatSlice {
   /** 加载更早的历史消息（prepend 到 messages 头部），返回新增条数；无更多或已加载返回 0 */
   loadOlderMessages: (conversationId: string) => Promise<number>
   /** 发送用户消息；返回 false 表示未接手（同会话正在流式，或 invoke 失败且用户消息未入库） */
-  sendUserMessage: (content: string, options?: ChatOptions, references?: string[], images?: string[]) => Promise<boolean>
+  sendUserMessage: (content: string, options?: ChatOptions, references?: string[], images?: string[], queuedMessageId?: string) => Promise<boolean>
   /** 流式运行中提交消息进入排队：agentOwned=true 发送到 Agent；false 任务结束后自动续跑 */
   queueUserMessage: (content: string, agentOwned: boolean, references?: string[], images?: string[]) => Promise<void>
   /** 编辑已发送的用户消息（更新后刷新列表） */

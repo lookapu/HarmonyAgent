@@ -1668,6 +1668,73 @@ fn take_next_queued(
     Ok(Some((id, content)))
 }
 
+/// 认领结果：正文与引用以库里为准（排队期间可被编辑）。
+struct ClaimedQueuedMessage {
+    content: String,
+    references: Option<Vec<String>>,
+}
+
+/// 认领一条排队消息作为新一轮首条输入（queued=1 → 0）。
+///
+/// 返回 None 表示已被其他任务消费或不存在：调用方不得再按"新消息"入库，
+/// 否则同一句话会在时间线出现两次。先做带条件的 UPDATE 再读正文，避免
+/// 读取与编辑并发时拿到旧内容（编辑同样要求 queued=1）。
+fn claim_queued_message(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Option<ClaimedQueuedMessage>, String> {
+    let changed = conn
+        .execute(
+            "UPDATE messages SET queued = 0
+             WHERE id = ?1 AND conversation_id = ?2 AND role = 'user' AND queued = 1 AND hidden = 0",
+            rusqlite::params![message_id, conversation_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let (content, refs_json): (String, Option<String>) = conn
+        .query_row(
+            "SELECT content, references_json FROM messages WHERE id = ?1",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let refs = refs_json.and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok());
+    Ok(Some(ClaimedQueuedMessage { content, references: refs }))
+}
+
+/// 批量入队的纯 DB 实现：同一事务写完全部行，任一失败整批回滚。
+/// created_at 相同，顺序由 rowid（插入顺序）保证——批量发送的后续行
+/// 因此不会与首条争抢时间戳精度。
+fn queue_batch_conn(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    lines: &[String],
+    ts: i64,
+) -> Result<Vec<String>, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut ids = Vec::with_capacity(lines.len());
+    for line in lines {
+        let id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, agent_owned, created_at)
+             VALUES (?1, ?2, 'user', ?3, 1, 0, ?4)",
+            rusqlite::params![id, conversation_id, line, ts],
+        )
+        .map_err(|e| e.to_string())?;
+        ids.push(id);
+    }
+    tx.execute(
+        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![ts, conversation_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ids)
+}
+
 /// 排队消息补写 UserMessage 事件。
 ///
 /// 排队消息的两条消费路径都不走"新消息入库 + 事件"分支：任务结束后的自动续跑
@@ -2171,7 +2238,7 @@ mod history_order_tests {
         insert(&conn, "aaaa-assistant", "assistant", "已修复两处错误", 3000);
 
         let rows = load_recent_history_rows(&conn, "c1", 10).unwrap();
-        let contents: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
         assert_eq!(
             contents,
             vec!["查一下构建错误", "build_project: 2 errors", "已修复两处错误"],
@@ -2198,7 +2265,104 @@ mod history_order_tests {
 
         let rows = load_recent_history_rows(&conn, "c1", 10).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, "正常消息");
+        assert_eq!(rows[0].content, "正常消息");
+    }
+}
+
+#[cfg(test)]
+mod queued_claim_tests {
+    use super::{claim_queued_message, queue_batch_conn};
+
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                references_json TEXT,
+                queued INTEGER NOT NULL DEFAULT 0,
+                agent_owned INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE conversations (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO conversations (id, updated_at) VALUES ('c1', 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn claim_returns_stored_content_and_clears_queue_flag() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, references_json, queued, created_at)
+             VALUES ('q1', 'c1', 'user', '第一条', ?1, 1, 100)",
+            rusqlite::params![r#"["src/a.ets"]"#],
+        )
+        .unwrap();
+
+        let claimed = claim_queued_message(&conn, "c1", "q1").unwrap().unwrap();
+        assert_eq!(claimed.content, "第一条", "认领后以库里正文为准");
+        assert_eq!(claimed.references, Some(vec!["src/a.ets".to_string()]));
+        let queued: i64 = conn
+            .query_row("SELECT queued FROM messages WHERE id = 'q1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0, "认领即退出队列");
+        assert!(claim_queued_message(&conn, "c1", "q1").unwrap().is_none(), "不得被认领两次");
+    }
+
+    #[test]
+    fn claim_rejects_other_conversation_hidden_and_missing_rows() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, hidden, created_at)
+             VALUES ('other', 'c2', 'user', '别的会话', 1, 0, 100),
+                    ('hidden', 'c1', 'user', '已归档', 1, 1, 100),
+                    ('assistant', 'c1', 'assistant', '回复', 0, 0, 100)",
+            [],
+        )
+        .unwrap();
+        for id in ["other", "hidden", "missing"] {
+            assert!(claim_queued_message(&conn, "c1", id).unwrap().is_none(), "{id} 不应被认领");
+        }
+    }
+
+    #[test]
+    fn batch_insert_keeps_input_order_even_with_one_timestamp() {
+        let conn = setup();
+        let lines = vec!["第一行".to_string(), "第二行".to_string(), "第三行".to_string()];
+        let ids = queue_batch_conn(&conn, "c1", &lines, 500).unwrap();
+        assert_eq!(ids.len(), 3);
+
+        let contents: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content FROM messages
+                     WHERE conversation_id = 'c1' AND queued = 1
+                     ORDER BY created_at ASC, rowid ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(contents, lines, "同一时间戳下批次顺序必须等于输入顺序");
+
+        // 首条被认领后，剩余排队顺序仍与输入一致（这是批量续跑的可见顺序）
+        assert_eq!(claim_queued_message(&conn, "c1", &ids[0]).unwrap().unwrap().content, "第一行");
+        let next: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE conversation_id = 'c1' AND queued = 1
+                 ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, "第二行");
     }
 }
 
@@ -2262,6 +2426,52 @@ pub async fn queue_message(
         )
         .map_err(|e| e.to_string())?;
     Ok(message)
+}
+
+/// 批量入队：整批消息按给定顺序写入（同一事务），供批量发送使用。
+///
+/// 与逐条 queue_message 的区别是**原子性与顺序**：任一行写失败整批回滚，
+/// 不会出现"前两行已入队、第三行失败"的半批；全部行同一时间戳，
+/// 由 rowid 固定先后，首条随后被 stream_chat 认领启动。
+#[tauri::command]
+pub fn queue_messages(
+    state: State<'_, DbState>,
+    conversation_id: String,
+    contents: Vec<String>,
+) -> Result<Vec<crate::db::models::ChatMessage>, String> {
+    let lines: Vec<String> = contents
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Err("批量内容为空".into());
+    }
+    if lines.len() > 100 {
+        return Err("单次最多入队 100 条".into());
+    }
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let exists: i64 = conn
+        .query_row("SELECT COUNT(1) FROM conversations WHERE id = ?1", [&conversation_id], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if exists == 0 {
+        return Err("会话不存在".into());
+    }
+    let ids = queue_batch_conn(&conn, &conversation_id, &lines, now())?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(
+            conn.query_row(
+                "SELECT id, conversation_id, role, content, references_json, model,
+                        tokens_in, tokens_out, created_at, reasoning, queued, agent_owned, modified_files_json, duration_ms
+                 FROM messages WHERE id = ?1",
+                [&id],
+                row_to_message,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(out)
 }
 
 /// 会话排队中消息列表（queued=1 的 user 消息，按提交顺序；内容截断到 200 字供前端展示）
@@ -2841,7 +3051,7 @@ mod idle_semantic_schedule_tests {
 #[tauri::command]
 pub async fn stream_chat(
     app: AppHandle,
-    _state: State<'_, DbState>,
+    state: State<'_, DbState>,
     _lock: State<'_, ChatLock>,
     _cancel: State<'_, ChatCancel>,
     _approval: State<'_, ToolApprovalState>,
@@ -2856,9 +3066,29 @@ pub async fn stream_chat(
     references: Option<Vec<String>>,
     // 多模态图片（data URL，仅首次请求发送；落库时正文追加附图标记）
     images: Option<Vec<String>>,
+    // 批量发送的首条：认领这条已入队的消息作为本轮输入，不再重复入库。
+    // 这样首条的 rowid 始终在后续排队消息之前，任务结束后按原顺序续跑。
+    queued_message_id: Option<String>,
 ) -> Result<(), String> {
     // 任一前台消息到达都使旧后台语义批次在当前批结束后退出；新的空闲窗口由本任务收尾重建。
     let foreground_generation = crate::agent::lsp_client::note_foreground_activity();
+    // 认领在注册任务之前完成：注册失败时把 queued 恢复，消息仍在队列里可重试，
+    // 不会变成"已显示为普通人消息、却没有任务回答"的孤儿。
+    let claimed = match queued_message_id.as_deref() {
+        Some(qid) => {
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            claim_queued_message(&conn, &conversation_id, qid)?
+        }
+        None => None,
+    };
+    if queued_message_id.is_some() && claimed.is_none() {
+        return Err("排队消息已被处理或不存在，请刷新会话后重试".into());
+    }
+    let initial_persist_user = claimed.is_none();
+    let (content, references) = match claimed {
+        Some(claimed) => (claimed.content, claimed.references.or(references)),
+        None => (content, references),
+    };
     // 任务监管壳：把任务主体 spawn 到 tokio（获得 AbortHandle 供看门狗强杀），
     // 注册心跳后等待收尾。State 在闭包内经 app.state() 重取（底层 'static 数据，
     // 跨线程可用），绕开命令参数借用生命周期；任务卡死/停止失效时看门狗 abort，
@@ -2893,6 +3123,7 @@ pub async fn stream_chat(
             regenerate_user_id,
             references,
             images,
+            initial_persist_user,
         )
         .await
     });
@@ -2901,11 +3132,27 @@ pub async fn stream_chat(
         let registry = app.state::<TaskRegistry>();
         let Some(generation) = registry.register(&conversation_id, abort_handle.clone()) else {
             join.abort();
+            // 认领成功但任务没启动：把消息放回队列，等待当前任务收尾时消费或用户重试
+            if let Some(qid) = queued_message_id.as_deref() {
+                if let Ok(conn) = state.0.lock() {
+                    let _ = conn.execute(
+                        "UPDATE messages SET queued = 1 WHERE id = ?1 AND queued = 0 AND role = 'user'",
+                        [qid],
+                    );
+                }
+            }
             return Err("该会话已有任务进行中，请等待完成或停止后重试".to_string());
         };
         TaskRegistry::ensure_watchdog(app.clone());
         generation
     };
+    // 首条已从队列认领：立即通知前端清掉「排队中」标记（后续行仍保持排队）
+    if let Some(qid) = queued_message_id.as_deref() {
+        let _ = app.emit(
+            "chat-queued-consumed",
+            serde_json::json!({ "conversation_id": conversation_id, "message_id": qid }),
+        );
+    }
     let mut registered = RegisteredChatTask {
         app: app.clone(),
         conversation_id: conversation_id.clone(),
@@ -2970,6 +3217,7 @@ async fn stream_chat_body(
     regenerate_user_id: Option<String>,
     references: Option<Vec<String>>,
     images: Option<Vec<String>>,
+    initial_persist_user: bool,
 ) -> Result<(), String> {
     registry.touch(&conversation_id, PHASE_START);
     let mut current_content = content;
@@ -2979,8 +3227,9 @@ async fn stream_chat_body(
     // take() 消费后自动置 None，避免续跑轮次重复注入
     let mut current_refs = references;
     let mut current_images = images;
-    // 首次进入需要入库 user 消息；续跑时消息已在库（排队原文），不再重复入库
-    let mut persist_user = true;
+    // 首次进入是否需要入库 user 消息：批量发送认领的首条已在库，直接进入组装；
+    // 续跑时消息同样已在库（排队原文），不再重复入库
+    let mut persist_user = initial_persist_user;
     loop {
         let refs_this = current_refs.take();
         let imgs_this = current_images.take();
@@ -4337,6 +4586,14 @@ struct AssembleInputs<'a> {
     ledger_base_n: u32,
 }
 
+/// 历史行（旧 → 新）：模型上一轮看到的会话内容。
+struct RecentHistoryRow {
+    role: String,
+    content: String,
+    references_json: Option<String>,
+    reasoning: Option<String>,
+}
+
 /// 读取最近的历史行（旧 → 新）。created_at 只有秒级精度：同一秒内的用户消息、
 /// 工具调用结果与助手回复必须按 rowid（真实插入顺序）兜底，否则模型可能先看到
 /// 工具结果再看到调用，或把排队续跑轮拼到错误位置。
@@ -4344,7 +4601,7 @@ fn load_recent_history_rows(
     conn: &rusqlite::Connection,
     conversation_id: &str,
     limit: usize,
-) -> Result<Vec<(String, String, Option<String>, Option<String>)>, String> {
+) -> Result<Vec<RecentHistoryRow>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT role, content, references_json, reasoning FROM messages
@@ -4354,7 +4611,12 @@ fn load_recent_history_rows(
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params![conversation_id, limit as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?))
+            Ok(RecentHistoryRow {
+                role: r.get(0)?,
+                content: r.get(1)?,
+                references_json: r.get(2)?,
+                reasoning: r.get(3)?,
+            })
         })
         .map_err(|e| e.to_string())?;
     let mut recent = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
@@ -4476,7 +4738,7 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
         rows
     };
     let mut history_rows = Vec::with_capacity(raw_history.len());
-    for (role, text, refs_json, reasoning) in raw_history {
+    for RecentHistoryRow { role, content: text, references_json: refs_json, reasoning } in raw_history {
         // @ 引用需要文件/DB IO，因此在纯策略 assembler 外预先展开。
         let content = if role == "user" && refs_json.is_some() {
             let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;

@@ -443,6 +443,7 @@ pub fn run() {
             commands::chat::list_tool_whitelist,
             commands::chat::remove_tool_whitelist,
             commands::chat::queue_message,
+            commands::chat::queue_messages,
             commands::chat::list_queued_messages,
             commands::chat::remove_queued_message,
             commands::chat::update_message,

@@ -1214,6 +1214,7 @@ fn dispatch_api(
                     regenerate_user_id,
                     references,
                     images,
+                    None,
                 )
                 .await;
             });

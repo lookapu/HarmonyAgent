@@ -1868,7 +1868,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     },
 
     // 新任务开始时清空上次任务摘要（防止跨任务残留展示）
-    sendUserMessage: async (content, options, references, images) => {
+    sendUserMessage: async (content, options, references, images, queuedMessageId) => {
       const conv = get().currentConversation
       if (!conv) return false
       // 同会话流式中防重（error 态允许重发；跨会话放行——后端同项目任务排队机制生效）
@@ -1877,10 +1877,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       // 开始发送消息性能追踪
       const sendTrace = startPerfTrace('sendMessage', { conv: conv.id.slice(0, 8) })
       sendTraces.set(conv.id, sendTrace)
-      // 乐观展示 user 消息（Rust 端同样入库）。ID 带随机后缀，避免跨会话同秒发送碰撞
+      // 乐观展示 user 消息（Rust 端同样入库）。ID 带随机后缀，避免跨会话同秒发送碰撞。
+      // 批量首条已在队列里且可能已显示：此时不再插入占位，避免同一句话出现两份。
       const now = Math.floor(Date.now() / 1000)
       const localId = `local-${now}-${Math.random().toString(36).slice(2, 8)}`
-      optimisticRunUserIds.set(conv.id, localId)
+      const alreadyShown = !!queuedMessageId && get().messages.some((m) => m.id === queuedMessageId)
+      optimisticRunUserIds.set(conv.id, alreadyShown ? (queuedMessageId as string) : localId)
       const fresh: StreamingState = {
         ...emptyStreaming(),
         conversationId: conv.id,
@@ -1889,25 +1891,27 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         lastDeltaAt: Date.now(),
       }
       set({
-        messages: [
-          ...get().messages,
-          {
-            id: localId,
-            conversation_id: conv.id,
-            role: 'user',
-            content,
-            references_json: references?.length ? JSON.stringify(references) : null,
-            model: null,
-            tokens_in: null,
-            tokens_out: null,
-            reasoning: null,
-            queued: 0,
-            agent_owned: 0,
-            modified_files_json: null,
-            duration_ms: null,
-            created_at: now,
-          },
-        ],
+        messages: alreadyShown
+          ? get().messages
+          : [
+              ...get().messages,
+              {
+                id: localId,
+                conversation_id: conv.id,
+                role: 'user',
+                content,
+                references_json: references?.length ? JSON.stringify(references) : null,
+                model: null,
+                tokens_in: null,
+                tokens_out: null,
+                reasoning: null,
+                queued: 0,
+                agent_owned: 0,
+                modified_files_json: null,
+                duration_ms: null,
+                created_at: now,
+              },
+            ],
         streamings: { ...get().streamings, [conv.id]: fresh },
         streaming: fresh,
         toolRuns: [],
@@ -1923,7 +1927,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       })
       sendTrace.mark('optimistic-rendered')
       try {
-        await streamChatApi(conv.id, content, options, false, references, images)
+        await streamChatApi(conv.id, content, options, false, references, images, undefined, queuedMessageId)
         return true
       } catch (e) {
         optimisticRunUserIds.delete(conv.id)

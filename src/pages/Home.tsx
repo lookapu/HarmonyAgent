@@ -60,7 +60,7 @@ import {
   type Conversation,
   type SnapshotInfo,
   listToolGroups,
-  queueMessage,
+  queueMessages,
   conversationRoot,
   getConversationBranchParent,
   mergeConversationBranch,
@@ -7721,35 +7721,32 @@ export default function Home() {
             }
             const convId = conv.id
             const wasStreaming = !!useProjectStore.getState().streamings[convId]
-            const failed: string[] = []
-            let ok = 0
-            // 空闲时首行直接开启新一轮，其余行先入队、任务结束后由后端串行续跑；
-            // 运行中也全部入队，由当前任务收尾时消费。
-            for (const line of wasStreaming ? lines : lines.slice(1)) {
-              try {
-                await queueMessage(convId, line, false)
-                ok++
-              } catch {
-                failed.push(line)
-              }
+            // 整批按输入顺序入队（同一事务）：后续行的 rowid 永远在首条之后。
+            // 空闲时再由首条认领启动，任务结束后后端按队列顺序续跑；
+            // 运行中则全部排队，由当前任务收尾时消费。
+            let saved: Awaited<ReturnType<typeof queueMessages>>
+            try {
+              saved = await queueMessages(convId, lines)
+            } catch (e) {
+              notifyActionNotSent(e)
+              return { ok: 0, failed: lines }
             }
-            if (!wasStreaming && lines.length > 0) {
-              ok++
-              // 不 await：要等整个任务结束；投递失败由 deliverActionText 自己提示/改排队
-              void deliverActionText(lines[0], modelOptions)
+            if (!wasStreaming && saved.length > 0) {
+              // 不 await：sendUserMessage 要等整个任务结束才 resolve。
+              // queuedMessageId 让后端认领首条而不是重新入库，顺序不会颠倒。
+              const first = saved[0]
+              void sendUserMessage(first.content, modelOptions, undefined, undefined, first.id)
             }
             useNotificationStore.getState().push({
-              tone: failed.length ? 'warn' : 'success',
+              tone: 'success',
               title: t('home.batchSent'),
-              body: t('home.batchSentBody', { ok, total: lines.length }),
+              body: t('home.batchSentBody', { ok: saved.length, total: lines.length }),
             })
             void refreshQueued(convId)
-            if (failed.length === 0) {
-              // 弹窗是模态的，处理期间用户无法改草稿；仍在原会话才清空
-              if (useProjectStore.getState().currentConversation?.id === convId) setDraft('')
-              setBatchOpen(false)
-            }
-            return { ok, failed }
+            // 弹窗是模态的，处理期间用户无法改草稿；仍在原会话才清空
+            if (useProjectStore.getState().currentConversation?.id === convId) setDraft('')
+            setBatchOpen(false)
+            return { ok: saved.length, failed: [] }
           }}
         />
       )}

@@ -61,7 +61,7 @@ Current codebase scale:
 | `agent/tools/` Rust files (incl. `mod.rs`) | 36 |
 | `commands/` command modules (excluding `mod.rs`) | 41 |
 | `services/` service modules (excluding `mod.rs`) | 64 |
-| Tauri IPC registration entry points | 321 |
+| Tauri IPC registration entry points | 322 |
 | Database migrations | 86 |
 | React pages | 19 |
 

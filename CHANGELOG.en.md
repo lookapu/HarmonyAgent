@@ -6,7 +6,39 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
-## Unreleased — Batch 59: same-second messages follow real insertion order everywhere (2026-10-22)
+## Unreleased — Batch 60: batch send enqueues and starts in input order (2026-10-22)
+
+When idle, batch send used to enqueue lines 2..N first and then send line 1:
+
+- line 1's user message was only inserted after the project lock was acquired, so its
+  rowid landed after every queued follow-up;
+- after the task finished, the queue resumed by rowid, leaving the first instruction
+  permanently below the rest of the batch (not transient — reopening showed the same);
+- per-line inserts had no transaction boundary; a mid-way failure left half a batch,
+  and retrying from the dialog could shuffle the order.
+
+Batch send now uses `queue_messages`: the whole batch is inserted in input order in one
+transaction, and any failure rolls the batch back. When idle, the backend then *claims*
+the first row (`queued_message_id` on `stream_chat`); the claim is a conditional
+`queued 1 → 0`, so the message is not inserted twice and its rowid always precedes the
+follow-ups. A successful claim emits `chat-queued-consumed` to clear the queued badge;
+if task registration fails, the row is restored to queued so the queue bar can retry —
+it never becomes an orphan question without an answer.
+
+Existing queue reads, model history and pagination keep the `(created_at, rowid)`
+ordering from Batch 59. The messages schema is unchanged; no migration is needed.
+
+### Verification
+
+Three new Rust unit tests: a claim uses the stored body and cannot be repeated; rows
+from another conversation, hidden rows and missing ids are rejected; a same-timestamp
+batch inserts in input order and keeps that order after the first row is claimed.
+Rust **1271/1271** (+3) · frontend vitest **237/237** unaffected · `tsc` / `eslint` /
+clippy baseline green · i18n keys unchanged (**2297**, union **2299**) · i18n gates,
+`check-docs` and the production build pass. Tool count unchanged: `TOOL_SPECS` to
+**204**, migration count reaches **86**.
+
+---
 
 `messages.created_at` only has second precision, yet the timeline, pagination and model
 context previously sorted by `created_at` alone:
