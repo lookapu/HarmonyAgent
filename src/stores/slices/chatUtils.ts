@@ -78,6 +78,23 @@ export function upsertMessageById(messages: ChatMessage[], message: ChatMessage)
   return messages.map((item, i) => (i === index ? message : item))
 }
 
+/** 排队消息被执行：消息可能已在时间线（单条排队的乐观行）也可能只在
+ * 排队条（批量发送）。两种情况都要落成一条普通用户消息并清掉排队条目，
+ * 否则任务在跑而提问气泡要等重新打开会话才出现。 */
+export function applyConsumedQueuedMessage<T extends { id: string }>(
+  messages: ChatMessage[],
+  queuedList: T[],
+  message: ChatMessage,
+): { messages: ChatMessage[]; queuedList: T[] } {
+  const shown = messages.some((m) => m.id === message.id)
+  return {
+    messages: shown
+      ? messages.map((m) => (m.id === message.id ? { ...message, queued: 0 } : m))
+      : [...messages, { ...message, queued: 0 }],
+    queuedList: queuedList.filter((q) => q.id !== message.id),
+  }
+}
+
 /** 一次完成事件只收敛一个运行项；同名工具并发时不能批量结束全部卡片。 */
 export function firstRunningIndex<T extends { status: string }>(entries: T[], matches: (entry: T) => boolean): number {
   return entries.findIndex((entry) => entry.status === 'running' && matches(entry))

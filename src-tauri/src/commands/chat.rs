@@ -1735,6 +1735,120 @@ fn queue_batch_conn(
     Ok(ids)
 }
 
+/// 读取队首消息的完整行（只读，不消费）：任务收尾与入队后据此判断
+/// 是否还有没人接手的排队消息。顺序与消费路径一致：(created_at, rowid)。
+fn first_queued_message_conn(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Option<ChatMessage>, String> {
+    conn.query_row(
+        "SELECT id, conversation_id, role, content, references_json, model,
+                tokens_in, tokens_out, created_at, reasoning, queued, agent_owned, modified_files_json, duration_ms
+         FROM messages
+         WHERE conversation_id = ?1 AND role = 'user' AND queued = 1 AND hidden = 0
+         ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        [conversation_id],
+        row_to_message,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// 按 id 读取完整消息行：消费事件要带上完整正文，前端才能在消息只存在于
+/// 排队条（批量发送）时把提问气泡补进时间线。
+fn message_by_id_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<Option<ChatMessage>, String> {
+    conn.query_row(
+        "SELECT id, conversation_id, role, content, references_json, model,
+                tokens_in, tokens_out, created_at, reasoning, queued, agent_owned, modified_files_json, duration_ms
+         FROM messages WHERE id = ?1",
+        [message_id],
+        row_to_message,
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// 空闲队列能否自动拉起：任务刚被停止时队列保留给用户决定（与任务内
+/// 自动续跑一致），项目正被其他会话占用时也不抢先——否则消息会从排队条
+/// 消失却在项目锁后静默等待。
+fn idle_queue_start_allowed(project_busy: bool, stopped: bool) -> bool {
+    !project_busy && !stopped
+}
+
+/// 若会话当前没有任务、项目锁空闲且队首消息存在，就认领并启动它。
+///
+/// 覆盖两个窄窗口：入队时任务已结束（generation 为空），以及任务在
+/// `take_next_queued` 返回 None 后才写入队列、收尾路径没再查一次。
+/// 启动复用 `stream_chat` 的认领/登记/看门狗壳：认领后随
+/// `chat-queued-consumed` 带完整消息，前端据此把只存在于排队条的提问补进
+/// 时间线；认领失败只会静默返回，消息仍在队列里可重试。
+fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_stop: bool) {
+    if app.state::<TaskRegistry>().generation(conversation_id).is_some() {
+        return;
+    }
+    let stopped = respect_stop
+        && app
+            .state::<ChatCancel>()
+            .0
+            .lock()
+            .map(|set| set.contains(conversation_id))
+            .unwrap_or(true);
+    let state = app.state::<DbState>();
+    let (project_id, queued) = {
+        let Ok(conn) = state.0.lock() else { return };
+        let project_id = match conn
+            .query_row("SELECT project_id FROM conversations WHERE id = ?1", [conversation_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+        {
+            Ok(Some(project_id)) => project_id,
+            _ => return,
+        };
+        let queued = match first_queued_message_conn(&conn, conversation_id) {
+            Ok(Some(message)) => message,
+            _ => return,
+        };
+        (project_id, queued)
+    };
+    let project_busy = app
+        .state::<ChatLock>()
+        .0
+        .lock()
+        .map(|locks| locks.contains_key(&project_id))
+        .unwrap_or(true);
+    if !idle_queue_start_allowed(project_busy, stopped) {
+        return;
+    }
+    let app_for_task = app.clone();
+    let conv_for_task = conversation_id.to_string();
+    let message_id = queued.id;
+    tauri::async_runtime::spawn(async move {
+        let st = app_for_task.state::<DbState>();
+        let lock = app_for_task.state::<ChatLock>();
+        let cancel = app_for_task.state::<ChatCancel>();
+        let approval = app_for_task.state::<ToolApprovalState>();
+        let plan = app_for_task.state::<PlanApprovalState>();
+        let _ = stream_chat(
+            app_for_task.clone(),
+            st,
+            lock,
+            cancel,
+            approval,
+            plan,
+            conv_for_task,
+            String::new(),
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            Some(message_id),
+        )
+        .await;
+    });
+}
+
 /// 排队消息补写 UserMessage 事件。
 ///
 /// 排队消息的两条消费路径都不走"新消息入库 + 事件"分支：任务结束后的自动续跑
@@ -2271,7 +2385,7 @@ mod history_order_tests {
 
 #[cfg(test)]
 mod queued_claim_tests {
-    use super::{claim_queued_message, queue_batch_conn};
+    use super::{claim_queued_message, first_queued_message_conn, idle_queue_start_allowed, queue_batch_conn};
 
     fn setup() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2282,8 +2396,14 @@ mod queued_claim_tests {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL DEFAULT '',
                 references_json TEXT,
+                model TEXT,
+                tokens_in INTEGER,
+                tokens_out INTEGER,
+                reasoning TEXT,
                 queued INTEGER NOT NULL DEFAULT 0,
                 agent_owned INTEGER NOT NULL DEFAULT 0,
+                modified_files_json TEXT,
+                duration_ms INTEGER,
                 hidden INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT 0
             );
@@ -2364,6 +2484,44 @@ mod queued_claim_tests {
             .unwrap();
         assert_eq!(next, "第二行");
     }
+
+    #[test]
+    fn first_queued_message_reads_full_row_without_consuming() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, hidden, created_at)
+             VALUES ('hidden', 'c1', 'user', '已归档', 1, 1, 90),
+                    ('assistant', 'c1', 'assistant', '回复', 0, 0, 95),
+                    ('q1', 'c1', 'user', '第一条', 1, 0, 100),
+                    ('q2', 'c1', 'user', '第二条', 1, 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET references_json = ?1, agent_owned = 1 WHERE id = 'q1'",
+            [r#"["src/a.ets"]"#],
+        )
+        .unwrap();
+
+        let first = first_queued_message_conn(&conn, "c1").unwrap().unwrap();
+        assert_eq!(first.id, "q1", "队首按插入顺序，隐藏行与助手行不参与");
+        assert_eq!(first.content, "第一条");
+        assert_eq!(first.references_json.as_deref(), Some(r#"["src/a.ets"]"#));
+        assert_eq!(first.queued, 1, "只读探测不得消费消息");
+        assert_eq!(first.agent_owned, 1);
+        let still_queued: i64 = conn
+            .query_row("SELECT COUNT(1) FROM messages WHERE queued = 1 AND hidden = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_queued, 2);
+    }
+
+    #[test]
+    fn idle_start_requires_free_project_and_no_stop() {
+        assert!(idle_queue_start_allowed(false, false));
+        assert!(!idle_queue_start_allowed(true, false), "项目正被其他会话占用时不抢先");
+        assert!(!idle_queue_start_allowed(false, true), "用户刚停止时队列保留");
+        assert!(!idle_queue_start_allowed(true, true));
+    }
 }
 
 /// 运行中提交消息进入排队：agent_owned=true 由 Agent 安全点并入当前任务（"发送到 Agent"），
@@ -2372,6 +2530,7 @@ mod queued_claim_tests {
 /// images：多模态图片 data URL（流式运行中无法按协议发送，内联为 Markdown 图片附在正文）。
 #[tauri::command]
 pub async fn queue_message(
+    app: AppHandle,
     state: State<'_, DbState>,
     conversation_id: String,
     content: String,
@@ -2425,19 +2584,26 @@ pub async fn queue_message(
             row_to_message,
         )
         .map_err(|e| e.to_string())?;
+    drop(conn);
+    // 空闲时（通常发生在任务刚结束、前端仍以为在流式的窄窗口）直接拉起队首，
+    // 不让消息停在排队条等用户再点一次。任务仍在跑时该调用是空操作。
+    spawn_queued_chat_if_idle(&app, &conversation_id, true);
     Ok(message)
 }
-
 /// 批量入队：整批消息按给定顺序写入（同一事务），供批量发送使用。
 ///
 /// 与逐条 queue_message 的区别是**原子性与顺序**：任一行写失败整批回滚，
 /// 不会出现"前两行已入队、第三行失败"的半批；全部行同一时间戳，
 /// 由 rowid 固定先后，首条随后被 stream_chat 认领启动。
+/// auto_start=true 时（调用方以为任务还在跑、实际可能刚结束）若当前已无
+/// 任务，则由后端自动拉起队首，覆盖"任务收尾后才写入"的窄窗口。
 #[tauri::command]
 pub fn queue_messages(
+    app: AppHandle,
     state: State<'_, DbState>,
     conversation_id: String,
     contents: Vec<String>,
+    auto_start: bool,
 ) -> Result<Vec<crate::db::models::ChatMessage>, String> {
     let lines: Vec<String> = contents
         .into_iter()
@@ -2470,6 +2636,10 @@ pub fn queue_messages(
             )
             .map_err(|e| e.to_string())?,
         );
+    }
+    drop(conn);
+    if auto_start {
+        spawn_queued_chat_if_idle(&app, &conversation_id, true);
     }
     Ok(out)
 }
@@ -3146,12 +3316,23 @@ pub async fn stream_chat(
         TaskRegistry::ensure_watchdog(app.clone());
         generation
     };
-    // 首条已从队列认领：立即通知前端清掉「排队中」标记（后续行仍保持排队）
+    // 首条已从队列认领：立即通知前端清掉「排队中」标记（后续行仍保持排队）。
+    // 带上完整消息：批量发送时这条只存在于排队条，前端要据此补进时间线。
     if let Some(qid) = queued_message_id.as_deref() {
-        let _ = app.emit(
-            "chat-queued-consumed",
-            serde_json::json!({ "conversation_id": conversation_id, "message_id": qid }),
-        );
+        let message = state
+            .0
+            .lock()
+            .ok()
+            .and_then(|conn| message_by_id_conn(&conn, qid).ok().flatten());
+        let payload = match message {
+            Some(message) => serde_json::json!({
+                "conversation_id": conversation_id,
+                "message_id": qid,
+                "message": message,
+            }),
+            None => serde_json::json!({ "conversation_id": conversation_id, "message_id": qid }),
+        };
+        let _ = app.emit("chat-queued-consumed", payload);
     }
     let mut registered = RegisteredChatTask {
         app: app.clone(),
@@ -3181,7 +3362,14 @@ pub async fn stream_chat(
     let idle_root = matches!(&result, Ok(Ok(())))
         .then(|| completed_conversation_root(&app, &conversation_id))
         .flatten();
+    let completed_cleanly = matches!(&result, Ok(Ok(())));
     registered.finish();
+    // 任务主体的最后一次 take_next_queued 之后仍可能有消息入队（前端在
+    // chat-done 到达前还以为在流式）。注销后再查一次队首，存在就自动拉起；
+    // 用户主动停止的队列不在此列（respect_stop 会看停止标志）。
+    if completed_cleanly {
+        spawn_queued_chat_if_idle(&app, &conversation_id, true);
+    }
     if let Some(root) = idle_root {
         crate::agent::lsp_client::schedule_idle_semantic_indexing(
             app.clone(),
@@ -3401,14 +3589,25 @@ async fn stream_chat_body(
         match take_next_queued(state, &conversation_id, false) {
             Ok(Some((queued_id, queued_content))) => {
                 // 单条续跑：queued 已在库里置 0，前端气泡上的"排队中"标记必须
-                // 同步清掉，否则这条消息会一直显示成未提交。
-                let _ = app.emit(
-                    "chat-queued-consumed",
-                    serde_json::json!({
+                // 同步清掉，否则这条消息会一直显示成未提交。带上完整消息后，
+                // 批量发送里只存在于排队条的那一行也能补进时间线。
+                let message = state
+                    .0
+                    .lock()
+                    .ok()
+                    .and_then(|conn| message_by_id_conn(&conn, &queued_id).ok().flatten());
+                let payload = match message {
+                    Some(message) => serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "message_id": queued_id,
+                        "message": message,
+                    }),
+                    None => serde_json::json!({
                         "conversation_id": conversation_id,
                         "message_id": queued_id,
                     }),
-                );
+                };
+                let _ = app.emit("chat-queued-consumed", payload);
                 current_content = queued_content;
                 current_regenerate = Some(false);
                 persist_user = false;

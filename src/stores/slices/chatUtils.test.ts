@@ -10,6 +10,7 @@ import {
   firstRunningIndex,
   reconcileRunUserMessage,
   upsertMessageById,
+  applyConsumedQueuedMessage,
   toolRunFromExecutionStep,
 } from './chatUtils'
 import type { ChatMessage, ExecutionStep } from '../../api/project'
@@ -116,6 +117,25 @@ describe('stream lifecycle reconciliation', () => {
     expect(next).toHaveLength(1)
     expect(next[0]).toEqual(done)
     expect(upsertMessageById([], done)).toEqual([done])
+  })
+})
+
+describe('applyConsumedQueuedMessage', () => {
+  it('消息已在时间线时只清排队标记，不重复追加', () => {
+    const messages = [{ ...msg('user', '修复错误'), id: 'q1', queued: 1 }]
+    const next = applyConsumedQueuedMessage(messages, [{ id: 'q1' }], { ...msg('user', '修复错误'), id: 'q1', queued: 1 })
+    expect(next.messages).toHaveLength(1)
+    expect(next.messages[0].queued).toBe(0)
+    expect(next.queuedList).toEqual([])
+  })
+
+  it('消息还只在排队条时补进时间线并移除排队条目', () => {
+    const messages = [msg('assistant', '上一轮回复')]
+    const queuedList = [{ id: 'q1' }, { id: 'q2' }]
+    const next = applyConsumedQueuedMessage(messages, queuedList, { ...msg('user', '第一条'), id: 'q1', queued: 1 })
+    expect(next.messages.map((m) => m.id)).toEqual([undefined, 'q1'])
+    expect(next.messages[1].queued).toBe(0)
+    expect(next.queuedList.map((q) => q.id)).toEqual(['q2'])
   })
 })
 

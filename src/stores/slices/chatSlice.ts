@@ -44,7 +44,7 @@ import type {
   ProjectState,
   StreamingState,
 } from '../projectStoreTypes'
-import { acceptsRunEvent, advancePlan, containsPersistedUserMessage, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
+import { acceptsRunEvent, advancePlan, applyConsumedQueuedMessage, containsPersistedUserMessage, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
 import { useGuardStore } from '../guardStore'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
@@ -474,12 +474,17 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     })
   }).catch(() => {})
 
-  // 单条排队消息被自动续跑消费：后端的 queued 已置 0，气泡上的"排队中"
-  // 标记必须同步清除，否则这条消息会一直显示成未提交。
-  listen<{ conversation_id: string; message_id: string }>('chat-queued-consumed', (event) => {
-    const { conversation_id, message_id } = event.payload
+  // 单条排队消息被消费（自动续跑或收尾窗口的自动拉起）：后端的 queued 已置 0，
+  // 气泡上的"排队中"标记必须同步清除。批量发送的排队行从未进过时间线，
+  // 后端会随事件带上完整消息，否则任务在跑而提问气泡要等重开会话才出现。
+  listen<{ conversation_id: string; message_id: string; message?: ChatMessage }>('chat-queued-consumed', (event) => {
+    const { conversation_id, message_id, message } = event.payload
     if (get().currentConversation?.id !== conversation_id) return
     const state = get()
+    if (message) {
+      set(applyConsumedQueuedMessage(state.messages, state.queuedList, message))
+      return
+    }
     if (!state.messages.some((m) => m.id === message_id) && !state.queuedList.some((q) => q.id === message_id)) {
       return
     }
@@ -2057,8 +2062,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       try {
         const saved = await queueMessageApi(conv.id, content, agentOwned, references, images)
         if (get().currentConversation?.id !== conv.id) return
-        // 用后端返回的真实消息替换本地占位（id 与时间戳以数据库为准）
-        set({ messages: get().messages.map((m) => (m.id === optimistic.id ? saved : m)) })
+        // 用后端返回的真实消息替换本地占位（id 与时间戳以数据库为准）。
+        // 自动拉起事件可能先一步把同一条消息补进了时间线，先去重再幂等写入。
+        set({ messages: upsertMessageById(get().messages.filter((m) => m.id !== optimistic.id), saved) })
       } catch (e) {
         // 入库失败：移除乐观消息，避免界面残留无效的排队条目
         if (get().currentConversation?.id === conv.id) {

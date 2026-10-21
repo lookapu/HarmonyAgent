@@ -6,6 +6,45 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 61: messages queued after a task ends start on their own (2026-10-22)
+
+There was a narrow window at task end: the backend had already checked that the queue
+was empty but had not unregistered yet, while the frontend still believed it was
+streaming and wrote the new user message into the queue. Nothing picked that message up
+afterwards, so it sat in the queue bar until the user clicked it again. Two fallbacks
+now close the window:
+
+- After unregistering, the task checks the head of the queue once more. If it finished
+  successfully and the user did not press Stop, it starts that message itself through
+  the normal claim/start path; the `chat-queued-consumed` claim event now carries the
+  full message, so the frontend can move a bubble that only existed in the queue bar
+  into the timeline;
+- The enqueue commands check as well: a single `queue_message` starts the queue head
+  when the conversation is idle, and `queue_messages` gains `autoStart`, passed by a
+  caller that believes a task is still running, so a batch written after the task ended
+  is started by the backend; the idle batch path still starts its first line from the
+  frontend in input order.
+
+Auto-start never jumps ahead when another conversation holds the project lock (the
+message stays visible in the queue bar instead of disappearing into a silent wait), and
+a queue left by an explicit Stop is preserved as before. Auto-start reuses the same
+claim path, so nothing is inserted twice; both the normal continuation and auto-start
+claim events now include the full message row, so the frontend has a single landing
+path.
+
+### Verification
+
+Two new Rust unit tests: the queue-head probe returns the full row without consuming it
+(hidden and assistant rows excluded, insertion order kept within one second), and
+auto-start requires both an idle project and no Stop request. Two new frontend unit
+tests: an auto-started message already in the timeline only clears its queued flag, and
+one that exists only in the queue bar is appended to the timeline and removed from the
+bar. Rust **1273/1273** (+2) · frontend vitest **239/239** (+2) · `tsc` / `eslint` /
+clippy baseline green · i18n keys unchanged (**2297**, union **2299**) · i18n gates,
+all 21 gate self-tests, `check-docs` and the production build pass. Tool count
+unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 60: batch send enqueues and starts in input order (2026-10-22)
 
 When idle, batch send used to enqueue lines 2..N first and then send line 1:

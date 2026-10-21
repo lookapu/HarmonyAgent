@@ -7726,7 +7726,9 @@ export default function Home() {
             // 运行中则全部排队，由当前任务收尾时消费。
             let saved: Awaited<ReturnType<typeof queueMessages>>
             try {
-              saved = await queueMessages(convId, lines)
+              // wasStreaming 时调用方不会自己启动首条：若写入时任务已结束，
+              // autoStart 让后端拉起队首，避免消息滞留在排队条。
+              saved = await queueMessages(convId, lines, wasStreaming)
             } catch (e) {
               notifyActionNotSent(e)
               return { ok: 0, failed: lines }

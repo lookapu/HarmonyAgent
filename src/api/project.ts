@@ -809,9 +809,10 @@ export const streamChat = (
 export const queueMessage = (conversationId: string, content: string, agentOwned: boolean, references?: string[], images?: string[]) =>
   invokeWithError<ChatMessage>('queue_message', { conversationId, content, agentOwned, references, images })
 
-/** 批量入队：整批按顺序写入（同一事务），失败整批回滚 */
-export const queueMessages = (conversationId: string, contents: string[]) =>
-  invokeWithError<ChatMessage[]>('queue_messages', { conversationId, contents })
+/** 批量入队：整批按顺序写入（同一事务），失败整批回滚；
+ * autoStart=true 表示调用方以为任务仍在跑，若写入时任务已结束则由后端自动拉起队首 */
+export const queueMessages = (conversationId: string, contents: string[], autoStart = false) =>
+  invokeWithError<ChatMessage[]>('queue_messages', { conversationId, contents, autoStart })
 
 /** 会话排队中消息（前端“排队中”条展示） */
 export interface QueuedMessageInfo {
