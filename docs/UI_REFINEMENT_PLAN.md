@@ -5702,3 +5702,42 @@ Rust `update_message_tests` **4/4**（排队原地改 / 已执行拒绝 / 历史
 前端 `chatUtils`（store slice）**28/28**（新增 3 条入库判定）·
 全量 vitest **234/234** · `tsc` / `eslint` 绿 · Rust 全量 **1251/1251** 不受影响 ·
 i18n 键 **2294**（+2，并集 2296）· 三道 i18n 门禁与 `check-docs` 绿。
+
+### 6.65 第四十八批：按钮触发的合成指令失败不再静默（2026-10-22）
+
+#### 6.65.1 起点：四个「点了没反应」的入口
+
+这一批审计的不是用户敲进输入框的消息，而是按钮生成的合成指令。它们没有
+输入框承载内容，投递失败时没有任何东西可以还给用户：
+
+- **运行时异常「立即修复」**：`setRuntimeAnomaly(null)` 先关卡片，再 await 发送；
+  invoke 失败后卡片与指令一起消失，异常上下文都找不回来。
+- **构建错误「自动修复」**：先 `setDraft('')` / `setReferences([])` 清掉用户输入，
+  再 `void sendUserMessage`；被拒时用户草稿与修复指令同时丢失。
+- **失败工具「重试」**：流式中 `void queueUserMessage(text, true)` 没有 catch，
+  入库失败成为未处理的 rejection，界面无反馈。
+- **未完成任务「继续任务 / 安全恢复」**：`void sendUserMessage`，被拒时按钮无反应。
+
+#### 6.65.2 统一投递：`deliverActionText`
+
+```ts
+const convId = currentConversation?.id
+if (await sendUserMessage(text, options, refs)) return true
+// 同会话恰好开始流式：改为排队续跑
+if (convId && currentConversation?.id === convId && liveBucket) {
+  await queueUserMessage(text, false, refs)  // 失败 → home.actionNotSent
+}
+notifyActionNotSent()
+```
+
+- 只有「同会话仍有存活的流式桶」才降级排队；用户已切走时不往别的会话塞指令；
+- 排队也失败或没有可排队的目标时，统一提示 `home.actionNotSent`；
+- 自动修复不再触碰输入框：草稿与 @ 引用属于用户，合成指令没有理由清空它们；
+- 运行时异常卡片改为投递成功后才收起，失败时保留卡片可重试。
+
+#### 6.65.3 验证
+
+前端 vitest **234/234**（无新增单测：改动集中在组件编排，纯函数未变）·
+`tsc` / `eslint` 绿 · Rust 全量 **1251/1251** 不受影响 ·
+i18n 键 **2295**（+1，并集 2297）· 三道 i18n 门禁与 `check-docs` 绿；
+工具数 / 迁移数不变（204 / 86）。

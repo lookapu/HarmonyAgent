@@ -1297,12 +1297,12 @@ export default function Home() {
   const fixRuntimeAnomaly = async () => {
     if (!runtimeAnomaly || !currentProject) return
     const a = runtimeAnomaly
-    setRuntimeAnomaly(null)
     const prompt = `应用运行时检测到异常（${a.category}），请自行修复：\n${a.summary}\n\n相关日志：\n${a.detail}\n\n请用 read_runtime_logs 读取完整运行日志，定位源码后修复，然后重新构建并部署验证。`
     if (!currentConversation) {
       await newConversation()
     }
-    await sendUserMessage(prompt, modelOptions)
+    // 投递成功才收起卡片：失败时保留卡片，用户可再次点「立即修复」
+    if (await deliverActionText(prompt, modelOptions)) setRuntimeAnomaly(null)
   }
 
   // 保存"修复经验候选"：把刚解决的错误沉淀为知识库条目（自动提取触发关键词）
@@ -2094,6 +2094,40 @@ export default function Home() {
     inputRef.current?.focus()
   }
 
+  /** 按钮触发的合成指令没有输入框承载内容：发送/排队都没接手时明确告知，
+   * 避免用户点了按钮却什么都没发生。 */
+  const notifyActionNotSent = useCallback((e?: unknown) => {
+    useNotificationStore.getState().push({
+      tone: 'error',
+      title: t('home.actionNotSent'),
+      ...(e ? { body: String(e) } : {}),
+    })
+  }, [t])
+
+  /** 投递合成指令：sendUserMessage 未接手（恰好开始流式）时自动改排队；
+   * 会话已切走则不排队，避免把指令塞进别的会话。只有排队也失败才报错。 */
+  const deliverActionText = useCallback(async (
+    text: string,
+    options?: ChatOptions,
+    refs?: string[],
+  ): Promise<boolean> => {
+    const convId = useProjectStore.getState().currentConversation?.id
+    if (await sendUserMessage(text, options, refs)) return true
+    const state = useProjectStore.getState()
+    const bucket = convId ? state.streamings[convId] : undefined
+    if (convId && state.currentConversation?.id === convId && bucket && !bucket.error) {
+      try {
+        await queueUserMessage(text, false, refs)
+        return true
+      } catch (e) {
+        notifyActionNotSent(e)
+        return false
+      }
+    }
+    notifyActionNotSent()
+    return false
+  }, [sendUserMessage, queueUserMessage, notifyActionNotSent])
+
   /** 失败工具一键重试：注入指令让 Agent 重新执行该工具（失败输出头尾截断后附给模型参考）
    * useCallback：ToolRunGroup 按 memo 浅比较 props，回调稳定才能阻止流式/工具输出更新时历史工具组全量重渲染 */
   const retryTool = useCallback(
@@ -2108,12 +2142,12 @@ export default function Home() {
         `请重试刚才失败的 ${run.tool} 工具。上次失败信息如下：\n${tail}\n\n` +
         '请先分析失败原因（参数/环境/前置步骤），修正后重新执行该工具，并继续后续步骤。'
       if (isStreaming) {
-        void queueUserMessage(text, true)
+        void queueUserMessage(text, true).catch(notifyActionNotSent)
       } else {
-        void sendUserMessage(text, modelOptions)
+        void deliverActionText(text, modelOptions)
       }
     },
-    [isStreaming, modelOptions, queueUserMessage, sendUserMessage],
+    [isStreaming, modelOptions, queueUserMessage, deliverActionText, notifyActionNotSent],
   )
 
   /** 取消正在运行的工具（稳定引用，避免 ToolRunGroup 因 onCancel 每次都是新函数而全量重渲染） */
@@ -2163,8 +2197,7 @@ export default function Home() {
       '3. 依赖问题优先 ohpm_install；SDK 版本问题优先 check_sdk_alignment；签名/证书类问题不要改代码，调用 show_diagnose_card 弹出引导卡片并向用户说明需在 DevEco 配置',
       '4. 调用构建工具重新构建，确认构建通过后再结束；若仍有错误继续修复，但不要用相同方式重复失败的构建',
     ].join('\n')
-    setDraft('')
-    setReferences([])
+    // 不清空输入框：自动修复是按钮触发的合成指令，草稿与 @ 引用属于用户
     // 有进行中任务时排队并入，否则直接发送（sendUserMessage 内部读取最新会话状态）
     const busy = !!streamingConversationId
     // 自动修复默认使用 first_write 审批：首次写文件前确认，本任务后续写操作免审，
@@ -2174,9 +2207,9 @@ export default function Home() {
         ? modelOptions
         : { ...modelOptions, tool_approval: 'first_write' }
     if (busy) {
-      void queueUserMessage(text, false, paths.length ? paths : undefined)
+      void queueUserMessage(text, false, paths.length ? paths : undefined).catch(notifyActionNotSent)
     } else {
-      void sendUserMessage(text, fixOptions, paths.length ? paths : undefined)
+      void deliverActionText(text, fixOptions, paths.length ? paths : undefined)
     }
   }
 
@@ -5914,7 +5947,7 @@ export default function Home() {
                       : unfinishedConv.recoveryPolicy === 'verify_effects'
                         ? t('home.recoveryVerifyPrompt')
                         : t('home.continuePrompt')
-                    void sendUserMessage(
+                    void deliverActionText(
                       affected ? `${base}\n\n${t('home.recoveryAffectedSteps')}:\n${affected}` : base,
                       unfinishedConv.runId
                         ? { ...modelOptions, resume_run_id: unfinishedConv.runId }
