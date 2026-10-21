@@ -6,6 +6,40 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 59: same-second messages follow real insertion order everywhere (2026-10-22)
+
+`messages.created_at` only has second precision, yet the timeline, pagination and model
+context previously sorted by `created_at` alone:
+
+- `list_messages_page` used the message id as the tie-breaker, and ids are UUIDs — a
+  question and its reply created in the same second could be reversed by lexicographic
+  order, putting the answer above the question after reopening a conversation;
+- model history and the compaction window had no deterministic order for same-second
+  rows, so a tool result could appear before its call;
+- memory replay and exports used the same ordering, so external views could disagree
+  with the UI.
+
+Every chronological message read now uses `(created_at, rowid)`: rowid is the real
+insertion order, which branch anchors and snapshot restore already rely on. The page
+cursor also moves from `(created_at, id)` to `(created_at, rowid)`, so paging across a
+same-second boundary neither duplicates nor loses rows. Covered reads: message list and
+pagination, model history, compaction window and character accounting, memorize replay,
+memory-summary draft, reply version list, session-share export and reproduction bundle.
+
+This is a read-order fix only: the messages schema, queue semantics and caches are
+unchanged, no migration is needed, and existing conversations display in the correct
+order as soon as they are reopened.
+
+### Verification
+
+Three new Rust unit tests: the list keeps rowid order even when UUIDs sort opposite to
+insertion; a same-second cursor pages with no duplicates or losses; model history keeps
+insertion order and excludes hidden/queued rows. Rust **1268/1268** (+3) · frontend
+vitest **237/237** unaffected · `tsc` / `eslint` / clippy baseline green · i18n keys
+unchanged (**2297**, union **2299**) · i18n gates, `check-docs` and the production build
+pass. Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 58: stopping during the project-lock wait still keeps the user event (2026-10-22)
 
 Auto-continue and "Submit together" tasks wait **before acquiring the project lock**

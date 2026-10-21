@@ -6110,5 +6110,49 @@ id 对齐；无可对齐行时事件仍保留、id 为 `None`。Rust 全量 **12
 i18n 键无变化（2297，并集 2299）· 三道 i18n 门禁与 `check-docs` 绿；
 工具数 / 迁移数不变（204 / 86）。
 
+### 6.76 第五十九批：同秒消息统一按写入顺序读取（2026-10-22）
+
+#### 6.76.1 起点：秒级时间戳 + 非确定兜底
+
+`messages.created_at` 是秒级整数。同一秒内写入多条消息很常见：排队续跑、
+工具结果与助手回复、批量发送的连续指令。此前各处的时间线读取只按
+`created_at` 排序，同秒顺序分别依赖具体实现：
+
+| 读取点 | 原排序 | 同秒风险 |
+|--------|--------|----------|
+| `list_messages` | `created_at ASC` | 顺序未定义，依赖扫描/排序实现 |
+| `list_messages_page` | `(created_at, id)` | id 是 UUID，字典序与插入顺序无关 |
+| 模型历史（`assemble_round`） | `created_at DESC LIMIT n` | 工具结果可能先于调用 |
+| 压缩窗口 | `created_at DESC` | 截断边界落在同秒时选中哪条不确定 |
+| memorize 重放 / 记忆总结 | `created_at DESC` | 后一次操作可能先被重放 |
+
+分页最直观：同秒写入的提问 `zzzz…` 与回复 `aaaa…` 会按 UUID 字典序排成
+「回复 → 提问」，重新打开会话就能看到答案在问题上方。分支锚点与快照恢复
+其实早已用 `(created_at, rowid)` 定位消息，只有读取路径没有统一。
+
+#### 6.76.2 修法：统一 `(created_at, rowid)`
+
+rowid 是 SQLite 的真实插入顺序，且 `messages` 不是 `WITHOUT ROWID` 表。
+把所有按时间读取会话消息的 SQL 统一补上 rowid 兜底：
+
+- 列表与分页：`ORDER BY created_at ASC, rowid ASC` /
+  `created_at DESC, rowid DESC`；
+- 分页游标从 `(created_at, id)` 改为 `(created_at, rowid)`，仍以
+  `before_id` 作为入参（前端协议不变）；
+- 模型历史抽出 `load_recent_history_rows`，内部按 `rowid DESC` 取最近 N 条
+  再反转，职责与测试都集中到一处；
+- 压缩窗口的字符统计与截断窗口、`replay_memories`、`summarize_memory`、
+  `list_message_versions`、`export_session` 与复现包导出同步补齐。
+
+消息表结构与索引不变，不需要迁移；历史会话重新打开后直接按正确顺序展示。
+
+#### 6.76.3 验证
+
+新增 3 条 Rust 单测：UUID 字典序与插入顺序相反时列表/分页仍按 rowid；
+同秒游标翻页不重不漏；模型历史同秒按插入顺序且隐藏行、排队行不参与。
+Rust 全量 **1268/1268**（+3）· 前端 vitest **237/237** 不受影响 ·
+`tsc` / `eslint` / clippy 基线绿 · i18n 键无变化（2297，并集 2299）·
+三道 i18n 门禁与 `check-docs` 绿；工具数 / 迁移数不变（204 / 86）。
+
 
 

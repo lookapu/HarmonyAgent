@@ -1326,11 +1326,19 @@ pub struct TagCount {
 #[tauri::command]
 pub fn list_messages(conversation_id: String, state: State<DbState>) -> Result<Vec<ChatMessage>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
+    list_messages_conn(&conn, &conversation_id)
+}
+
+/// 正序读取会话可见消息。created_at 只有秒级精度，同秒多条（排队续跑、工具结果、
+/// 快速回复）必须用 rowid 兜底，否则顺序取决于 id 字典序 / 排序实现，
+/// 可能出现回复排在提问之前。分支锚点也以 (created_at, rowid) 定位消息。
+fn list_messages_conn(conn: &rusqlite::Connection, conversation_id: &str) -> Result<Vec<ChatMessage>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, conversation_id, role, content, references_json, model,
                     tokens_in, tokens_out, created_at, reasoning, queued, agent_owned, modified_files_json, duration_ms
-             FROM messages WHERE conversation_id = ?1 AND hidden = 0 ORDER BY created_at ASC",
+             FROM messages WHERE conversation_id = ?1 AND hidden = 0
+             ORDER BY created_at ASC, rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -1368,13 +1376,14 @@ fn list_messages_page_impl(
     limit: Option<usize>,
 ) -> Result<MessagePage, String> {
     let page_size = limit.unwrap_or(60).clamp(1, 500);
-    // 游标定位：以 (created_at, id) 行值比较定位更早消息（同秒多条时 id 兜底保证全序）
-    let cursor: Option<(i64, String)> = match before_id {
+    // 游标定位：以 (created_at, rowid) 行值比较定位更早消息。created_at 只有秒级精度，
+    // 同秒多条必须用 rowid（真实插入顺序）兜底；用 id 字典序会把 UUID 排成任意顺序。
+    let cursor: Option<(i64, i64)> = match before_id {
         Some(bid) => conn
             .query_row(
-                "SELECT created_at, id FROM messages WHERE id = ?1",
+                "SELECT created_at, rowid FROM messages WHERE id = ?1",
                 [bid],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?,
@@ -1389,18 +1398,18 @@ fn list_messages_page_impl(
     let sql = "SELECT id, conversation_id, role, content, references_json, model,
                       tokens_in, tokens_out, created_at, reasoning, queued, agent_owned, modified_files_json, duration_ms
                FROM messages";
-    let mut out: Vec<ChatMessage> = if let Some((ts, bid)) = &cursor {
+    let mut out: Vec<ChatMessage> = if let Some((ts, rid)) = &cursor {
         let sql = format!(
-            "{sql} WHERE conversation_id = ?1 AND hidden = 0 AND (created_at, id) < (?2, ?3)\n               ORDER BY created_at DESC, id DESC LIMIT ?4"
+            "{sql} WHERE conversation_id = ?1 AND hidden = 0 AND (created_at, rowid) < (?2, ?3)\n               ORDER BY created_at DESC, rowid DESC LIMIT ?4"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![conversation_id, ts, bid, fetch], row_to_message)
+            .query_map(params![conversation_id, ts, rid, fetch], row_to_message)
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
     } else {
         let sql = format!(
-            "{sql} WHERE conversation_id = ?1 AND hidden = 0\n               ORDER BY created_at DESC, id DESC LIMIT ?2"
+            "{sql} WHERE conversation_id = ?1 AND hidden = 0\n               ORDER BY created_at DESC, rowid DESC LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
@@ -1806,7 +1815,7 @@ mod tests {
         )
         .unwrap();
         for i in 1..=count {
-            // id 前缀补零保证字典序 = 时间序；created_at 故意每 3 条同秒，验证行值游标
+            // created_at 故意每 3 条同秒：验证 (created_at, rowid) 行值游标
             let id = format!("m-{i:03}");
             let ts = 1000 + i / 3;
             conn.execute(
@@ -1871,6 +1880,35 @@ mod tests {
             sorted.sort();
             assert_eq!(chunk.to_vec(), sorted, "块内应正序");
         }
+    }
+
+    #[test]
+    fn same_second_messages_follow_rowid_not_id_order() {
+        let conn = test_conn();
+        seed(&conn, "c1", 0);
+        // 模拟 UUID 主键：字典序与插入顺序相反，created_at 完全相同。
+        for (id, content) in [("zzzz-first", "先插入"), ("aaaa-second", "后插入")] {
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, content, created_at)
+                 VALUES (?1, 'c1', 'user', ?2, 2000)",
+                params![id, content],
+            )
+            .unwrap();
+        }
+        let ids: Vec<String> = list_messages_conn(&conn, "c1")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["zzzz-first", "aaaa-second"], "同秒按真实插入顺序，而非 id 字典序");
+
+        let page = list_messages_page_impl(&conn, "c1", None, Some(10)).unwrap();
+        let ids: Vec<&str> = page.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["zzzz-first", "aaaa-second"], "分页同样按插入顺序");
+        // 游标用 rowid 定位：以第二条为界只应取到更早的第一条
+        let page = list_messages_page_impl(&conn, "c1", Some("aaaa-second"), Some(10)).unwrap();
+        let ids: Vec<&str> = page.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["zzzz-first"], "同秒游标不得重复或漏掉前一条");
     }
 
     #[test]

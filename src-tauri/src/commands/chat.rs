@@ -2130,6 +2130,78 @@ mod cancel_queued_alignment_tests {
     }
 }
 
+#[cfg(test)]
+mod history_order_tests {
+    use super::*;
+
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                references_json TEXT,
+                reasoning TEXT,
+                queued INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert(conn: &rusqlite::Connection, id: &str, role: &str, content: &str, ts: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, created_at)
+             VALUES (?1, 'c1', ?2, ?3, ?4)",
+            rusqlite::params![id, role, content, ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn same_second_history_follows_insertion_order() {
+        let conn = setup();
+        // UUID 字典序与插入顺序相反：若同秒兜底用 id，模型会先看到工具结果再看到提问。
+        insert(&conn, "zzzz-user", "user", "查一下构建错误", 3000);
+        insert(&conn, "bbbb-tool", "tool", "build_project: 2 errors", 3000);
+        insert(&conn, "aaaa-assistant", "assistant", "已修复两处错误", 3000);
+
+        let rows = load_recent_history_rows(&conn, "c1", 10).unwrap();
+        let contents: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["查一下构建错误", "build_project: 2 errors", "已修复两处错误"],
+            "同秒历史必须按 rowid（插入顺序）排列"
+        );
+    }
+
+    #[test]
+    fn hidden_and_queued_rows_are_excluded_before_ordering() {
+        let conn = setup();
+        insert(&conn, "b", "user", "正常消息", 4000);
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, created_at)
+             VALUES ('a', 'c1', 'user', '排队中', 1, 4000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, hidden, created_at)
+             VALUES ('c', 'c1', 'user', '已归档', 1, 4000)",
+            [],
+        )
+        .unwrap();
+
+        let rows = load_recent_history_rows(&conn, "c1", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "正常消息");
+    }
+}
+
 /// 运行中提交消息进入排队：agent_owned=true 由 Agent 安全点并入当前任务（"发送到 Agent"），
 /// false 则当前任务结束后自动续跑处理。返回入库后的完整消息（前端替换乐观展示）。
 /// references：@ 引用文件列表（落库 references_json，续跑时历史组装自动注入文件内容）；
@@ -4265,6 +4337,31 @@ struct AssembleInputs<'a> {
     ledger_base_n: u32,
 }
 
+/// 读取最近的历史行（旧 → 新）。created_at 只有秒级精度：同一秒内的用户消息、
+/// 工具调用结果与助手回复必须按 rowid（真实插入顺序）兜底，否则模型可能先看到
+/// 工具结果再看到调用，或把排队续跑轮拼到错误位置。
+fn load_recent_history_rows(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    limit: usize,
+) -> Result<Vec<(String, String, Option<String>, Option<String>)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content, references_json, reasoning FROM messages
+             WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![conversation_id, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut recent = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    recent.reverse();
+    Ok(recent)
+}
+
 /// 轮中组装（纯搬运：原主循环内联代码，行为一致）。
 ///
 /// 顺序原样保留：挂起消息并入 → 预读（历史行/账本/工具结果/注入）→ assembler 组装 →
@@ -4370,28 +4467,16 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     // 历史行：从 DB 读取并转换为 HistoryRow
     let raw_history = {
         let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT role, content, references_json, reasoning FROM messages
-                 WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0 AND hidden = 0
-                 ORDER BY created_at DESC LIMIT ?2",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![inputs.conversation_id, inputs.round_state.history_limit as i64],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?)),
-            )
-            .map_err(|e| e.to_string())?;
-        let raw_history: Vec<(String, String, Option<String>, Option<String>)> =
-            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-        drop(stmt);
+        let rows = load_recent_history_rows(
+            &conn,
+            inputs.conversation_id,
+            inputs.round_state.history_limit,
+        )?;
         drop(conn);
-
-        raw_history
+        rows
     };
     let mut history_rows = Vec::with_capacity(raw_history.len());
-    for (role, text, refs_json, reasoning) in raw_history.into_iter().rev() {
+    for (role, text, refs_json, reasoning) in raw_history {
         // @ 引用需要文件/DB IO，因此在纯策略 assembler 外预先展开。
         let content = if role == "user" && refs_json.is_some() {
             let conn = inputs.state.0.lock().map_err(|e| e.to_string())?;
@@ -12931,10 +13016,10 @@ async fn summarize_rolling_history(
         let mut stmt = conn
             .prepare(
                 "SELECT role, content FROM (
-                     SELECT role, content, created_at FROM messages
+                     SELECT role, content, created_at, rowid FROM messages
                      WHERE conversation_id = ?1 AND role IN ('user','assistant','tool') AND queued = 0
-                     ORDER BY created_at DESC LIMIT ?2
-                 ) ORDER BY created_at ASC LIMIT ?3",
+                     ORDER BY created_at DESC, rowid DESC LIMIT ?2
+                 ) ORDER BY created_at ASC, rowid ASC LIMIT ?3",
             )
             .ok()?;
         let rows = stmt
@@ -13226,7 +13311,7 @@ fn replay_memories(conn: &rusqlite::Connection, conversation_id: &str) -> Option
         .prepare(
             "SELECT content FROM messages \
              WHERE conversation_id = ?1 AND role = 'assistant' AND queued = 0 \
-             ORDER BY created_at DESC LIMIT ?2",
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
         )
         .ok()?;
     let rows = stmt
@@ -13520,7 +13605,7 @@ fn conversation_snippet(
         .ok()?;
     let summary: Option<String> = conn
         .query_row(
-            "SELECT summary FROM messages WHERE conversation_id = ?1 AND summary IS NOT NULL AND summary != '' ORDER BY created_at DESC LIMIT 1",
+            "SELECT summary FROM messages WHERE conversation_id = ?1 AND summary IS NOT NULL AND summary != '' ORDER BY created_at DESC, rowid DESC LIMIT 1",
             [conversation_id],
             |r| r.get(0),
         )
@@ -13529,7 +13614,7 @@ fn conversation_snippet(
         return Some((title, s));
     }
     conn.query_row(
-        "SELECT content FROM messages WHERE conversation_id = ?1 AND role = 'assistant' AND content != '' ORDER BY created_at DESC LIMIT 1",
+        "SELECT content FROM messages WHERE conversation_id = ?1 AND role = 'assistant' AND content != '' ORDER BY created_at DESC, rowid DESC LIMIT 1",
         [conversation_id],
         |r| r.get(0),
     )
@@ -14197,7 +14282,7 @@ pub fn list_message_versions(conversation_id: String, state: State<DbState>) -> 
         .prepare(
             "SELECT id, conversation_id, user_message_id, content, reasoning, model, created_at
              FROM message_versions WHERE conversation_id = ?1
-             ORDER BY created_at ASC",
+             ORDER BY created_at ASC, rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -14240,7 +14325,7 @@ pub async fn summarize_memory(
             .prepare(
                 "SELECT role, content FROM messages
                  WHERE conversation_id = ?1 AND role IN ('user','assistant') AND queued = 0
-                 ORDER BY created_at DESC LIMIT 10",
+                 ORDER BY created_at DESC, rowid DESC LIMIT 10",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt

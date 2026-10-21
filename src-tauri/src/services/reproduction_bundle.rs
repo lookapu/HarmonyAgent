@@ -626,7 +626,7 @@ fn environment_json(project_name: &str, project_kind: &str, root: &Path) -> serd
 }
 
 fn messages_json(conn: &Connection, conversation_id: &str) -> Result<serde_json::Value, String> {
-    let mut stmt = conn.prepare("SELECT role,content,references_json,plan_json,tool_calls_json,model,created_at FROM (SELECT id,role,content,references_json,plan_json,tool_calls_json,model,created_at FROM messages WHERE conversation_id=?1 ORDER BY created_at DESC,id DESC LIMIT 50) ORDER BY created_at,id").map_err(|error|error.to_string())?;
+    let mut stmt = conn.prepare("SELECT role,content,references_json,plan_json,tool_calls_json,model,created_at FROM (SELECT id,role,content,references_json,plan_json,tool_calls_json,model,created_at,rowid FROM messages WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 50) ORDER BY created_at,rowid").map_err(|error|error.to_string())?;
     let rows = stmt
         .query_map([conversation_id], |row| {
             Ok(serde_json::json!({

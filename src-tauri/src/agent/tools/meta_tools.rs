@@ -418,7 +418,7 @@ pub(super) async fn share_session(
     let mut stmt = conn
         .prepare(
             "SELECT role, content, tool_calls_json, model, created_at FROM messages
-             WHERE conversation_id = ?1 ORDER BY created_at ASC",
+             WHERE conversation_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )
         .map_err(|e| e.to_string())?;
     let msgs: Vec<serde_json::Value> = stmt
