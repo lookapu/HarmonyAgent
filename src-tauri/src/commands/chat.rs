@@ -1746,23 +1746,127 @@ pub fn remove_queued_message(
     Ok(())
 }
 
-/// 编辑已发送的用户消息内容（仅 role='user'；排队中的消息同样可编辑）
-#[tauri::command]
-pub fn update_message(state: State<'_, DbState>, message_id: String, content: String) -> Result<(), String> {
-    let content = content.trim().to_string();
+/// 编辑用户消息内容。
+///
+/// `require_queued=true` 时把 `queued=1` 写进 **UPDATE 的 WHERE**，而不是先查再改：
+/// 排队消息可能在弹窗打开期间被 Agent 并入并执行，先查后改会把「已经发给模型的句子」
+/// 原地改掉，对话记录与模型实际看到的内容不一致。0 行受影响即返回明确错误。
+fn update_user_message_content(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+    content: &str,
+    require_queued: bool,
+) -> Result<(), String> {
+    let content = content.trim();
     if content.is_empty() {
         return Err("消息内容为空".into());
     }
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
     let role: String = conn
-        .query_row("SELECT role FROM messages WHERE id = ?1", [&message_id], |r| r.get(0))
+        .query_row("SELECT role FROM messages WHERE id = ?1", [message_id], |r| r.get(0))
         .map_err(|e| e.to_string())?;
     if role != "user" {
         return Err("仅可编辑用户消息".into());
     }
-    conn.execute("UPDATE messages SET content = ?1 WHERE id = ?2", rusqlite::params![content, message_id])
-        .map_err(|e| e.to_string())?;
+    let changed = if require_queued {
+        conn.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2 AND queued = 1",
+            rusqlite::params![content, message_id],
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        conn.execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![content, message_id],
+        )
+        .map_err(|e| e.to_string())?
+    };
+    if require_queued && changed == 0 {
+        return Err("消息已开始执行，无法再编辑".into());
+    }
     Ok(())
+}
+
+/// 编辑已发送的用户消息内容（仅 role='user'；`require_queued` 用于排队消息的原子校验）
+#[tauri::command]
+pub fn update_message(
+    state: State<'_, DbState>,
+    message_id: String,
+    content: String,
+    require_queued: Option<bool>,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    update_user_message_content(&conn, &message_id, &content, require_queued.unwrap_or(false))
+}
+
+#[cfg(test)]
+mod update_message_tests {
+    use super::*;
+
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+             role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+             queued INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_msg(conn: &rusqlite::Connection, id: &str, role: &str, content: &str, queued: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, created_at)
+             VALUES (?1, 'c1', ?2, ?3, ?4, 1)",
+            rusqlite::params![id, role, content, queued],
+        )
+        .unwrap();
+    }
+
+    fn content_of(conn: &rusqlite::Connection, id: &str) -> String {
+        conn.query_row("SELECT content FROM messages WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn queued_message_can_be_edited_in_place() {
+        let conn = setup();
+        insert_msg(&conn, "q1", "user", "旧内容", 1);
+        update_user_message_content(&conn, "q1", "  新内容  ", true).unwrap();
+        assert_eq!(content_of(&conn, "q1"), "新内容", "应原地更新并去除首尾空白");
+    }
+
+    #[test]
+    fn consumed_message_rejects_queued_edit() {
+        let conn = setup();
+        insert_msg(&conn, "m1", "user", "已发送的内容", 0);
+        let err = update_user_message_content(&conn, "m1", "改掉它", true).unwrap_err();
+        assert_eq!(err, "消息已开始执行，无法再编辑");
+        assert_eq!(content_of(&conn, "m1"), "已发送的内容", "被模型消费的消息不能被改写");
+    }
+
+    #[test]
+    fn history_edit_allows_consumed_message() {
+        let conn = setup();
+        insert_msg(&conn, "m1", "user", "旧内容", 0);
+        update_user_message_content(&conn, "m1", "新内容", false).unwrap();
+        assert_eq!(content_of(&conn, "m1"), "新内容");
+    }
+
+    #[test]
+    fn rejects_non_user_and_empty_content() {
+        let conn = setup();
+        insert_msg(&conn, "a1", "assistant", "回复", 0);
+        assert_eq!(
+            update_user_message_content(&conn, "a1", "x", false).unwrap_err(),
+            "仅可编辑用户消息"
+        );
+        insert_msg(&conn, "q1", "user", "原内容", 1);
+        assert_eq!(
+            update_user_message_content(&conn, "q1", "   ", true).unwrap_err(),
+            "消息内容为空"
+        );
+        assert_eq!(content_of(&conn, "q1"), "原内容");
+    }
 }
 
 /// 删除单条消息及其之后的所有消息（保持对话上下文连续；事务原子）

@@ -223,7 +223,7 @@ export function EditMessageDialog({
           {t('home.editMessage')}
           {message.role === 'user' && (
             <span className="ml-2 font-normal text-[length:var(--app-text-xs)] text-[var(--text-muted)]">
-              {t('home.editRerunHint')}
+              {t(message.queued === 1 ? 'home.editQueuedHint' : 'home.editRerunHint')}
             </span>
           )}
         </>

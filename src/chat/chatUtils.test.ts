@@ -3,6 +3,8 @@ import {
   fmtElapsed,
   impactDisplay,
   interruptedTailMessage,
+  planMessageDelete,
+  planUserMessageEdit,
   sanitizeToolMarkers,
   shouldSubmitComposerKey,
 } from './chatUtils'
@@ -54,6 +56,34 @@ describe('shouldSubmitComposerKey', () => {
     expect(shouldSubmitComposerKey('Enter', true, false)).toBe(false)
     expect(shouldSubmitComposerKey('Enter', false, true)).toBe(false)
     expect(shouldSubmitComposerKey('a', false, false)).toBe(false)
+  })
+})
+
+describe('planUserMessageEdit', () => {
+  it('排队消息原地编辑，与是否流式无关', () => {
+    const queued = chatMsg('user', 'q1', { queued: 1 })
+    expect(planUserMessageEdit(queued, true)).toBe('edit-queued')
+    expect(planUserMessageEdit(queued, false)).toBe('edit-queued')
+  })
+
+  it('历史消息空闲时重跑、运行中禁止截断上下文', () => {
+    const user = chatMsg('user', 'u1', { queued: 0 })
+    expect(planUserMessageEdit(user, false)).toBe('rerun-history')
+    expect(planUserMessageEdit(user, true)).toBe('blocked-running')
+  })
+})
+
+describe('planMessageDelete', () => {
+  it('排队消息只撤这一条（运行中同样允许）', () => {
+    const queued = chatMsg('user', 'q1', { queued: 1 })
+    expect(planMessageDelete(queued, true)).toBe('remove-queued')
+    expect(planMessageDelete(queued, false)).toBe('remove-queued')
+  })
+
+  it('历史消息空闲时级联删除、运行中禁止', () => {
+    const assistant = chatMsg('assistant', 'a1', { queued: 0 })
+    expect(planMessageDelete(assistant, false)).toBe('cascade')
+    expect(planMessageDelete(assistant, true)).toBe('blocked-running')
   })
 })
 

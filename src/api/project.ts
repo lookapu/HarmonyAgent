@@ -839,9 +839,10 @@ export const listToolWhitelist = (projectId: string) =>
 export const removeToolWhitelist = (projectId: string, tool: string) =>
   invokeWithError<void>('remove_tool_whitelist', { projectId, tool })
 
-/** 编辑已发送的用户消息内容 */
-export const updateMessage = (messageId: string, content: string) =>
-  invokeWithError<void>('update_message', { messageId, content })
+/** 编辑用户消息内容。requireQueued=true 时后端只改仍未执行（queued=1）的消息，
+ * 已并入任务的消息返回错误，避免改写模型实际看到的内容。 */
+export const updateMessage = (messageId: string, content: string, requireQueued = false) =>
+  invokeWithError<void>('update_message', { messageId, content, requireQueued })
 
 /** 删除单条消息及其之后的所有消息 */
 export const deleteMessage = (messageId: string) => invokeWithError<number>('delete_message', { messageId })

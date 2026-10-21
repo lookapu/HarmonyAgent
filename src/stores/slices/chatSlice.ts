@@ -2012,6 +2012,18 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       if (get().currentConversation?.id === conversationId) set({ messages, olderHasMore: false })
     },
 
+    editQueuedMessage: async (messageId, content) => {
+      const conversationId = get().currentConversation?.id
+      const trimmed = content.trim()
+      // requireQueued：排队消息可能在弹窗打开期间被 Agent 并入，不能改写已消费的句子
+      await updateMessageApi(messageId, trimmed, true)
+      if (!conversationId || get().currentConversation?.id !== conversationId) return
+      set((s) => ({
+        messages: s.messages.map((m) => (m.id === messageId ? { ...m, content: trimmed } : m)),
+        queuedList: s.queuedList.map((q) => (q.id === messageId ? { ...q, content: trimmed } : q)),
+      }))
+    },
+
     removeMessage: async (messageId) => {
       const conversationId = get().currentConversation?.id
       await deleteMessageApi(messageId)
@@ -2152,17 +2164,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     removeQueued: async (messageId) => {
       const conv = get().currentConversation
       if (!conv) return
-      try {
-        await removeQueuedMessageApi(conv.id, messageId)
-        set((s) => ({
-          queuedList: s.queuedList.filter((q) => q.id !== messageId),
-          // 库里那条已经删了，气泡也得跟着撤：否则界面上留下一个永远带"排队中"标记的幽灵
-          // （空闲态"立即插入"正是先移除再重发，不撤会显示成两条一样的内容）
-          messages: s.messages.filter((m) => m.id !== messageId),
-        }))
-      } catch {
-        // 失败静默（下次刷新自愈）
-      }
+      // 失败向上抛：气泡删除和「接着执行」都依赖这一条真的消失，
+      // 静默失败会让界面继续显示排队项（或重复发送），调用方必须能提示。
+      await removeQueuedMessageApi(conv.id, messageId)
+      set((s) => ({
+        queuedList: s.queuedList.filter((q) => q.id !== messageId),
+        // 库里那条已经删了，气泡也得跟着撤：否则界面上留下一个永远带"排队中"标记的幽灵
+        // （空闲态"立即插入"正是先移除再重发，不撤会显示成两条一样的内容）
+        messages: s.messages.filter((m) => m.id !== messageId),
+      }))
     },
 
     renameConversation: async (id, title) => {

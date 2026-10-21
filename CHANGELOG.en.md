@@ -6,6 +6,50 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 46: queued messages no longer use the history edit/delete path (2026-10-22)
+
+Batch 45 closed the forced wrap-up gap; this batch fixes the conversation core around
+queued messages. Editing and deleting a queued message used to go through the history
+path, whose semantics are "cascade delete and re-run from here":
+
+- **Editing a queued message** deleted it and everything after it, then called
+  `sendUserMessage` — which returns immediately while the same conversation is streaming.
+  The message was gone and the edit did nothing.
+- **Deleting a queued message** also cascaded, removing content the user never meant to touch.
+- **Editing history during a run** was allowed and could cut the context the running task
+  was still using.
+
+### Queued messages: edit in place, delete one row
+
+- `update_message` gains `require_queued`: the backend puts `queued = 1` into the **UPDATE
+  WHERE clause** instead of checking first. A queued message can be merged by the Agent
+  while the dialog is open; check-then-write would rewrite a sentence the model already
+  saw. Zero affected rows returns "already started executing", and the UI says the content
+  was not changed.
+- Deletion uses `remove_queued_message`, never the cascade.
+- The edit dialog switches its hint: queued messages say "saving updates it in place
+  without re-running the task".
+
+### History is locked while running
+
+Editing or deleting a non-queued message during streaming now shows "stop the task first"
+instead of truncating live context. Queued messages are unaffected. The decision lives in
+two pure functions, `planUserMessageEdit` / `planMessageDelete`; the submit path checks
+again in case a run started while the dialog was open.
+
+### Failures stay visible
+
+Editing too late, a failed cascade delete, or a failed assistant edit now raises a
+notification instead of silently doing nothing or leaving an unhandled rejection.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### Verification
+
+Rust `update_message_tests` **4/4** · frontend chatUtils **25/25** and edit dialog **3/3** ·
+i18n keys **2292** (+6, union **2294**) · i18n gates and `check-docs` green; the full test
+suite and clippy baseline are part of the pre-commit gate.
+
+---
 ## Unreleased — Batch 45: force wrap-up — stop the tool loop when level 3 is ignored (2026-10-21)
 
 Batches 32–34 made stalls visible and actionable, but the guard itself was still **only

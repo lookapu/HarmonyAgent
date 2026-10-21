@@ -300,6 +300,8 @@ export interface ChatSlice {
   queueUserMessage: (content: string, agentOwned: boolean, references?: string[], images?: string[]) => Promise<void>
   /** 编辑已发送的用户消息（更新后刷新列表） */
   editMessage: (messageId: string, content: string) => Promise<void>
+  /** 原地编辑排队中的消息（要求后端原子校验 queued=1；已被并入任务时抛错） */
+  editQueuedMessage: (messageId: string, content: string) => Promise<void>
   /** 删除单条消息及其之后的所有消息（刷新列表） */
   removeMessage: (messageId: string) => Promise<void>
   stopGeneration: () => Promise<void>

@@ -24,6 +24,28 @@ export function shouldSubmitComposerKey(key: string, shiftKey: boolean, isCompos
   return key === 'Enter' && !shiftKey && !isComposing
 }
 
+/** 用户消息编辑的落点：排队中原地改；历史消息重跑；运行中改历史会让正在执行的上下文错位。 */
+export type UserMessageEditPlan = 'edit-queued' | 'rerun-history' | 'blocked-running'
+
+export function planUserMessageEdit(
+  message: Pick<ChatMessage, 'queued'>,
+  streaming: boolean,
+): UserMessageEditPlan {
+  if (message.queued === 1) return 'edit-queued'
+  return streaming ? 'blocked-running' : 'rerun-history'
+}
+
+/** 消息删除的落点：排队中只删这一条；历史消息级联删除其后内容；运行中截断历史会破坏当前任务。 */
+export type MessageDeletePlan = 'remove-queued' | 'cascade' | 'blocked-running'
+
+export function planMessageDelete(
+  message: Pick<ChatMessage, 'queued'>,
+  streaming: boolean,
+): MessageDeletePlan {
+  if (message.queued === 1) return 'remove-queued'
+  return streaming ? 'blocked-running' : 'cascade'
+}
+
 /** 恢复划词选区高亮。快照 Range 的边界节点可能因 DOM 更新失效：Chromium 会把失效边界
  * 归一化到最近的存活节点（选区收缩），此时改用保存的完整文本在容器内重建 Range；
  * 容器本身也被重建时，退化为在所有消息正文中按文本搜索。 */

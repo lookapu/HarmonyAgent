@@ -118,6 +118,8 @@ import {
   fmtElapsed,
   impactDisplay,
   interruptedTailMessage,
+  planMessageDelete,
+  planUserMessageEdit,
   restoreSelectionRange,
   shouldSubmitComposerKey,
 } from '../chat/chatUtils'
@@ -328,6 +330,7 @@ export default function Home() {
     summarizing,
     queueUserMessage,
     editMessage,
+    editQueuedMessage,
     removeMessage,
     tokenStats,
     rollbackTask,
@@ -416,6 +419,7 @@ export default function Home() {
     summarizing: s.summarizing,
     queueUserMessage: s.queueUserMessage,
     editMessage: s.editMessage,
+    editQueuedMessage: s.editQueuedMessage,
     removeMessage: s.removeMessage,
     tokenStats: s.tokenStats,
     rollbackTask: s.rollbackTask,
@@ -2019,7 +2023,17 @@ export default function Home() {
     } catch {
       refs = undefined
     }
-    await removeQueued(first.id)
+    try {
+      await removeQueued(first.id)
+    } catch (e) {
+      // 没删掉就不能再发：否则同一条内容既留在队列里、又开了一轮新任务
+      useNotificationStore.getState().push({
+        tone: 'error',
+        title: t('home.deleteFailed'),
+        body: String(e ?? ''),
+      })
+      return
+    }
     void sendUserMessage(first.content, modelOptions, refs)
   }
 
@@ -2607,8 +2621,24 @@ export default function Home() {
     })
   }
 
-  /** 删除消息（二次确认：第一次点击进入确认态，3 秒内再点执行；级联删除其后所有消息） */
+  /** 打开编辑弹窗：排队消息原地改；任务运行中不允许编辑历史消息
+   * （保存历史编辑会级联删除后续消息，把正在执行的上下文截断）。 */
+  const handleEditMessage = useCallback((msg: ChatMessage) => {
+    if (planUserMessageEdit(msg, isStreaming) === 'blocked-running') {
+      useNotificationStore.getState().push({ tone: 'warn', title: t('home.historyLockedRunning') })
+      return
+    }
+    setEditTarget(msg)
+  }, [isStreaming, t])
+
+  /** 删除消息（二次确认：第一次点击进入确认态，3 秒内再点执行）。
+   * 排队消息只撤这一条；历史消息级联删除其后所有消息；运行中禁止截断历史。 */
   const handleDeleteMessage = useCallback(async (msg: ChatMessage) => {
+    const plan = planMessageDelete(msg, isStreaming)
+    if (plan === 'blocked-running') {
+      useNotificationStore.getState().push({ tone: 'warn', title: t('home.historyLockedRunning') })
+      return
+    }
     if (confirmDeleteMsgId !== msg.id) {
       setConfirmDeleteMsgId(msg.id)
       setTimeout(() => setConfirmDeleteMsgId((cur) => (cur === msg.id ? null : cur)), 3000)
@@ -2616,7 +2646,17 @@ export default function Home() {
     }
     setConfirmDeleteMsgId(null)
     const target = msg // 捕获到 const，audit 里使用不依赖 useCallback deps
-    await removeMessage(target.id)
+    try {
+      if (plan === 'remove-queued') await removeQueued(target.id)
+      else await removeMessage(target.id)
+    } catch (e) {
+      useNotificationStore.getState().push({
+        tone: 'error',
+        title: t('home.deleteFailed'),
+        body: String(e ?? ''),
+      })
+      return
+    }
     // 写 audit
     useAuditStore.getState().log({
       category: 'message.delete',
@@ -2625,7 +2665,7 @@ export default function Home() {
       conversationId: currentConversation?.id,
       projectId: currentProject?.id,
     })
-  }, [confirmDeleteMsgId, removeMessage, currentConversation?.id, currentProject?.id, t])
+  }, [confirmDeleteMsgId, isStreaming, removeQueued, removeMessage, currentConversation?.id, currentProject?.id, t])
   /** 更新对话级模型设置（持久化到 localStorage，随消息发送；同时绑定到当前会话使上下文预算实时生效） */
   const updateModelOptions = (next: ChatOptions) => {
     setModelOptions(next)
@@ -5191,7 +5231,7 @@ export default function Home() {
                           onOpenVersions={openVersionDialog}
                           onSpeak={toggleSpeak}
                           speaking={speakingId === item.message.id}
-                          onEditMessage={setEditTarget}
+                          onEditMessage={handleEditMessage}
                           onDeleteMessage={handleDeleteMessage}
                           confirmDeleteMsgId={confirmDeleteMsgId}
                           projectPath={convRoot ?? currentProject?.path}
@@ -5909,7 +5949,15 @@ export default function Home() {
                         hoverTone="danger"
                         pad="xs"
                         iconSize={11}
-                        onClick={() => removeQueued(q.id)}
+                        onClick={() => {
+                          removeQueued(q.id).catch((e) =>
+                            useNotificationStore.getState().push({
+                              tone: 'error',
+                              title: t('home.deleteFailed'),
+                              body: String(e ?? ''),
+                            }),
+                          )
+                        }}
                       />
                     </div>
                   ))}
@@ -7429,12 +7477,38 @@ export default function Home() {
           message={editTarget}
           onCancel={() => setEditTarget(null)}
           onSubmit={async (content) => {
-            if (editTarget.role === 'user') {
-              // 编辑用户消息 = 重新执行任务：任务已执行过，直接保存无意义。
+            const target = editTarget
+            if (target.role === 'user') {
+              const plan = planUserMessageEdit(target, isStreaming)
+              if (plan === 'blocked-running') {
+                // 弹窗打开期间任务启动了：绝不截断正在执行的上下文
+                setEditTarget(null)
+                useNotificationStore.getState().push({ tone: 'warn', title: t('home.historyLockedRunning') })
+                return
+              }
+              if (plan === 'edit-queued') {
+                // 排队消息尚未发给模型：原地改，不删除、不重跑
+                try {
+                  await editQueuedMessage(target.id, content)
+                  setEditTarget(null)
+                } catch (e) {
+                  const reason = String(e ?? '')
+                  useNotificationStore.getState().push({
+                    tone: 'error',
+                    title: t('home.editQueuedFailed'),
+                    // 弹窗打开期间消息可能已被 Agent 并入：后端原子校验会拒绝
+                    body: reason.includes('无法再编辑') ? t('home.editQueuedTooLate') : reason,
+                  })
+                  void refreshQueued(target.conversation_id)
+                  setEditTarget(null)
+                }
+                return
+              }
+              // 编辑历史用户消息 = 重新执行任务：任务已执行过，直接保存无意义。
               // 删除该消息及其后的所有消息，再以编辑后的内容重新流式执行
               const refs = (() => {
                 try {
-                  const v = editTarget.references_json ? JSON.parse(editTarget.references_json) : null
+                  const v = target.references_json ? JSON.parse(target.references_json) : null
                   return Array.isArray(v) ? (v as string[]) : undefined
                 } catch {
                   return undefined
@@ -7442,15 +7516,23 @@ export default function Home() {
               })()
               setEditTarget(null)
               try {
-                await removeMessage(editTarget.id)
+                await removeMessage(target.id)
               } catch {
                 // 删除失败（如消息已不存在）：仍按新内容重跑，避免任务无法继续
               }
               await sendUserMessage(content, undefined, refs)
             } else {
               // 助手消息编辑：仅更新内容展示（不可重跑）
-              await editMessage(editTarget.id, content)
-              setEditTarget(null)
+              try {
+                await editMessage(target.id, content)
+                setEditTarget(null)
+              } catch (e) {
+                useNotificationStore.getState().push({
+                  tone: 'error',
+                  title: t('home.editFailed'),
+                  body: String(e ?? ''),
+                })
+              }
             }
           }}
         />
