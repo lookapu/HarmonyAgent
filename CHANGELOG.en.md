@@ -6,6 +6,30 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 49: batch sending no longer loses lines, and starts immediately when idle (2026-10-22)
+
+The batch-task dialog (one instruction per line, executed serially) had three ways to
+look submitted while doing nothing:
+
+- **Submitting in a fresh chat**: the handler returned as soon as
+  `currentConversation` was empty, the dialog closed as usual, and every parsed line
+  was lost. It now creates the conversation first.
+- **Submitting while idle**: all lines were stored with `queued=1`, but no task was
+  running, so the backend never resumed them — the user had to click "Run now" on
+  the queue bar. The first line now starts a new round immediately; the rest stay
+  queued and are consumed serially when the task finishes.
+- **Enqueue failures**: only a summary notification appeared and the composer was
+  cleared anyway. Failed lines now remain in the dialog (successful lines are already
+  queued and are not repeated), and the dialog closes only when everything succeeds.
+
+### Verification
+
+Frontend vitest **236/236** (+2 for batch-dialog parsing and failed-line retention) ·
+`tsc` / `eslint` green · Rust **1251/1251** unaffected · i18n keys **2295**
+(no additions, union **2297**) · i18n gates, `check-docs` and the production build pass.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 48: button-generated instructions no longer fail silently (2026-10-22)
 
 Continuing the conversation-core polish, this batch audits instructions that are

@@ -7647,24 +7647,54 @@ export default function Home() {
           initial={draft}
           onClose={() => setBatchOpen(false)}
           onSubmit={async (lines) => {
-            setBatchOpen(false)
-            if (!currentProject || !currentConversation) return
-            let ok = 0
-            for (const line of lines) {
+            if (!currentProject) {
+              notifyActionNotSent()
+              return { ok: 0, failed: lines }
+            }
+            if (!useProjectStore.getState().currentConversation) {
               try {
-                await queueMessage(currentConversation.id, line, false)
-                ok++
-              } catch {
-                // 跳过失败
+                await newConversation()
+              } catch (e) {
+                notifyActionNotSent(e)
+                return { ok: 0, failed: lines }
               }
             }
-            setDraft('')
+            const conv = useProjectStore.getState().currentConversation
+            if (!conv) {
+              notifyActionNotSent()
+              return { ok: 0, failed: lines }
+            }
+            const convId = conv.id
+            const wasStreaming = !!useProjectStore.getState().streamings[convId]
+            const failed: string[] = []
+            let ok = 0
+            // 空闲时首行直接开启新一轮，其余行先入队、任务结束后由后端串行续跑；
+            // 运行中也全部入队，由当前任务收尾时消费。
+            for (const line of wasStreaming ? lines : lines.slice(1)) {
+              try {
+                await queueMessage(convId, line, false)
+                ok++
+              } catch {
+                failed.push(line)
+              }
+            }
+            if (!wasStreaming && lines.length > 0) {
+              ok++
+              // 不 await：要等整个任务结束；投递失败由 deliverActionText 自己提示/改排队
+              void deliverActionText(lines[0], modelOptions)
+            }
             useNotificationStore.getState().push({
-              tone: ok === lines.length ? 'success' : 'warn',
+              tone: failed.length ? 'warn' : 'success',
               title: t('home.batchSent'),
               body: t('home.batchSentBody', { ok, total: lines.length }),
             })
-            void refreshQueued(currentConversation.id)
+            void refreshQueued(convId)
+            if (failed.length === 0) {
+              // 弹窗是模态的，处理期间用户无法改草稿；仍在原会话才清空
+              if (useProjectStore.getState().currentConversation?.id === convId) setDraft('')
+              setBatchOpen(false)
+            }
+            return { ok, failed }
           }}
         />
       )}

@@ -16,13 +16,16 @@ import { IconButton } from '../ui/IconButton'
 /* ============ 批量任务浮层：每行一条入队（agentOwned=false 让任务结束后自动续跑） ============
  * - 多行文本 → 逐行入队 → Agent 串行处理
  * - 入参 initial：当前输入框草稿（默认填入，用户可继续编辑）
- * - 入参 onSubmit：用户点"入队"时触发，把行数组交给外层
+ * - 入参 onSubmit：用户点"入队"时触发，把行数组交给外层；返回成功的条数与失败行
+ * - 有失败行时留在弹窗里（只保留失败行），用户修改后可重试；成功行已入队不会重复
  * - Esc 关闭、Cmd/Ctrl+Enter 直接入队
  */
+export type BatchSendResult = { ok: number; failed: string[] }
+
 export function BatchSendDialog({ initial, onClose, onSubmit }: {
   initial: string
   onClose: () => void
-  onSubmit: (lines: string[]) => void | Promise<void>
+  onSubmit: (lines: string[]) => BatchSendResult | Promise<BatchSendResult>
 }) {
   const { t } = useTranslation()
   const [text, setText] = useState(initial)
@@ -39,7 +42,8 @@ export function BatchSendDialog({ initial, onClose, onSubmit }: {
     if (lines.length === 0) return
     submittingRef.current = true
     try {
-      await onSubmit(lines)
+      const result = await onSubmit(lines)
+      if (result.failed.length > 0) setText(result.failed.join('\n'))
     } finally {
       submittingRef.current = false
     }

@@ -5741,3 +5741,41 @@ notifyActionNotSent()
 `tsc` / `eslint` 绿 · Rust 全量 **1251/1251** 不受影响 ·
 i18n 键 **2295**（+1，并集 2297）· 三道 i18n 门禁与 `check-docs` 绿；
 工具数 / 迁移数不变（204 / 86）。
+
+### 6.66 第四十九批：批量发送不再丢行，空闲时直接开跑（2026-10-22）
+
+#### 6.66.1 起点：三处「看起来提交了」
+
+批量任务弹窗把每行作为一条指令串行执行，但提交处理器有三处断点：
+
+- **新会话**：`if (!currentProject || !currentConversation) return` —— 新会话里
+  `currentConversation` 为空，弹窗照常关闭，拆好的行全部丢失；
+- **空闲**：所有行都写 `queued=1`，但没有运行中的任务，后端不会自动续跑，
+  用户必须再点一次排队条上的「接着执行」；
+- **失败**：逐行入队时吞掉异常，最后只弹汇总通知，输入框仍被清空。
+
+#### 6.66.2 提交语义：先把任务跑起来，失败行留在弹窗
+
+```ts
+if (!currentConversation) await newConversation()   // 新会话先创建
+const wasStreaming = !!streamings[convId]
+// 空闲：首行直接发送；其余行先入队，任务结束后由后端串行消费
+for (const line of wasStreaming ? lines : lines.slice(1)) await queueMessage(...)
+if (!wasStreaming) void deliverActionText(lines[0], modelOptions)
+```
+
+`BatchSendDialog` 的 `onSubmit` 改为返回 `{ ok, failed }`：
+
+- 全部成功 → 外层关闭弹窗并清空草稿；
+- 有失败行 → 弹窗保持打开，文本替换为失败行，用户修改后可重试；
+  成功行已经在队列里，不会因为重试而重复。
+
+首行发送不 await：`sendUserMessage` 要等整个任务结束才 resolve；
+投递失败由 `deliverActionText` 自动改排队并提示。
+
+#### 6.66.3 验证
+
+前端 vitest **236/236**（+2：批量弹窗按行拆分提交、失败行留存）·
+`tsc` / `eslint` 绿 · Rust 全量 **1251/1251** 不受影响 ·
+i18n 键 **2295**（无新增，并集 2297）· 三道 i18n 门禁与 `check-docs` 绿；
+工具数 / 迁移数不变（204 / 86）。
