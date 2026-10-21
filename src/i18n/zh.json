@@ -288,6 +288,7 @@
     "sendRejected": "消息未能发出，请稍后重试",
     "actionNotSent": "操作未能提交，请稍后重试",
     "insertQueuedFailed": "立即插入未生效，排队消息仍然保留",
+    "stopToolFailed": "停止当前工具的清理未完成",
     "queuedLabel": "排队中，任务结束后处理",
     "queuedAgentLabel": "待 Agent 并入当前任务",
     "queuedBar": "排队中 {{count}} 条（点击展开）",

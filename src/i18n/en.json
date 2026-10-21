@@ -288,6 +288,7 @@
     "sendRejected": "Message wasn't sent; please try again",
     "actionNotSent": "The action wasn't submitted; please try again",
     "insertQueuedFailed": "Insert now didn't take effect; queued messages are kept",
+    "stopToolFailed": "Stopping the running tool didn't finish cleaning up",
     "queuedLabel": "Queued — after current task",
     "queuedAgentLabel": "Pending Agent merge",
     "queuedBar": "{{count}} queued (click to expand)",

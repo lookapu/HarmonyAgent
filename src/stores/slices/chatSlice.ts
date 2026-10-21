@@ -1968,11 +1968,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     stopCurrentTool: async () => {
       const conv = get().currentConversation
       if (!conv) return
-      try {
-        await stopToolApi(conv.id)
-      } catch {
-        // 忽略：后端轮询中断标志自行处理
-      }
+      // 本地中断由后端先发；这里抛出的通常是持久撤销失败（数据库忙/锁损坏），
+      // 必须上抛让入口提示并可重试
+      await stopToolApi(conv.id)
     },
 
     /** 流式运行中提交消息进入排队：乐观展示（带排队标记）→ 后端入库 queued=1

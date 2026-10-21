@@ -2164,10 +2164,22 @@ export default function Home() {
     [isStreaming, modelOptions, queueUserMessage, deliverActionText, notifyActionNotSent],
   )
 
+  /** 停止当前工具：本地中断后端总会先发，失败意味着持久撤销未完成（如数据库忙），
+   * 必须让用户看见并可重试，不能像以前那样吞掉。 */
+  const handleStopTool = useCallback(() => {
+    void stopCurrentTool().catch((e) => {
+      useNotificationStore.getState().push({
+        tone: 'warn',
+        title: t('home.stopToolFailed'),
+        body: String(e ?? ''),
+      })
+    })
+  }, [stopCurrentTool, t])
+
   /** 取消正在运行的工具（稳定引用，避免 ToolRunGroup 因 onCancel 每次都是新函数而全量重渲染） */
   const cancelToolRun = useCallback(() => {
-    stopCurrentTool()
-  }, [stopCurrentTool])
+    handleStopTool()
+  }, [handleStopTool])
 
   /** 构建错误自动修复闭环：直接向 Agent 发送修复任务（自动改代码 + 重新构建验证），无需手动发送 */
   const handleAutoFixErrors = async (errors: AnalyzedBuildError[]) => {
@@ -6438,7 +6450,7 @@ export default function Home() {
                     {/* 停止当前工具：xl 以下折叠到更多菜单，xl+ 展开（危险操作，但仅在工具运行时显示，频次低） */}
                     {toolRuns.some((r) => r.status === 'running') && (
                       <button
-                        onClick={() => stopCurrentTool()}
+                        onClick={handleStopTool}
                         className="hidden xl:flex h-8 xl:px-3 rounded-full bg-[var(--warning)]/12 text-[var(--warning)] items-center justify-start gap-1.5 hover:bg-[var(--warning)]/20 active:scale-95 transition-[color,background-color,border-color,transform] text-[length:var(--app-text-sm)] font-medium"
                         title={t('home.stopTool')}
                       >
@@ -6530,7 +6542,7 @@ export default function Home() {
                           {toolRuns.some((r) => r.status === 'running') && (
                             <button
                               onClick={() => {
-                                stopCurrentTool()
+                                handleStopTool()
                                 setToolbarMoreOpen(false)
                               }}
                               className="w-full flex items-center gap-2.5 px-3 py-2 text-[length:var(--app-text-sm)] text-[var(--warning)] hover:bg-[var(--bg-hover)] transition-colors"

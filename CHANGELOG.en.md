@@ -6,6 +6,36 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 55: failures when stopping the running tool are no longer silent (2026-10-22)
+
+"Stop the running tool" is a two-step backend action: first the conversation's stop
+generation is bumped (the running tool observes it and kills its child process), then
+the approval credential for that call is persistently revoked. The frontend
+`stopCurrentTool` treated the whole thing as ignorable:
+
+```ts
+try { await stopToolApi(conv.id) } catch { /* ignored */ }
+```
+
+Whenever the backend returned an error — typically the revocation hitting a busy or
+broken database lock — the click produced no feedback at all: the local interrupt may
+have been sent, but whether the credential was revoked and whether a retry is needed
+was invisible. All three entries (tool-row cancel, composer button, overflow menu)
+shared this silent function.
+
+Errors now propagate, and the three entries share `handleStopTool`: on failure it
+posts a `warn` notification `home.stopToolFailed` ("Stopping the running tool didn't
+finish cleaning up") with the backend message. The success path is unchanged; tool
+state still updates from streaming events.
+
+### Verification
+
+Rust **1261/1261** unaffected · frontend vitest **237/237** unaffected ·
+`tsc` / `eslint` / clippy baseline green · i18n keys **2297** (+1, union **2299**) ·
+i18n gates, `check-docs` and the production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 54: queued messages no longer vanish from the session event log (2026-10-22)
 
 `session_events` is the append-only source shared by the timeline panel,
