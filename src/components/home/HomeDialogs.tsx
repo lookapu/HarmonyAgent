@@ -49,18 +49,21 @@ export function BatchSendDialog({ initial, onClose, onSubmit }: {
     }
   }
 
-  // 快捷键：Ctrl+Enter 提交（Esc 走全局栈，见下）
+  // 快捷键：Ctrl+Enter 提交（Esc 走全局栈，见下）。
+  // 用 ref 指向最新 submit：只在挂载时注册一次监听；若依赖 lines.length，
+  // 同行数内的编辑不会重建监听，快捷键会提交上一版文本。
+  const submitRef = useRef(submit)
+  submitRef.current = submit
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault()
-        void submit()
+        void submitRef.current()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines.length]) // submit 是稳定闭包，但依赖 lines 让 Enter 触发时拿到最新行数
+  }, [])
   useEscapeKey(onClose)
 
   return (

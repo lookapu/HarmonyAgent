@@ -6,6 +6,25 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 50: the batch dialog's shortcut submits the latest text (2026-10-22)
+
+The batch-task dialog registered its Ctrl+Enter listener with a dependency on
+`lines.length`. After editing a line without adding or removing lines, the listener
+still held the previous `submit` closure, so the shortcut enqueued the text from
+*before* the edit — the dialog looked edited, the queue got the old instruction.
+
+The listener is now registered once on mount and calls the latest `submit` through
+`submitRef`. A regression test edits text within the same line count, presses
+Ctrl+Enter, and asserts the new text is submitted.
+
+### Verification
+
+Frontend vitest **237/237** (+1 for the shortcut submitting the latest text) with
+`tsc` / `eslint` green · Rust **1251/1251** unaffected · i18n keys **2295**
+(no additions, union **2297**) · i18n gates, `check-docs` and the production build pass.
+Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 49: batch sending no longer loses lines, and starts immediately when idle (2026-10-22)
 
 The batch-task dialog (one instruction per line, executed serially) had three ways to

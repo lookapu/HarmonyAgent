@@ -5779,3 +5779,38 @@ if (!wasStreaming) void deliverActionText(lines[0], modelOptions)
 `tsc` / `eslint` 绿 · Rust 全量 **1251/1251** 不受影响 ·
 i18n 键 **2295**（无新增，并集 2297）· 三道 i18n 门禁与 `check-docs` 绿；
 工具数 / 迁移数不变（204 / 86）。
+
+### 6.67 第五十批：批量弹窗快捷键提交最新文本（2026-10-22）
+
+#### 6.67.1 起点：过期闭包
+
+`BatchSendDialog` 的 Ctrl+Enter 监听写成：
+
+```ts
+useEffect(() => { ... void submit() ... }, [lines.length])
+// 注释误以为 submit 是稳定闭包，只依赖 lines.length
+```
+
+但 `submit` 每次渲染都会重建，并闭包捕获当次的 `lines`。用户只改字符、
+不增删行时 `lines.length` 不变，监听不重建，快捷键仍调用旧 `submit`——
+弹窗里看到的是新文本，入队的是编辑前的内容。
+
+#### 6.67.2 修法：监听只注册一次，经 ref 取最新提交函数
+
+```ts
+const submitRef = useRef(submit)
+submitRef.current = submit      // 渲染期同步最新闭包
+useEffect(() => {
+  const onKey = (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) ... void submitRef.current() }
+  window.addEventListener('keydown', onKey)
+  return () => window.removeEventListener('keydown', onKey)
+}, [])
+```
+
+回归测试覆盖「行数不变、只改文本」这一最容易漏掉的路径。
+
+#### 6.67.3 验证
+
+前端 vitest **237/237**（+1：快捷键提交最新文本）· `tsc` / `eslint` 绿 ·
+Rust 全量 **1251/1251** 不受影响 · i18n 键 **2295**（无新增，并集 2297）·
+三道 i18n 门禁与 `check-docs` 绿；工具数 / 迁移数不变（204 / 86）。

@@ -19,4 +19,12 @@ describe('BatchSendDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'home.batchSend' }))
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('第二行'))
   })
+
+  it('Ctrl+Enter 提交编辑后的最新文本（行数不变也不能是旧闭包）', async () => {
+    const onSubmit = vi.fn().mockResolvedValue({ ok: 1, failed: [] })
+    render(<BatchSendDialog initial="旧内容" onClose={() => {}} onSubmit={onSubmit} />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '新内容' } })
+    fireEvent.keyDown(window, { key: 'Enter', ctrlKey: true })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(['新内容']))
+  })
 })
