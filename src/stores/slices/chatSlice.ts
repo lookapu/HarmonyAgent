@@ -44,7 +44,7 @@ import type {
   ProjectState,
   StreamingState,
 } from '../projectStoreTypes'
-import { acceptsRunEvent, advancePlan, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
+import { acceptsRunEvent, advancePlan, containsPersistedUserMessage, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
 import { useGuardStore } from '../guardStore'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
@@ -1817,10 +1817,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     // 新任务开始时清空上次任务摘要（防止跨任务残留展示）
     sendUserMessage: async (content, options, references, images) => {
       const conv = get().currentConversation
-      if (!conv) return
+      if (!conv) return false
       // 同会话流式中防重（error 态允许重发；跨会话放行——后端同项目任务排队机制生效）
       const existing = get().streamings[conv.id]
-      if (existing && !existing.error) return
+      if (existing && !existing.error) return false
       // 开始发送消息性能追踪
       const sendTrace = startPerfTrace('sendMessage', { conv: conv.id.slice(0, 8) })
       sendTraces.set(conv.id, sendTrace)
@@ -1871,6 +1871,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       sendTrace.mark('optimistic-rendered')
       try {
         await streamChatApi(conv.id, content, options, false, references, images)
+        return true
       } catch (e) {
         optimisticRunUserIds.delete(conv.id)
         sendTraces.delete(conv.id)
@@ -1882,6 +1883,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           // invoke 可能在 user 入库前失败，也可能在入库后模型请求失败。以数据库为
           // 真源刷新最近一页，既移除幽灵乐观消息，也保留已真实入库的用户请求。
           const page = await listMessagesPage(conv.id).catch(() => null)
+          // 拉取期间用户可能已经重发：新任务已接管，旧失败不得回滚消息列表或恢复旧输入
+          if (get().streamings[conv.id]?.startedAt !== fresh.startedAt) return true
           if (page && get().currentConversation?.id === conv.id) {
             const pendingQueued = get().messages.filter(
               (message) => message.queued === 1 && message.id.startsWith('local-'),
@@ -1895,7 +1898,12 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
               olderHasMore: page.hasMore,
             })
           }
+          // 只有明确看到用户消息已在库里才算出「已发出」；拉取失败时按已发出处理，
+          // 避免恢复草稿后用户再发一次、同一句话出现两遍。
+          return !page || containsPersistedUserMessage(page.messages, content, now, !!images?.length)
         }
+        // 新任务已接管：旧 invoke 的失败与本次输入无关
+        return true
       }
     },
 
@@ -1903,41 +1911,46 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const conv = get().currentConversation
       if (!conv) return
       const cid = conv.id
-      try {
-        await stopChatApi(cid)
-      } catch {
-        // 忽略：后端在安全点自行退出
-      }
       // 停止兜底：后端任务若已死（线程卡死、join 永不返回），invoke 永不 reject，
       // 前端须在宽限期后自行释放流式桶，否则界面永久转圈且无法再发消息。
+      // **计时器必须先于 await 启动**：旧写法等 stopChatApi 返回后才 arm，恰好在
+      // 「后端卡死、命令永不返回」这条最需要兜底的路径上永远启动不了。
       // 用代次 token（startedAt）校验：用户停止后若立即重新发送，新桶的 startedAt
       // 不同，旧计时器不会误杀新任务。
       const bucket = get().streamings[cid]
-      if (!bucket) return
-      const token = bucket.startedAt
-      const deadline = Date.now() + 60 * 1000
-      const timer = setInterval(() => {
-        const cur = get().streamings[cid]
-        if (!cur || cur.startedAt !== token) {
-          clearInterval(timer)
-          return
-        }
-        if (Date.now() >= deadline) {
-          clearInterval(timer)
-          setBucket(cid, {
-            ...emptyStreaming(),
-            error: '停止未生效：后端任务已无响应。请查看应用日志定位卡点，或重启应用后重试',
-            errorDetail: {
-              kind: 'timeout',
-              title: '停止未生效',
-              reason: '后端任务在停止命令后 60 秒内仍未响应，可能已卡死。',
-              suggestion: '请查看应用日志定位卡点，或重启应用后重试。',
-              retryable: false,
-              statusCode: null,
-            },
-          })
-        }
-      }, 10 * 1000)
+      if (bucket) {
+        const token = bucket.startedAt
+        const deadline = Date.now() + 60 * 1000
+        const timer = setInterval(() => {
+          const cur = get().streamings[cid]
+          if (!cur || cur.startedAt !== token) {
+            clearInterval(timer)
+            return
+          }
+          if (Date.now() >= deadline) {
+            clearInterval(timer)
+            setBucket(cid, {
+              ...emptyStreaming(),
+              error: '停止未生效：后端任务已无响应。请查看应用日志定位卡点，或重启应用后重试',
+              errorDetail: {
+                kind: 'timeout',
+                title: '停止未生效',
+                reason: '后端任务在停止命令后 60 秒内仍未响应，可能已卡死。',
+                suggestion: '请查看应用日志定位卡点，或重启应用后重试。',
+                retryable: false,
+                statusCode: null,
+              },
+            })
+          }
+        }, 10 * 1000)
+      }
+      // 无论前端是否还持有流式桶，都通知后端停止（旧行为保留）：桶可能已被看门狗清掉，
+      // 但后端任务仍需安全点退出。
+      try {
+        await stopChatApi(cid)
+      } catch {
+        // 忽略：后端在安全点自行退出；计时器继续承担兜底
+      }
     },
 
     /**

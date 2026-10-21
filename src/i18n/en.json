@@ -284,6 +284,8 @@
     "sendToAgent": "Send to Agent",
     "queueSend": "Queue",
     "queueFailed": "Queued message failed to send",
+    "sendFailed": "Message wasn't sent; it has been kept in the composer",
+    "sendRejected": "Message wasn't sent; please try again",
     "queuedLabel": "Queued — after current task",
     "queuedAgentLabel": "Pending Agent merge",
     "queuedBar": "{{count}} queued (click to expand)",

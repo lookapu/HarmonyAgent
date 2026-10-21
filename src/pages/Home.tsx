@@ -2034,7 +2034,28 @@ export default function Home() {
       })
       return
     }
-    void sendUserMessage(first.content, modelOptions, refs)
+    const delivered = await sendUserMessage(first.content, modelOptions, refs)
+    if (delivered) return
+    // 移除后恰好有任务开始流式（或不接受发送）：放回队列/输入框，内容不能凭空消失
+    const bucket = useProjectStore.getState().streamings[conv.id]
+    if (bucket && !bucket.error) {
+      try {
+        await queueUserMessage(first.content, false, refs)
+        return
+      } catch (e) {
+        useNotificationStore.getState().push({
+          tone: 'error',
+          title: t('home.queueFailed'),
+          body: String(e ?? ''),
+        })
+      }
+    }
+    if (currentProject) {
+      restoreComposerInput(conv.id, currentProject.id, first.content, refs ?? [], null, [])
+    }
+    if (!bucket || bucket.error) {
+      useNotificationStore.getState().push({ tone: 'error', title: t('home.sendFailed') })
+    }
   }
 
   /** 失速提示条「换个思路」：运行中作为 Agent 指令并入当前任务（agent_owned=1，
@@ -2044,8 +2065,8 @@ export default function Home() {
     try {
       if (isStreaming) {
         await queueUserMessage(text, true)
-      } else {
-        await sendUserMessage(text, modelOptions)
+      } else if (!(await sendUserMessage(text, modelOptions))) {
+        throw new Error('send not accepted')
       }
     } catch (e) {
       useNotificationStore.getState().push({ tone: 'warn', title: t('home.guardNudgeFailed') })
@@ -2202,6 +2223,29 @@ export default function Home() {
     const fromText = Array.from(draft.matchAll(/@([^\s@]+)/g), (m) => m[1])
     return Array.from(new Set([...references, ...fromText]))
   }
+
+  /** 发送/排队失败时把整条输入放回用户面前：仍停在原会话就恢复编辑器，
+   * 否则写回该会话草稿。文本与用户之后新输入的内容合并，不覆盖。 */
+  const restoreComposerInput = useCallback((
+    conversationId: string,
+    projectId: string,
+    text: string,
+    refs: string[],
+    quote: { id: string; preview: string } | null,
+    images: string[],
+  ) => {
+    if (useProjectStore.getState().currentConversation?.id === conversationId) {
+      setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
+      setReferences((cur) => Array.from(new Set([...refs, ...cur])))
+      setPickedImages((cur) => [...images, ...cur].slice(0, 4))
+      if (quote) setPendingQuote(quote)
+    } else {
+      const targetDrafts = draftCtxRef.current.proj === projectId ? draftsRef.current : readDraftMap(projectId)
+      const existing = targetDrafts[conversationId] ?? ''
+      targetDrafts[conversationId] = existing.trim() ? `${text}\n\n${existing}` : text
+      writeDraftMap(projectId, targetDrafts)
+    }
+  }, [])
 
   const appendExternalText = useCallback((name: string, text: string) => {
     const block = externalTextReference(
@@ -2529,18 +2573,8 @@ export default function Home() {
     setPendingQuote(null)
     if (isStreaming) {
       queueUserMessage(text, false, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
-        // 排队落库失败时不能吞掉用户输入；仍停留在原会话则完整恢复编辑器，否则保存到原会话草稿。
-        if (useProjectStore.getState().currentConversation?.id === targetConversation.id) {
-          setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
-          setReferences((cur) => Array.from(new Set([...selectedRefs, ...cur])))
-          setPickedImages((cur) => [...imgs, ...cur].slice(0, 4))
-          if (quote) setPendingQuote(quote)
-        } else {
-          const targetDrafts = draftCtxRef.current.proj === projectId ? draftsRef.current : readDraftMap(projectId)
-          const existing = targetDrafts[targetConversation.id] ?? ''
-          targetDrafts[targetConversation.id] = existing.trim() ? `${text}\n\n${existing}` : text
-          writeDraftMap(projectId, targetDrafts)
-        }
+        // 排队落库失败时不能吞掉用户输入；完整恢复编辑器或写回原会话草稿。
+        restoreComposerInput(targetConversation.id, projectId, text, selectedRefs, quote, imgs)
         useNotificationStore.getState().push({
           tone: 'error',
           title: t('home.queueFailed'),
@@ -2548,7 +2582,12 @@ export default function Home() {
         })
       })
     } else {
-      void sendUserMessage(text, modelOptions, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
+      const delivered = await sendUserMessage(text, modelOptions, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
+      if (!delivered) {
+        // 没接手（同会话恰好开始流式，或用户消息未入库）：把输入还给用户，避免静默丢失
+        restoreComposerInput(targetConversation.id, projectId, text, selectedRefs, quote, imgs)
+        useNotificationStore.getState().push({ tone: 'error', title: t('home.sendFailed') })
+      }
     }
   }
 
@@ -2602,17 +2641,7 @@ export default function Home() {
     setRefCandidates(null)
     setPendingQuote(null)
     queueUserMessage(text, true, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
-      if (useProjectStore.getState().currentConversation?.id === conversationId) {
-        setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
-        setReferences((cur) => Array.from(new Set([...selectedRefs, ...cur])))
-        setPickedImages((cur) => [...imgs, ...cur].slice(0, 4))
-        if (quote) setPendingQuote(quote)
-      } else {
-        const targetDrafts = draftCtxRef.current.proj === projectId ? draftsRef.current : readDraftMap(projectId)
-        const existing = targetDrafts[conversationId] ?? ''
-        targetDrafts[conversationId] = existing.trim() ? `${text}\n\n${existing}` : text
-        writeDraftMap(projectId, targetDrafts)
-      }
+      restoreComposerInput(conversationId, projectId, text, selectedRefs, quote, imgs)
       useNotificationStore.getState().push({
         tone: 'error',
         title: t('home.queueFailed'),
@@ -3430,8 +3459,9 @@ export default function Home() {
     if (!currentConversation) {
       await newConversation()
     }
-    await sendUserMessage(`${instruction}\n\n${quote}`, modelOptions)
-    setDraft('')
+    const delivered = await sendUserMessage(`${instruction}\n\n${quote}`, modelOptions)
+    if (delivered) setDraft('')
+    else useNotificationStore.getState().push({ tone: 'error', title: t('home.sendRejected') })
   }
 
   /** 划词操作：搜索（系统浏览器打开） */
@@ -7520,7 +7550,19 @@ export default function Home() {
               } catch {
                 // 删除失败（如消息已不存在）：仍按新内容重跑，避免任务无法继续
               }
-              await sendUserMessage(content, undefined, refs)
+              const delivered = await sendUserMessage(content, undefined, refs)
+              if (!delivered) {
+                // 旧消息已经为了重跑删掉了：至少把新内容还给用户，别让编辑内容一起消失
+                if (currentProject) {
+                  restoreComposerInput(target.conversation_id, currentProject.id, content, refs ?? [], null, [])
+                } else {
+                  setDraft((cur) => (cur.trim() ? `${content}\n\n${cur}` : content))
+                }
+                useNotificationStore.getState().push({
+                  tone: 'error',
+                  title: t('home.sendFailed'),
+                })
+              }
             } else {
               // 助手消息编辑：仅更新内容展示（不可重跑）
               try {

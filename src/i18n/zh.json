@@ -284,6 +284,8 @@
     "sendToAgent": "发给 Agent",
     "queueSend": "排队发送",
     "queueFailed": "排队消息发送失败",
+    "sendFailed": "消息未能发出，内容已保留在输入框",
+    "sendRejected": "消息未能发出，请稍后重试",
     "queuedLabel": "排队中，任务结束后处理",
     "queuedAgentLabel": "待 Agent 并入当前任务",
     "queuedBar": "排队中 {{count}} 条（点击展开）",

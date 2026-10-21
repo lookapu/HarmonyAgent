@@ -6,6 +6,7 @@ import {
   escapeHtml,
   toHtml,
   acceptsRunEvent,
+  containsPersistedUserMessage,
   firstRunningIndex,
   reconcileRunUserMessage,
   upsertMessageById,
@@ -24,6 +25,41 @@ describe('durable tool projection', () => {
   })
   it('缺失持久调用身份时不伪造可撤销 ID', () => {
     expect(toolRunFromExecutionStep({ ...step, external_id: '' })).toMatchObject({ id: 'tool-call-step-1', callId: undefined })
+  })
+})
+
+describe('containsPersistedUserMessage', () => {
+  it('只认发送窗口内、同内容且未排队的最新用户消息', () => {
+    const messages = [
+      { role: 'user', content: '旧请求', queued: 0, created_at: 100 },
+      { role: 'assistant', content: '回复', queued: 0, created_at: 101 },
+      { role: 'user', content: '  修复编译错误  ', queued: 0, created_at: 205 },
+    ] as ChatMessage[]
+    expect(containsPersistedUserMessage(messages, '修复编译错误', 204)).toBe(true)
+  })
+
+  it('带图片的请求接受后端追加的多模态说明；纯文本请求不接受', () => {
+    const messages = [
+      {
+        role: 'user',
+        content: '看图\n\n（本次请求附带 2 张图片，多模态输入）',
+        queued: 0,
+        created_at: 205,
+      },
+    ] as ChatMessage[]
+    expect(containsPersistedUserMessage(messages, '看图', 204, true)).toBe(true)
+    expect(containsPersistedUserMessage(messages, '看图', 204)).toBe(false)
+  })
+
+  it('排队消息、旧消息与助手消息都不算已发送', () => {
+    const messages = [
+      { role: 'user', content: '修复编译错误', queued: 1, created_at: 205 },
+      { role: 'user', content: '同一句话', queued: 0, created_at: 100 },
+      { role: 'assistant', content: '修复编译错误', queued: 0, created_at: 205 },
+    ] as ChatMessage[]
+    expect(containsPersistedUserMessage(messages, '修复编译错误', 204)).toBe(false)
+    expect(containsPersistedUserMessage(messages, '同一句话', 204)).toBe(false)
+    expect(containsPersistedUserMessage(messages, '没出现过', 204)).toBe(false)
   })
 })
 

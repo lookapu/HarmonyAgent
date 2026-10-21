@@ -6,6 +6,46 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 47: the stop fallback actually starts; failed sends no longer eat input (2026-10-22)
+
+Two more conversation-core paths had their fallback only in a comment:
+
+- **Stop fallback**: `stopGeneration` awaited `stopChatApi` before arming the 60-second
+  timer. That fallback exists precisely for "backend hung, the command never returns" —
+  the await never finishes, so the timer never starts and the UI spins forever.
+  The timer is now armed before the stop command is awaited; the existing `startedAt`
+  generation check still keeps an old timer from killing a new task.
+- **Failed sends**: `sendUserMessage` returned immediately while the same conversation
+  was streaming, after the composer had already been cleared. If the invoke failed
+  before the user message was persisted, the input only survived inside an optimistic
+  bubble that was about to be replaced. `sendUserMessage` now reports whether it took
+  the message: the duplicate guard and a not-persisted failure return false, and callers
+  restore the input. After an invoke failure the latest database page decides whether
+  the message landed; a persisted message counts as sent so the draft is never restored
+  and sent twice, and a failed page fetch is also treated as sent.
+
+### What is restored
+
+- Composer: text, @ references, images and the quoted message; if the user switched
+  conversations, the text is written back to that conversation's draft. New typing is
+  merged, never overwritten.
+- Queue bar "Run now": if a task starts streaming right after the queued row is removed,
+  the message is queued again; only a second failure falls back to the composer.
+- History edit re-run: the old messages were already deleted for the re-run, so a
+  rejected send at least returns the edited content to the user.
+- Selection instructions: a rejected send no longer clears the user's draft and reports
+  that it should be retried.
+
+Two new strings: `home.sendFailed` / `home.sendRejected`. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+### Verification
+
+Frontend vitest **234/234** (+3 for the persisted-user-message check, including image sends) with `tsc` /
+`eslint` green · Rust **1251/1251** unaffected · i18n keys **2294** (+2, union **2296**) ·
+i18n gates, `check-docs` and the production build pass.
+
+---
 ## Unreleased — Batch 46: queued messages no longer use the history edit/delete path (2026-10-22)
 
 Batch 45 closed the forced wrap-up gap; this batch fixes the conversation core around

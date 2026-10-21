@@ -22,6 +22,26 @@ export function toolRunFromExecutionStep(step: ExecutionStep): ToolRun {
   }
 }
 
+/** invoke 失败后刷新到的最新一页里，是否已包含刚发送的用户消息。
+ * 乐观消息没有数据库 ID，只能按「角色 + 内容 + 发送时间」判断；
+ * 排队消息不算——它还没执行，本轮请求并未作为已发送消息入库。
+ * 带图片的请求入库时后端会追加「（本次请求附带 N 张图片…）」，只在确实发过图片时
+ * 才接受这个后缀，避免普通消息被宽松匹配。 */
+export function containsPersistedUserMessage(
+  messages: ChatMessage[],
+  content: string,
+  sentAtSec: number,
+  imagesSent = false,
+): boolean {
+  const target = content.trim()
+  return messages.some((m) => {
+    if (m.role !== 'user' || m.queued === 1 || (m.created_at ?? 0) < sentAtSec - 2) return false
+    const stored = m.content.trim()
+    if (stored === target) return true
+    return imagesSent && stored.startsWith(`${target}\n\n（本次请求附带 `)
+  })
+}
+
 /** 运行代次匹配：无事件 ID 兼容旧后端；有 ID 时必须与当前任务一致。 */
 export function acceptsRunEvent(activeRunId: string | null | undefined, eventRunId?: string): boolean {
   return !eventRunId || activeRunId === eventRunId
