@@ -93,17 +93,56 @@ pub fn get(conversation_id: &str) -> Vec<TodoItem> {
     load(conversation_id)
 }
 
-/// 持久化清单到 DB（best effort：写失败不影响内存主径，仅静默降级）。
-fn persist(conversation_id: &str, items: &[TodoItem]) {
-    let Some(db) = crate::db::global() else { return };
-    let Ok(conn) = db.lock() else { return };
+/// 用调用方已持有的连接读取清单：内存优先，空时读持久化镜像。
+///
+/// 快照保存在 DB 锁内调用，不能走 [`get`] 的全局单例路径（同一把锁会自锁）。
+pub fn get_with(conn: &rusqlite::Connection, conversation_id: &str) -> Vec<TodoItem> {
+    {
+        let ctx = table();
+        if let Some(list) = ctx.todo_lists.get(conversation_id) {
+            if !list.is_empty() {
+                return list.clone();
+            }
+        }
+    }
+    let json: String = match conn.query_row(
+        "SELECT items_json FROM conversation_todos WHERE conversation_id = ?1",
+        [conversation_id],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+/// 只更新内存主径：快照恢复已在自己的事务里写回持久化镜像，无需再次锁库。
+pub fn remember(conversation_id: &str, items: Vec<TodoItem>) {
+    let mut ctx = table();
+    ctx.todo_lists.insert(conversation_id.to_string(), items);
+}
+
+/// 用调用方连接写回清单镜像（快照恢复在自己的事务内调用，避免二次锁全局 DB）。
+pub fn persist_with(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    items: &[TodoItem],
+) -> rusqlite::Result<()> {
     let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
-    let _ = conn.execute(
+    conn.execute(
         "INSERT INTO conversation_todos (conversation_id, items_json, updated_at)
          VALUES (?1, ?2, unixepoch())
          ON CONFLICT(conversation_id) DO UPDATE SET items_json = excluded.items_json, updated_at = unixepoch()",
         rusqlite::params![conversation_id, json],
-    );
+    )?;
+    Ok(())
+}
+
+/// 持久化清单到 DB（best effort：写失败不影响内存主径，仅静默降级）。
+fn persist(conversation_id: &str, items: &[TodoItem]) {
+    let Some(db) = crate::db::global() else { return };
+    let Ok(conn) = db.lock() else { return };
+    let _ = persist_with(&conn, conversation_id, items);
 }
 
 /// 从 DB 恢复清单（内存无数据时调用）。

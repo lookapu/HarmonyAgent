@@ -29,6 +29,7 @@ vi.mock('../api/project', async (importOriginal) => {
     listMessageFeedback: vi.fn(),
     listMessageVersions: vi.fn(),
     listPendingConfirmations: vi.fn(),
+    getTodos: vi.fn().mockResolvedValue([]),
   }
 })
 
@@ -37,6 +38,7 @@ import {
   deleteMessage,
   getConversationCostStats,
   getTaskLedger,
+  getTodos,
   listConversations,
   listMessageFeedback,
   listMessageVersions,
@@ -255,6 +257,9 @@ describe('project deletion sync', () => {
     vi.mocked(listMessageVersions).mockResolvedValue([{ id: 'v1', user_message_id: 'm1' } as never])
     vi.mocked(listSnapshots).mockResolvedValue([{ id: 's0' } as never])
     vi.mocked(listQueuedMessages).mockResolvedValue([])
+    vi.mocked(getTodos).mockResolvedValue([
+      { id: 'todo-a', content: '步骤 A', status: 'in_progress' } as never,
+    ])
     // loadingSnapshots=true 时 loadSnapshots 会直接返回，这里模拟时间线已加载完
     useProjectStore.setState({ ...populatedConversationView(), loadingSnapshots: false })
 
@@ -269,6 +274,9 @@ describe('project deletion sync', () => {
     expect(state.approvedPlan).toBeNull()
     expect(state.unfinishedConv).toBeNull()
     expect(state.tokenStats).toBeNull()
+    // 被归档未来分支的执行轨迹不再展示
+    expect(state.toolRuns).toEqual([])
+    expect(state.agentRuns).toEqual([])
     await vi.waitFor(() => {
       const s = useProjectStore.getState()
       expect(s.feedbackMap).toEqual({ m1: { message_id: 'm1' } })
@@ -276,10 +284,13 @@ describe('project deletion sync', () => {
       expect(s.queuedList).toEqual([])
       expect(s.snapshots).toEqual([{ id: 's0' }])
       expect(s.taskLedgers.c1).toEqual({ ledger, finished: true })
+      // 清单以后端回退结果为准，而不是停留在未来分支
+      expect(s.todos).toEqual([{ id: 'todo-a', content: '步骤 A', status: 'in_progress' }])
     })
     expect(restoreSnapshot).toHaveBeenCalledWith('c1', 's1')
     expect(listMessagesPage).toHaveBeenCalledWith('c1')
     expect(getTaskLedger).toHaveBeenCalledWith('c1')
+    expect(getTodos).toHaveBeenCalledWith('c1')
     expect(listMessageFeedback).toHaveBeenCalledWith('c1')
     expect(listMessageVersions).toHaveBeenCalledWith('c1')
     expect(listQueuedMessages).toHaveBeenCalledWith('c1')

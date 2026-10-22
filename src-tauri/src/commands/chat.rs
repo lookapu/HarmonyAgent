@@ -1403,9 +1403,13 @@ fn save_conversation_snapshot(
     }
     let ledger_json = ledger
         .and_then(|l| serde_json::to_string(l).ok());
+    // 任务清单属于该历史点的会话状态：不拍进快照，回退后清单会停在被归档的
+    // 未来分支，下一轮还会把这些未来待办注入模型上下文。始终写 JSON（空清单写 "[]"）。
+    let todos_json = serde_json::to_string(&crate::agent::todo::get_with(conn, conversation_id))
+        .map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, anchor_message_id, label, ledger_json, tool_count, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, anchor_message_id, label, ledger_json, todos_json, tool_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             Uuid::new_v4().to_string(),
             conversation_id,
@@ -1413,6 +1417,7 @@ fn save_conversation_snapshot(
             anchor_message_id,
             label,
             ledger_json,
+            todos_json,
             tool_count as i64,
             now()
         ],
@@ -1531,14 +1536,28 @@ fn restore_snapshot_conn(
     conversation_id: &str,
     snapshot_id: &str,
 ) -> Result<RestoreSnapshotResult, String> {
-    let (stored_rowid, anchor_message_id, label, ledger_json): (i64, Option<String>, String, Option<String>) = conn
+    let (stored_rowid, anchor_message_id, label, ledger_json, todos_json): (
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT msg_rowid, anchor_message_id, label, ledger_json FROM conversation_snapshots
+            "SELECT msg_rowid, anchor_message_id, label, ledger_json, todos_json FROM conversation_snapshots
              WHERE id = ?1 AND conversation_id = ?2",
             params![snapshot_id, conversation_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .map_err(|e| format!("快照不存在或不属于该会话: {e}"))?;
+    // 旧快照没有 todos_json（列在迁移 089 才加入）：无法推断当时清单，
+    // 恢复时保持现状，而不是清空用户正在使用的清单。
+    let snapshot_todos: Option<Vec<crate::agent::todo::TodoItem>> = match todos_json {
+        Some(json) => Some(
+            serde_json::from_str(&json).map_err(|e| format!("快照任务清单损坏: {e}"))?,
+        ),
+        None => None,
+    };
     // 新快照按消息 id 定位锚点：messages 没有 AUTOINCREMENT，删除末端消息后
     // rowid 会被复用，按 rowid 恢复可能落到一条完全不同的新消息上。
     // 旧快照没有 id，退回 rowid 并校验它仍存在（新删除路径会同步清快照，这里兜旧数据）。
@@ -1593,7 +1612,17 @@ fn restore_snapshot_conn(
         ],
     )
     .map_err(|e| e.to_string())?;
+    // 4. 任务清单与消息/账本同一事务回退：清单每轮注入模型上下文，
+    //    只回退消息会让下一轮继续围绕未来分支的待办推进。
+    if let Some(items) = &snapshot_todos {
+        crate::agent::todo::persist_with(&tx, conversation_id, items)
+            .map_err(|e| e.to_string())?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
+    // 提交成功后再更新内存主径，避免回滚时内存与库不一致
+    if let Some(items) = snapshot_todos {
+        crate::agent::todo::remember(conversation_id, items);
+    }
     Ok(RestoreSnapshotResult {
         label,
         archived: archived as i64,
@@ -16215,7 +16244,9 @@ mod snapshot_tests {
                  hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
              CREATE TABLE conversation_snapshots (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
                  msg_rowid INTEGER NOT NULL, anchor_message_id TEXT, label TEXT NOT NULL DEFAULT '', ledger_json TEXT,
-                 tool_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+                 todos_json TEXT, tool_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+             CREATE TABLE conversation_todos (conversation_id TEXT PRIMARY KEY,
+                 items_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER NOT NULL DEFAULT 0);
              INSERT INTO conversations (id, ledger) VALUES ('c1', NULL);",
         )
         .unwrap();
@@ -16229,6 +16260,23 @@ mod snapshot_tests {
             params![format!("m-{ts}"), role, content, ts],
         )
         .unwrap();
+    }
+
+    fn insert_msg_for(conn: &rusqlite::Connection, conv: &str, role: &str, content: &str, ts: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            params![format!("{conv}-{ts}"), conv, role, content, ts],
+        )
+        .unwrap();
+    }
+
+    fn todo(id: &str, status: &str) -> crate::agent::todo::TodoItem {
+        crate::agent::todo::TodoItem {
+            id: id.into(),
+            content: format!("步骤 {id}"),
+            status: status.into(),
+        }
     }
 
     fn visible(conn: &rusqlite::Connection) -> i64 {
@@ -16443,6 +16491,137 @@ mod snapshot_tests {
 
         assert_eq!((res.archived, res.restored), (2, 0));
         assert_eq!(visible(&conn), 3, "旧快照继续按 rowid 恢复");
+    }
+
+    /// 快照必须随历史一起回退任务清单：清单每轮注入模型上下文，
+    /// 只回退消息会让下一轮继续围绕被归档分支的待办推进。
+    #[test]
+    fn restore_rewinds_todo_list_captured_in_snapshot() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO conversations (id, ledger) VALUES ('c-todo-a', NULL)",
+            [],
+        )
+        .unwrap();
+        insert_msg_for(&conn, "c-todo-a", "user", "任务", 1);
+        insert_msg_for(&conn, "c-todo-a", "assistant", "A1", 2);
+        crate::agent::todo::remember(
+            "c-todo-a",
+            vec![todo("a", "done"), todo("b", "in_progress")],
+        );
+        save_conversation_snapshot(&conn, "c-todo-a", None, "A 阶段", 1).unwrap();
+        let snap: String = conn
+            .query_row(
+                "SELECT id FROM conversation_snapshots WHERE conversation_id = 'c-todo-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // 未来分支：清单推进到 3 项
+        crate::agent::todo::remember(
+            "c-todo-a",
+            vec![todo("a", "done"), todo("b", "done"), todo("c", "pending")],
+        );
+        insert_msg_for(&conn, "c-todo-a", "assistant", "B1", 3);
+        assert_eq!(crate::agent::todo::get("c-todo-a").len(), 3);
+
+        restore_snapshot_conn(&conn, "c-todo-a", &snap).unwrap();
+
+        let memory = crate::agent::todo::get("c-todo-a");
+        assert_eq!(memory.len(), 2, "内存清单回到快照时刻: {memory:?}");
+        assert_eq!(memory[1].status, "in_progress");
+        let stored_json: String = conn
+            .query_row(
+                "SELECT items_json FROM conversation_todos WHERE conversation_id = 'c-todo-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored: Vec<crate::agent::todo::TodoItem> = serde_json::from_str(&stored_json).unwrap();
+        assert_eq!(stored.len(), 2, "持久化镜像与内存一致");
+        assert!(!stored.iter().any(|t| t.id == "c"), "未来分支的待办不残留");
+        crate::agent::session_ctx::drop_session("c-todo-a");
+    }
+
+    /// 回到任务开始前的快照：当时清单为空，恢复后未来分支的清单必须清空
+    /// （否则下一轮仍会注入旧计划）。
+    #[test]
+    fn restore_clears_todos_when_snapshot_had_empty_list() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO conversations (id, ledger) VALUES ('c-todo-b', NULL)",
+            [],
+        )
+        .unwrap();
+        insert_msg_for(&conn, "c-todo-b", "user", "任务", 1);
+        save_conversation_snapshot(&conn, "c-todo-b", None, "A 阶段", 1).unwrap();
+        let snap: String = conn
+            .query_row(
+                "SELECT id FROM conversation_snapshots WHERE conversation_id = 'c-todo-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::agent::todo::remember("c-todo-b", vec![todo("future", "pending")]);
+
+        restore_snapshot_conn(&conn, "c-todo-b", &snap).unwrap();
+
+        assert!(crate::agent::todo::get("c-todo-b").is_empty());
+        let stored: String = conn
+            .query_row(
+                "SELECT items_json FROM conversation_todos WHERE conversation_id = 'c-todo-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "[]");
+        crate::agent::session_ctx::drop_session("c-todo-b");
+    }
+
+    /// 迁移 089 之前的旧快照没有 todos_json：无从推断当时清单，
+    /// 恢复时保持现状（既不清空内存，也不凭空写库）。
+    #[test]
+    fn restore_legacy_snapshot_without_todos_keeps_current_list() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO conversations (id, ledger) VALUES ('c-todo-legacy', NULL)",
+            [],
+        )
+        .unwrap();
+        insert_msg_for(&conn, "c-todo-legacy", "user", "任务", 1);
+        insert_msg_for(&conn, "c-todo-legacy", "assistant", "A1", 2);
+        let anchor: i64 = conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE conversation_id = 'c-todo-legacy' AND content = 'A1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, anchor_message_id, label, created_at)
+             VALUES ('s-legacy-todo', 'c-todo-legacy', ?1, 'c-todo-legacy-2', '旧快照', 1)",
+            [anchor],
+        )
+        .unwrap();
+        insert_msg_for(&conn, "c-todo-legacy", "assistant", "未来", 3);
+        crate::agent::todo::remember("c-todo-legacy", vec![todo("current", "in_progress")]);
+
+        restore_snapshot_conn(&conn, "c-todo-legacy", "s-legacy-todo").unwrap();
+
+        assert_eq!(
+            crate::agent::todo::get("c-todo-legacy").len(),
+            1,
+            "旧快照不覆盖清单，保持现状"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM conversation_todos WHERE conversation_id = 'c-todo-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "不应凭空写库");
+        crate::agent::session_ctx::drop_session("c-todo-legacy");
     }
 
     #[test]

@@ -1555,11 +1555,22 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           approvedPlan: null,
           unfinishedConv: null,
           tokenStats: null,
+          // 任务清单随快照回退（后端同事务写回）；等待重拉期间先隐藏未来分支的清单
+          todos: [],
+          // 上一次任务的工具/子代理轨迹同样属于被归档分支，不再显示
+          toolRuns: [],
+          agentRuns: [],
         })
         // 反馈/版本按会话重拉：恢复段可能带回旧消息的既有评价，
         // 只清空映射会让仍可见的消息丢掉角标
         void get().loadFeedback(conversationId).catch(() => {})
         void get().loadVersions(conversationId).catch(() => {})
+        // 任务清单以后端回退结果为准（旧快照没有清单字段时后端保持现状）
+        void getTodosApi(conversationId)
+          .then((todos) => {
+            if (same()) set({ todos })
+          })
+          .catch(() => {})
         // 排队列表以库为准：锚点之后的排队消息已被归档，不再显示
         void get().refreshQueued(conversationId)
       }

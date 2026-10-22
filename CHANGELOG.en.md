@@ -6,6 +6,36 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 80: time travel brings the task list back with the history (2026-10-22)
+
+Scenario: the task list (`conversation_todos`) is conversation-level persisted state
+and is injected into the model context every round. Restoring an earlier snapshot used
+to archive messages and rewind the ledger only, while the list stayed on the archived
+future branch: the UI showed future todos, and the next round fed them back to the
+model, so the rewound conversation kept following the old plan; the previous task's
+tool/sub-agent trace panels likewise kept showing the future branch.
+
+- Migration 089 adds `todos_json` to `conversation_snapshots`: saving a snapshot now
+  also records the task list at that moment (an empty list is stored as `[]`);
+- Restoring writes the list back to `conversation_todos` in the same transaction and
+  refreshes the in-memory copy after commit, so messages, ledger, and list rewind
+  together; snapshots older than migration 089 have no such field (NULL), and since the
+  list at that time cannot be inferred, restore leaves the current list untouched
+  instead of clearing it;
+- The frontend `restoreToSnapshot` clears the tool/sub-agent trace panels, hides the
+  future-branch list immediately, and reloads it from the backend (the database wins).
+
+### Verification
+
+3 Rust unit tests added (the list rewinds with the snapshot; an empty list at snapshot
+time clears future todos; a legacy snapshot neither changes the list nor invents a DB
+row). Rust full suite **1314/1314** (+3) · frontend vitest **252/252** (restore case
+extended, count unchanged) · `tsc` / `eslint` / clippy baseline 57/57 · i18n keys
+unchanged (2298, union 2300) · all three i18n gates, 21 gate self-tests, `check-docs`,
+and the production build pass. `TOOL_SPECS` to **204** (unchanged in this batch), and
+database migration count reaches **89**.
+
+---
 ## Unreleased — Batch 79: forced aborts no longer leave unanswerable approvals/plans behind (2026-10-22)
 
 Scenario: while a task is waiting on tool approval or plan review, deleting a
