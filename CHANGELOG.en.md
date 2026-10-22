@@ -6,6 +6,42 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 74: time-travel restore passes the task gate and no longer lands on ghost anchors (2026-10-22)
+
+Scenario: restoring a snapshot (time travel) only checked `ChatLock`, which is held
+only once a task actually starts executing. While a registered task waited in the
+project queue (up to 10 minutes) or between two turns, a restore could slip through
+and rewrite the visible history of a task that was running or about to run. The
+existing snapshot test also never called the restore implementation — it hand-wrote
+the same UPDATE statements, so a broken restore would still stay green. Older
+versions did not clean snapshots when deleting messages, so a snapshot whose anchor
+message was gone could still be restored onto a rowid that no longer existed. The
+returned `went_back` was computed as `restored > 0`, contradicting its own "true =
+moved earlier" comment.
+
+- `restore_snapshot` now delegates to a testable `restore_snapshot_conn`; the command
+  only performs the gate and locking;
+- The gate combines `TaskRegistry.is_running` with `ChatLock`, covering queue waits and
+  between-turn gaps;
+- Before restoring, the anchor message must still exist: a stale snapshot returns
+  "the snapshot anchor message was deleted; this history point cannot be restored"
+  without touching visibility or the ledger;
+- `went_back` is now `archived > 0` (archiving visible messages after the anchor is
+  what moving back means).
+
+### Verification
+
+The existing snapshot test now calls the real `restore_snapshot_conn` (bidirectional
+visibility, archived/restored/went_back, ledger written and cleared); 3 unit tests
+were added: another conversation's snapshot is rejected, a deleted anchor is rejected
+with zero writes, and the runtime gate catches both the project lock and the registry
+while allowing other conversations. Rust full suite **1302/1302** (+3) · frontend
+vitest **246/246** (unchanged, no frontend changes in this batch) · `tsc` / `eslint` /
+clippy baseline 57/57 · i18n keys unchanged (2298, union 2300) · all three i18n gates,
+21 gate self-tests, `check-docs`, and the production build pass. Tool and migration
+counts are unchanged: `TOOL_SPECS` to **204**; database migration count reaches **86**.
+
+---
 ## Unreleased — Batch 73: a running task also blocks message deletion over direct IPC (2026-10-22)
 
 Scenario: while streaming, the frontend forbids editing/deleting historical messages

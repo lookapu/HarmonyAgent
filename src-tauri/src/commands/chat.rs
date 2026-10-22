@@ -1388,7 +1388,7 @@ pub fn list_snapshots(
 }
 
 /// 恢复结果（前端提示条展示）
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RestoreSnapshotResult {
     pub label: String,
     /// 归档（隐藏）的消息条数
@@ -1408,17 +1408,39 @@ pub struct RestoreSnapshotResult {
 pub fn restore_snapshot(
     state: State<'_, DbState>,
     lock: State<'_, ChatLock>,
+    registry: State<'_, TaskRegistry>,
     conversation_id: String,
     snapshot_id: String,
 ) -> Result<RestoreSnapshotResult, String> {
-    // 任务运行检查：ChatLock 记录 project_id → 正在执行的会话 id
-    {
-        let guard = lock.0.lock().map_err(|e| e.to_string())?;
-        if guard.values().any(|c| c == &conversation_id) {
-            return Err("会话任务正在运行，请先停止任务再回到历史点".into());
-        }
-    }
+    ensure_history_idle(&lock, &registry, &conversation_id, "回到历史点")?;
     let conn = state.0.lock().map_err(|e| e.to_string())?;
+    restore_snapshot_conn(&conn, &conversation_id, &snapshot_id)
+}
+
+/// 历史改写闸门：任务登记表覆盖整个任务（含排队等待与回合间隙），项目锁再兜一层。
+fn ensure_history_idle(
+    lock: &ChatLock,
+    registry: &TaskRegistry,
+    conversation_id: &str,
+    action: &str,
+) -> Result<(), String> {
+    let project_busy = lock
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .values()
+        .any(|c| c == conversation_id);
+    if project_busy || registry.is_running(conversation_id) {
+        return Err(format!("会话任务正在运行，请先停止任务再{action}"));
+    }
+    Ok(())
+}
+
+fn restore_snapshot_conn(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    snapshot_id: &str,
+) -> Result<RestoreSnapshotResult, String> {
     let (anchor, label, ledger_json): (i64, String, Option<String>) = conn
         .query_row(
             "SELECT msg_rowid, label, ledger_json FROM conversation_snapshots
@@ -1427,6 +1449,18 @@ pub fn restore_snapshot(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|e| format!("快照不存在或不属于该会话: {e}"))?;
+    // 锚点消息可能已被历史版本删除（新删除路径会同步清快照，这里兜住旧数据）：
+    // 恢复到一个不存在的 rowid 只会让可见起点悬空，失败关闭。
+    let anchor_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ?1 AND rowid = ?2)",
+            params![conversation_id, anchor],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !anchor_exists {
+        return Err("快照锚点消息已删除，无法恢复到该历史点".into());
+    }
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     // 1. 归档：锚点之后的可见消息 → hidden（旧分支保留可回溯，不硬删）
     let archived = tx
@@ -1454,7 +1488,8 @@ pub fn restore_snapshot(
         label,
         archived: archived as i64,
         restored: restored as i64,
-        went_back: restored > 0,
+        // 归档锚点之后的可见消息 = 回到更早；仅恢复归档分支 = 前进/切换分支
+        went_back: archived > 0,
     })
 }
 
@@ -15896,6 +15931,20 @@ mod snapshot_tests {
         .unwrap();
     }
 
+    fn visible(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(1) FROM messages WHERE conversation_id = 'c1' AND hidden = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn ledger_of(conn: &rusqlite::Connection) -> Option<String> {
+        conn.query_row("SELECT ledger FROM conversations WHERE id = 'c1'", [], |r| r.get(0))
+            .unwrap()
+    }
+
     #[test]
     fn save_skips_empty_round() {
         // 首轮无执行痕迹：不保存快照
@@ -15950,6 +15999,14 @@ mod snapshot_tests {
         let snap_a: String = conn
             .query_row("SELECT id FROM conversation_snapshots", [], |r| r.get(0))
             .unwrap();
+        // A 的账本：回退时必须写回
+        let ledger = TaskLedger::from_tool_runs("任务", &[], "A 阶段", 0);
+        let ledger_json = serde_json::to_string(&ledger).unwrap();
+        conn.execute(
+            "UPDATE conversation_snapshots SET ledger_json = ?1 WHERE id = ?2",
+            params![ledger_json, snap_a],
+        )
+        .unwrap();
         // 阶段 B：追加 2 条
         insert_msg(&conn, "assistant", "B1", 4);
         insert_msg(&conn, "tool", "edit_file\ny", 5);
@@ -15961,51 +16018,82 @@ mod snapshot_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let visible = |conn: &rusqlite::Connection| -> i64 {
-            conn.query_row(
-                "SELECT COUNT(1) FROM messages WHERE conversation_id = 'c1' AND hidden = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
         assert_eq!(visible(&conn), 5);
-        // 回退到 A：B 段归档
-        let anchor: i64 = conn
-            .query_row("SELECT msg_rowid FROM conversation_snapshots WHERE id = ?1", [&snap_a], |r| r.get(0))
-            .unwrap();
-        conn.execute(
-            "UPDATE messages SET hidden = 1 WHERE conversation_id = 'c1' AND hidden = 0 AND rowid > ?1",
-            params![anchor],
-        )
-        .unwrap();
+
+        // 回退到 A：走真实实现，B 段归档
+        let back = restore_snapshot_conn(&conn, "c1", &snap_a).unwrap();
+        assert_eq!(back.label, "A 阶段");
+        assert_eq!((back.archived, back.restored), (2, 0));
+        assert!(back.went_back, "归档锚点之后的消息表示回到更早");
         assert_eq!(visible(&conn), 3);
-        // 前进回 B：归档段重新可见（双向时间旅行）
-        let anchor_b: i64 = conn
-            .query_row("SELECT msg_rowid FROM conversation_snapshots WHERE id = ?1", [&snap_b], |r| r.get(0))
-            .unwrap();
-        conn.execute(
-            "UPDATE messages SET hidden = 0 WHERE conversation_id = 'c1' AND hidden = 1 AND rowid <= ?1",
-            params![anchor_b],
-        )
-        .unwrap();
+        assert_eq!(ledger_of(&conn).as_deref(), Some(ledger_json.as_str()));
+
+        // 前进回 B：归档段重新可见（双向时间旅行），B 快照无账本 → 写回 NULL
+        let forward = restore_snapshot_conn(&conn, "c1", &snap_b).unwrap();
+        assert_eq!((forward.archived, forward.restored), (0, 2));
+        assert!(!forward.went_back, "只恢复归档分支表示前进/切换分支");
         assert_eq!(visible(&conn), 5);
-        // 恢复账本写回：ledger_json 非空时覆盖 conversations.ledger
-        let ledger = TaskLedger::from_tool_runs("任务", &[], "A 阶段", 0);
-        let ledger_json = serde_json::to_string(&ledger).unwrap();
+        assert_eq!(ledger_of(&conn), None);
+    }
+
+    #[test]
+    fn restore_rejects_snapshot_from_another_conversation() {
+        let conn = setup();
+        insert_msg(&conn, "user", "当前会话", 1);
         conn.execute(
-            "UPDATE conversation_snapshots SET ledger_json = ?1 WHERE id = ?2",
-            params![ledger_json, snap_a],
+            "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, label, created_at)
+             VALUES ('s-other', 'c2', 1, '别的会话', 1)",
+            [],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE conversations SET ledger = ?1 WHERE id = 'c1'",
-            params![Some(ledger_json.clone())],
-        )
-        .unwrap();
-        let stored: Option<String> = conn
-            .query_row("SELECT ledger FROM conversations WHERE id = 'c1'", [], |r| r.get(0))
+
+        let err = restore_snapshot_conn(&conn, "c1", "s-other").unwrap_err();
+
+        assert!(err.contains("快照不存在或不属于该会话"), "错误应指出快照归属: {err}");
+        assert_eq!(visible(&conn), 1, "跨会话快照不能改动消息");
+        assert_eq!(ledger_of(&conn), None, "跨会话快照不能写回账本");
+    }
+
+    #[test]
+    fn restore_rejects_deleted_anchor_without_touching_messages() {
+        let conn = setup();
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "回复", 2);
+        save_conversation_snapshot(&conn, "c1", None, "锚点", 1).unwrap();
+        let snap: String = conn
+            .query_row("SELECT id FROM conversation_snapshots", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(stored.as_deref(), Some(ledger_json.as_str()));
+        // 旧数据中删除消息未清快照：锚点已失效
+        conn.execute("DELETE FROM messages WHERE id = 'm-2'", []).unwrap();
+
+        let err = restore_snapshot_conn(&conn, "c1", &snap).unwrap_err();
+
+        assert_eq!(err, "快照锚点消息已删除，无法恢复到该历史点");
+        assert_eq!(visible(&conn), 1, "失效快照不能改动任何消息");
+        assert_eq!(ledger_of(&conn), None, "失效快照不能写回账本");
+    }
+
+    #[tokio::test]
+    async fn history_mutation_rejected_while_task_runs() {
+        let lock = ChatLock::default();
+        let registry = TaskRegistry::default();
+        lock.0.lock().unwrap().insert("p1".into(), "c1".into());
+        let err = ensure_history_idle(&lock, &registry, "c1", "回到历史点").unwrap_err();
+        assert_eq!(err, "会话任务正在运行，请先停止任务再回到历史点");
+        assert!(
+            ensure_history_idle(&lock, &registry, "c2", "回到历史点").is_ok(),
+            "别的会话不受项目锁影响"
+        );
+        lock.0.lock().unwrap().clear();
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.register("c1", task.abort_handle()).unwrap();
+        let err = ensure_history_idle(&lock, &registry, "c1", "回到历史点").unwrap_err();
+        assert_eq!(
+            err, "会话任务正在运行，请先停止任务再回到历史点",
+            "排队等待/回合间隙也由登记表拦住"
+        );
+        assert!(ensure_history_idle(&lock, &registry, "c2", "回到历史点").is_ok());
+        task.abort();
     }
 }
