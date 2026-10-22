@@ -6,6 +6,40 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 73: a running task also blocks message deletion over direct IPC (2026-10-22)
+
+Scenario: while streaming, the frontend forbids editing/deleting historical messages
+(editing history first deletes the messages after it and re-runs), but that constraint
+lived only in the frontend. `delete_message` took a message id, looked up its
+conversation and cascaded the delete without ever checking whether that conversation
+had a running task. Through direct IPC, automation, or a window where streaming state
+was out of sync, the delete could succeed while the main loop kept appending messages
+from its own context — the timeline then showed a reply to a prompt that no longer
+existed, and task-final writes could overwrite each other with the delete. The frontend
+also could not stop the race where a task starts while the confirmation dialog is open.
+
+- `TaskRegistry` gains `is_running(conversation_id)`: true while the registry holds
+  that conversation; a poisoned lock is treated conservatively as running (make the
+  user retry rather than rewrite history concurrently);
+- `delete_message` now takes the task registry: it resolves the owning conversation
+  from the message id and returns "the conversation task is running; stop it before
+  deleting messages" while a task is registered;
+- The gate sits at the top of `delete_message_checked`, before any feedback/version/
+  message/snapshot cleanup; editing and removing queued messages use separate
+  commands and keep working during a run.
+
+### Verification
+
+Added 1 registry unit test (registration/unregistration tracking, only the target
+conversation is blocked) and 2 delete tests (a running task rejects the delete with
+messages, feedback, versions and snapshots untouched; an idle conversation deletes
+normally). Rust full suite **1299/1299** (+3) · frontend vitest **246/246** (unchanged,
+no frontend changes in this batch) · `tsc` / `eslint` / clippy baseline 57/57 · i18n
+keys unchanged (2298, union 2300) · all three i18n gates, 21 gate self-tests,
+`check-docs`, and the production build pass. Tool and migration counts are unchanged:
+`TOOL_SPECS` to **204**; database migration count reaches **86**.
+
+---
 ## Unreleased — Batch 72: deleting a message cleans its feedback, versions and dead snapshots (2026-10-22)
 
 Scenario: deleting a historical message cascades to every visible message after it, but

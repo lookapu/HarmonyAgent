@@ -93,6 +93,15 @@ impl TaskRegistry {
         self.0.lock().map(|tasks| tasks.is_empty()).unwrap_or(false)
     }
 
+    /// 会话是否有运行中的任务。锁中毒时保守视为仍在运行：调用方据此拒绝改写
+    /// 历史/上下文，宁可让用户重试，也不与主循环并发写消息。
+    pub fn is_running(&self, conversation_id: &str) -> bool {
+        self.0
+            .lock()
+            .map(|tasks| tasks.contains_key(conversation_id))
+            .unwrap_or(true)
+    }
+
     /// 尝试登记运行中任务。已存在时拒绝，避免并发 stream_chat 覆盖原任务的 AbortHandle。
     /// 返回本次代次，正常收尾时必须带回该值做条件注销。
     pub fn register(&self, conversation_id: &str, abort: tokio::task::AbortHandle) -> Option<u64> {
@@ -470,6 +479,21 @@ mod tests {
         assert!(!registry.is_idle());
         registry.unregister("c", generation);
         assert!(registry.is_idle());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn is_running_tracks_conversation_lifecycle() {
+        let registry = TaskRegistry::default();
+        assert!(!registry.is_running("conv-running"));
+        let task = tokio::spawn(std::future::pending::<()>());
+        let generation = registry
+            .register("conv-running", task.abort_handle())
+            .expect("register");
+        assert!(registry.is_running("conv-running"));
+        assert!(!registry.is_running("conv-other"), "只拦目标会话，不影响其他会话");
+        registry.unregister("conv-running", generation);
+        assert!(!registry.is_running("conv-running"));
         task.abort();
     }
 

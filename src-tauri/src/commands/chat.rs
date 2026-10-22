@@ -3021,24 +3021,50 @@ mod update_message_tests {
     }
 }
 
-/// 删除单条消息及其之后的所有消息（保持对话上下文连续；事务原子）
+/// 删除单条消息及其之后的所有消息（保持对话上下文连续；事务原子）。
+/// 任务运行中拒绝：前端已禁用入口，这里兜住直接 IPC / 多窗口，避免与主循环写消息竞态。
 #[tauri::command]
-pub fn delete_message(state: State<'_, DbState>, message_id: String) -> Result<u64, String> {
+pub fn delete_message(
+    state: State<'_, DbState>,
+    registry: State<'_, TaskRegistry>,
+    message_id: String,
+) -> Result<u64, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    delete_message_conn(&conn, &message_id)
+    delete_message_checked(&conn, &message_id, |conversation_id| {
+        registry.is_running(conversation_id)
+    })
+}
+
+/// 删除前的运行态闸门：先定位消息所属会话，运行中则一条都不删。
+fn delete_message_checked(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+    is_running: impl FnOnce(&str) -> bool,
+) -> Result<u64, String> {
+    let conversation_id = message_conversation_id(conn, message_id)?;
+    if is_running(&conversation_id) {
+        return Err("会话任务正在运行，请先停止任务再删除消息".into());
+    }
+    delete_message_conn(conn, message_id)
+}
+
+fn message_conversation_id(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+) -> Result<String, String> {
+    conn.query_row(
+        "SELECT conversation_id FROM messages WHERE id = ?1",
+        [message_id],
+        |r| r.get(0),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// 删除范围：该消息及其后的全部可见消息（hidden 归档分支保留，时间旅行后不误删旧分支）。
 /// 没有外键级联的附属数据必须在删消息前清理，否则反馈/版本会永久指向不存在的消息；
 /// 删完后清掉锚点已失效的快照，避免时间轴恢复到幽灵位置。
 fn delete_message_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<u64, String> {
-    let conversation_id: String = conn
-        .query_row(
-            "SELECT conversation_id FROM messages WHERE id = ?1",
-            [message_id],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    let conversation_id = message_conversation_id(conn, message_id)?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM message_feedback WHERE message_id IN (
@@ -3077,7 +3103,7 @@ fn delete_message_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<
 
 #[cfg(test)]
 mod delete_message_tests {
-    use super::delete_message_conn;
+    use super::{delete_message_checked, delete_message_conn};
 
     fn setup() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -3205,6 +3231,50 @@ mod delete_message_tests {
             vec!["s-m1", "s-m3", "s-m5"],
             "锚点消息已删的快照要移除；锚在归档分支与其他会话的快照保留"
         );
+    }
+
+    #[test]
+    fn running_task_rejects_delete_before_any_write() {
+        let conn = setup();
+        insert_message(&conn, "m1", "c1", 0);
+        insert_message(&conn, "m2", "c1", 0);
+        insert_feedback(&conn, "m1");
+        insert_feedback(&conn, "m2");
+        insert_version(&conn, "m1", "c1");
+        insert_snapshot(&conn, "s-m1", "c1", "m1");
+
+        let err = delete_message_checked(&conn, "m1", |conversation_id| {
+            assert_eq!(conversation_id, "c1", "闸门按消息实际归属的会话判断");
+            true
+        })
+        .unwrap_err();
+
+        assert_eq!(err, "会话任务正在运行，请先停止任务再删除消息");
+        assert_eq!(
+            strings(&conn, "SELECT id FROM messages ORDER BY id"),
+            vec!["m1", "m2"],
+            "运行中拒绝时一条消息都不能删"
+        );
+        assert_eq!(
+            strings(&conn, "SELECT message_id FROM message_feedback ORDER BY message_id"),
+            vec!["m1", "m2"],
+            "闸门必须先于附属表清理，拒绝时反馈原样保留"
+        );
+        assert_eq!(strings(&conn, "SELECT user_message_id FROM message_versions"), vec!["m1"]);
+        assert_eq!(strings(&conn, "SELECT id FROM conversation_snapshots"), vec!["s-m1"]);
+    }
+
+    #[test]
+    fn idle_conversation_passes_the_gate() {
+        let conn = setup();
+        insert_message(&conn, "m1", "c1", 0);
+        insert_feedback(&conn, "m1");
+
+        let removed = delete_message_checked(&conn, "m1", |_| false).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(strings(&conn, "SELECT id FROM messages").is_empty());
+        assert!(strings(&conn, "SELECT message_id FROM message_feedback").is_empty());
     }
 
     #[test]
