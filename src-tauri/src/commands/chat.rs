@@ -3025,23 +3025,211 @@ mod update_message_tests {
 #[tauri::command]
 pub fn delete_message(state: State<'_, DbState>, message_id: String) -> Result<u64, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let (conversation_id, _): (String, i64) = conn
+    delete_message_conn(&conn, &message_id)
+}
+
+/// 删除范围：该消息及其后的全部可见消息（hidden 归档分支保留，时间旅行后不误删旧分支）。
+/// 没有外键级联的附属数据必须在删消息前清理，否则反馈/版本会永久指向不存在的消息；
+/// 删完后清掉锚点已失效的快照，避免时间轴恢复到幽灵位置。
+fn delete_message_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<u64, String> {
+    let conversation_id: String = conn
         .query_row(
-            "SELECT conversation_id, created_at FROM messages WHERE id = ?1",
-            [&message_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT conversation_id FROM messages WHERE id = ?1",
+            [message_id],
+            |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    // 按 rowid（插入顺序）级联删除该消息及其后的全部可见消息（hidden 归档分支保留，
-    // 时间旅行后不误删旧分支；含排队/工具/回复）
-    let removed = conn
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM message_feedback WHERE message_id IN (
+             SELECT id FROM messages
+             WHERE conversation_id = ?1 AND hidden = 0
+               AND rowid >= (SELECT rowid FROM messages WHERE id = ?2))",
+        params![conversation_id, message_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM message_versions
+         WHERE conversation_id = ?1 AND user_message_id IN (
+             SELECT id FROM messages
+             WHERE conversation_id = ?1 AND hidden = 0
+               AND rowid >= (SELECT rowid FROM messages WHERE id = ?2))",
+        params![conversation_id, message_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let removed = tx
         .execute(
             "DELETE FROM messages
              WHERE conversation_id = ?1 AND hidden = 0 AND rowid >= (SELECT rowid FROM messages WHERE id = ?2)",
-            rusqlite::params![conversation_id, message_id],
+            params![conversation_id, message_id],
         )
         .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM conversation_snapshots
+         WHERE conversation_id = ?1
+           AND msg_rowid NOT IN (SELECT rowid FROM messages WHERE conversation_id = ?1)",
+        [&conversation_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(removed as u64)
+}
+
+#[cfg(test)]
+mod delete_message_tests {
+    use super::delete_message_conn;
+
+    fn setup() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                hidden INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE message_feedback (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL UNIQUE,
+                conversation_id TEXT NOT NULL,
+                feedback TEXT NOT NULL,
+                reason TEXT,
+                comment TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE message_versions (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_message_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                reasoning TEXT,
+                model TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE conversation_snapshots (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                msg_rowid INTEGER NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                ledger_json TEXT,
+                tool_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_message(conn: &rusqlite::Connection, id: &str, conversation_id: &str, hidden: i64) {
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, hidden, created_at)
+             VALUES (?1, ?2, 'user', ?3, ?4, 1)",
+            rusqlite::params![id, conversation_id, format!("内容-{id}"), hidden],
+        )
+        .unwrap();
+    }
+
+    fn insert_feedback(conn: &rusqlite::Connection, message_id: &str) {
+        conn.execute(
+            "INSERT INTO message_feedback (id, message_id, conversation_id, feedback, created_at)
+             VALUES (?1, ?2, 'c1', 'like', 1)",
+            rusqlite::params![format!("f-{message_id}"), message_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_version(conn: &rusqlite::Connection, user_message_id: &str, conversation_id: &str) {
+        conn.execute(
+            "INSERT INTO message_versions (id, conversation_id, user_message_id, content, created_at)
+             VALUES (?1, ?2, ?3, '旧回复', 1)",
+            rusqlite::params![format!("v-{user_message_id}"), conversation_id, user_message_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_snapshot(conn: &rusqlite::Connection, id: &str, conversation_id: &str, message_id: &str) {
+        let rowid: i64 = conn
+            .query_row("SELECT rowid FROM messages WHERE id = ?1", [message_id], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, created_at)
+             VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![id, conversation_id, rowid],
+        )
+        .unwrap();
+    }
+
+    fn strings(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn deleting_message_cleans_feedback_versions_and_dead_snapshot_anchors() {
+        let conn = setup();
+        for (id, hidden) in [("m1", 0), ("m2", 0), ("m3", 1), ("m4", 0)] {
+            insert_message(&conn, id, "c1", hidden);
+        }
+        insert_message(&conn, "m5", "c2", 0);
+        for id in ["m1", "m2", "m3", "m4", "m5"] {
+            insert_feedback(&conn, id);
+        }
+        for id in ["m1", "m2", "m3", "m4"] {
+            insert_version(&conn, id, "c1");
+        }
+        insert_version(&conn, "m5", "c2");
+        for id in ["m1", "m2", "m3", "m4"] {
+            insert_snapshot(&conn, &format!("s-{id}"), "c1", id);
+        }
+        insert_snapshot(&conn, "s-m5", "c2", "m5");
+
+        let removed = delete_message_conn(&conn, "m2").unwrap();
+
+        assert_eq!(removed, 2, "只删可见的 m2 及其后的 m4，hidden 归档分支 m3 保留");
+        assert_eq!(strings(&conn, "SELECT id FROM messages ORDER BY id"), vec!["m1", "m3", "m5"]);
+        assert_eq!(
+            strings(&conn, "SELECT message_id FROM message_feedback ORDER BY message_id"),
+            vec!["m1", "m3", "m5"],
+            "被删消息的点赞/点踩不能留下孤儿记录"
+        );
+        assert_eq!(
+            strings(&conn, "SELECT user_message_id FROM message_versions ORDER BY user_message_id"),
+            vec!["m1", "m3", "m5"],
+            "被删用户消息的旧版本必须一起清理，另一个会话不受影响"
+        );
+        assert_eq!(
+            strings(&conn, "SELECT id FROM conversation_snapshots ORDER BY id"),
+            vec!["s-m1", "s-m3", "s-m5"],
+            "锚点消息已删的快照要移除；锚在归档分支与其他会话的快照保留"
+        );
+    }
+
+    #[test]
+    fn failed_cascade_rolls_back_side_table_cleanup() {
+        let conn = setup();
+        insert_message(&conn, "m1", "c1", 0);
+        insert_message(&conn, "m2", "c1", 0);
+        insert_feedback(&conn, "m1");
+        insert_feedback(&conn, "m2");
+        insert_version(&conn, "m1", "c1");
+        conn.execute_batch(
+            "CREATE TRIGGER fail_delete BEFORE DELETE ON messages
+             BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;",
+        )
+        .unwrap();
+
+        assert!(delete_message_conn(&conn, "m1").is_err());
+        assert_eq!(strings(&conn, "SELECT id FROM messages ORDER BY id"), vec!["m1", "m2"]);
+        assert_eq!(
+            strings(&conn, "SELECT message_id FROM message_feedback ORDER BY message_id"),
+            vec!["m1", "m2"],
+            "消息删除失败时附属数据清理必须回滚"
+        );
+        assert_eq!(strings(&conn, "SELECT user_message_id FROM message_versions"), vec!["m1"]);
+    }
 }
 
 fn now() -> i64 {

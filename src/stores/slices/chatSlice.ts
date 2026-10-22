@@ -2199,7 +2199,29 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       await deleteMessageApi(messageId)
       if (!conversationId) return
       const messages = await listMessages(conversationId)
-      if (get().currentConversation?.id === conversationId) set({ messages, olderHasMore: false })
+      if (get().currentConversation?.id !== conversationId) return
+      // 反馈/版本按消息 id 聚合：被删消息（含其后级联删除的）不能继续留在映射里
+      const remaining = new Set(messages.map((m) => m.id))
+      const keep = <T,>(map: Record<string, T>) =>
+        Object.fromEntries(Object.entries(map).filter(([id]) => remaining.has(id))) as Record<string, T>
+      set({
+        messages,
+        olderHasMore: false,
+        feedbackMap: keep(get().feedbackMap),
+        versionMap: keep(get().versionMap),
+        // 任务摘要/计划/续跑断点都属于刚被删掉的那段对话，留着会指向不存在的内容
+        lastTaskSummary: null,
+        plan: null,
+        approvedPlan: null,
+        unfinishedConv: null,
+        tokenStats: null,
+        snapshots: [],
+        loadingSnapshots: false,
+      })
+      // token/成本、快照与排队项都以库为准重新拉取（后端已清掉失效快照与队列消息）
+      void get().loadTokenStats(conversationId).catch(() => {})
+      void get().loadSnapshots(conversationId).catch(() => {})
+      void get().refreshQueued(conversationId)
     },
 
     /** 回复工具权限审核：true=允许执行 / false=拒绝（可附理由）；remember 勾选后本会话同工具免审，scope=project 额外写入项目白名单 */

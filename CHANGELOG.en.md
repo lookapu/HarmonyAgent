@@ -6,6 +6,42 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 72: deleting a message cleans its feedback, versions and dead snapshots (2026-10-22)
+
+Scenario: deleting a historical message cascades to every visible message after it, but
+only the `messages` table was touched. Likes/dislikes (`message_feedback`) and the old
+replies kept for regeneration (`message_versions`) have no foreign-key cascade, so they
+kept pointing at messages that no longer existed. Time-travel snapshots anchor on
+`msg_rowid`; once the anchor message was deleted, the snapshot stayed on the timeline
+and restoring it could only land on a ghost position. The frontend also replaced only
+the message list: feedback/versions of deleted messages, token stats, the last task
+summary, plan, approved plan and the "continue task" checkpoint stayed visible, while
+the snapshot list and queued bar were not refreshed — users could see data from a
+deleted task or even be invited to continue a task that no longer existed. The function
+comment claimed "transactional" but the statements were not wrapped in a transaction.
+
+- `delete_message` now delegates to a testable `delete_message_conn` that, inside one
+  transaction, removes feedback and user-message versions in the deletion range, deletes
+  the messages, then removes snapshots whose anchor rowid no longer exists; any failure
+  rolls everything back;
+- Frontend `removeMessage` now trusts the reloaded message list: it filters feedback and
+  version maps to surviving message ids, clears the last task summary, plan, approved
+  plan and continuation checkpoint, and reloads token/cost stats, snapshots and the
+  queued list.
+
+### Verification
+
+Added 2 Rust unit tests: deleting a middle message clears only the target range, keeps
+the hidden archive branch and other conversations, and removes feedback/versions/dead
+snapshots; a trigger-blocked delete rolls the side-table cleanup back. Added 1 vitest:
+after deleting a message, feedback/versions only keep surviving messages, task summary/
+plan/continuation are cleared, and token, snapshot and queued data are reloaded. Rust
+full suite **1296/1296** (+2) · frontend vitest **246/246** (+1) · `tsc` / `eslint` /
+clippy baseline 57/57 · i18n keys unchanged (2298, union 2300) · all three i18n gates,
+21 gate self-tests, `check-docs`, and the production build pass. Tool and migration
+counts are unchanged: `TOOL_SPECS` to **204**; database migration count reaches **86**.
+
+---
 ## Unreleased — Batch 71: deleting the current conversation no longer leaves its view behind (2026-10-22)
 
 Scenario: after deleting the current conversation from the sidebar — especially the

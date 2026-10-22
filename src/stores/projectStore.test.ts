@@ -18,10 +18,24 @@ vi.mock('../api/project', async (importOriginal) => {
     listProjects: vi.fn(),
     listConversations: vi.fn(),
     deleteConversation: vi.fn(),
+    deleteMessage: vi.fn(),
+    listMessages: vi.fn(),
+    getConversationCostStats: vi.fn(),
+    listSnapshots: vi.fn(),
+    listQueuedMessages: vi.fn(),
   }
 })
 
-import { deleteConversation, listConversations, listProjects } from '../api/project'
+import {
+  deleteConversation,
+  deleteMessage,
+  getConversationCostStats,
+  listConversations,
+  listMessages,
+  listProjects,
+  listQueuedMessages,
+  listSnapshots,
+} from '../api/project'
 import { emptyStreaming } from './slices/chatSlice'
 import { useProjectStore } from './projectStore'
 
@@ -171,5 +185,47 @@ describe('project deletion sync', () => {
     await useProjectStore.getState().deleteConversation('c1')
 
     expectViewCleared()
+  })
+
+  it('removeMessage 清理被删消息的反馈/版本与过时统计', async () => {
+    const stats = { total_tokens: 7 } as never
+    vi.mocked(deleteMessage).mockResolvedValue(1)
+    vi.mocked(listMessages).mockResolvedValue([{ id: 'm1', conversation_id: 'c1' } as never])
+    vi.mocked(getConversationCostStats).mockResolvedValue(stats)
+    vi.mocked(listSnapshots).mockResolvedValue([{ id: 's2' } as never])
+    vi.mocked(listQueuedMessages).mockResolvedValue([])
+    useProjectStore.setState({
+      conversations: [conversation('c1')],
+      currentConversation: conversation('c1'),
+      messages: [{ id: 'm1' } as never, { id: 'm2' } as never],
+      feedbackMap: { m1: { message_id: 'm1' } as never, m2: { message_id: 'm2' } as never },
+      versionMap: { m1: [{ id: 'v1' } as never], m2: [{ id: 'v2' } as never] },
+      lastTaskSummary: { status: 'completed' } as never,
+      plan: { phase: 'done', steps: [] } as never,
+      approvedPlan: { conversationId: 'c1', plan: 'x' } as never,
+      unfinishedConv: { conversationId: 'c1' } as never,
+      tokenStats: { total_tokens: 99 } as never,
+      snapshots: [{ id: 's1' } as never],
+      loadingSnapshots: true,
+    })
+
+    await useProjectStore.getState().removeMessage('m2')
+
+    const state = useProjectStore.getState()
+    expect(deleteMessage).toHaveBeenCalledWith('m2')
+    expect(state.messages.map((m) => m.id)).toEqual(['m1'])
+    expect(Object.keys(state.feedbackMap)).toEqual(['m1'])
+    expect(Object.keys(state.versionMap)).toEqual(['m1'])
+    expect(state.lastTaskSummary).toBeNull()
+    expect(state.plan).toBeNull()
+    expect(state.approvedPlan).toBeNull()
+    expect(state.unfinishedConv).toBeNull()
+    await vi.waitFor(() => {
+      expect(useProjectStore.getState().tokenStats).toEqual(stats)
+      expect(useProjectStore.getState().snapshots).toEqual([{ id: 's2' }])
+    })
+    expect(getConversationCostStats).toHaveBeenCalledWith('c1')
+    expect(listSnapshots).toHaveBeenCalledWith('c1')
+    expect(listQueuedMessages).toHaveBeenCalledWith('c1')
   })
 })
