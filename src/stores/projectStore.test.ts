@@ -20,9 +20,14 @@ vi.mock('../api/project', async (importOriginal) => {
     deleteConversation: vi.fn(),
     deleteMessage: vi.fn(),
     listMessages: vi.fn(),
+    listMessagesPage: vi.fn(),
     getConversationCostStats: vi.fn(),
     listSnapshots: vi.fn(),
     listQueuedMessages: vi.fn(),
+    restoreSnapshot: vi.fn(),
+    getTaskLedger: vi.fn(),
+    listMessageFeedback: vi.fn(),
+    listMessageVersions: vi.fn(),
   }
 })
 
@@ -30,11 +35,16 @@ import {
   deleteConversation,
   deleteMessage,
   getConversationCostStats,
+  getTaskLedger,
   listConversations,
+  listMessageFeedback,
+  listMessageVersions,
   listMessages,
+  listMessagesPage,
   listProjects,
   listQueuedMessages,
   listSnapshots,
+  restoreSnapshot,
 } from '../api/project'
 import { emptyStreaming } from './slices/chatSlice'
 import { useProjectStore } from './projectStore'
@@ -227,5 +237,50 @@ describe('project deletion sync', () => {
     expect(getConversationCostStats).toHaveBeenCalledWith('c1')
     expect(listSnapshots).toHaveBeenCalledWith('c1')
     expect(listQueuedMessages).toHaveBeenCalledWith('c1')
+  })
+
+  it('restoreToSnapshot 清空未来分支的计划/摘要/续跑断点并重拉反馈、排队与快照', async () => {
+    const ledger = { title: '任务' } as never
+    vi.mocked(restoreSnapshot).mockResolvedValue({
+      label: 'A 阶段',
+      archived: 2,
+      restored: 0,
+      went_back: true,
+    })
+    vi.mocked(listMessagesPage).mockResolvedValue({ messages: [{ id: 'm1' } as never], hasMore: true })
+    vi.mocked(getTaskLedger).mockResolvedValue(ledger)
+    vi.mocked(listMessageFeedback).mockResolvedValue([{ message_id: 'm1' } as never])
+    vi.mocked(listMessageVersions).mockResolvedValue([{ id: 'v1', user_message_id: 'm1' } as never])
+    vi.mocked(listSnapshots).mockResolvedValue([{ id: 's0' } as never])
+    vi.mocked(listQueuedMessages).mockResolvedValue([])
+    // loadingSnapshots=true 时 loadSnapshots 会直接返回，这里模拟时间线已加载完
+    useProjectStore.setState({ ...populatedConversationView(), loadingSnapshots: false })
+
+    const result = await useProjectStore.getState().restoreToSnapshot('c1', 's1')
+
+    expect(result).toEqual({ label: 'A 阶段', archived: 2, restored: 0, went_back: true })
+    const state = useProjectStore.getState()
+    expect(state.messages.map((m) => m.id)).toEqual(['m1'])
+    expect(state.olderHasMore).toBe(true)
+    expect(state.lastTaskSummary).toBeNull()
+    expect(state.plan).toBeNull()
+    expect(state.approvedPlan).toBeNull()
+    expect(state.unfinishedConv).toBeNull()
+    expect(state.tokenStats).toBeNull()
+    await vi.waitFor(() => {
+      const s = useProjectStore.getState()
+      expect(s.feedbackMap).toEqual({ m1: { message_id: 'm1' } })
+      expect(s.versionMap).toEqual({ m1: [{ id: 'v1', user_message_id: 'm1' }] })
+      expect(s.queuedList).toEqual([])
+      expect(s.snapshots).toEqual([{ id: 's0' }])
+      expect(s.taskLedgers.c1).toEqual({ ledger, finished: true })
+    })
+    expect(restoreSnapshot).toHaveBeenCalledWith('c1', 's1')
+    expect(listMessagesPage).toHaveBeenCalledWith('c1')
+    expect(getTaskLedger).toHaveBeenCalledWith('c1')
+    expect(listMessageFeedback).toHaveBeenCalledWith('c1')
+    expect(listMessageVersions).toHaveBeenCalledWith('c1')
+    expect(listQueuedMessages).toHaveBeenCalledWith('c1')
+    expect(listSnapshots).toHaveBeenCalledWith('c1')
   })
 })

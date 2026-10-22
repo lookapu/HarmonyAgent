@@ -1548,10 +1548,20 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         set({
           messages: page.messages,
           olderHasMore: page.hasMore,
-          feedbackMap: {},
-          versionMap: {},
+          // 计划/任务摘要/续跑断点属于被归档的未来分支：账本虽已写回快照时刻，
+          // 这些视图状态还指向旧分支，继续任务会接到错误的位置
+          lastTaskSummary: null,
+          plan: null,
+          approvedPlan: null,
+          unfinishedConv: null,
           tokenStats: null,
         })
+        // 反馈/版本按会话重拉：恢复段可能带回旧消息的既有评价，
+        // 只清空映射会让仍可见的消息丢掉角标
+        void get().loadFeedback(conversationId).catch(() => {})
+        void get().loadVersions(conversationId).catch(() => {})
+        // 排队列表以库为准：锚点之后的排队消息已被归档，不再显示
+        void get().refreshQueued(conversationId)
       }
       // 刷新账本（写回快照时刻的执行轨迹，续跑/继续任务继承）
       void getTaskLedgerApi(conversationId)

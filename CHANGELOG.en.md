@@ -6,6 +6,40 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 76: time travel no longer leaves the future branch's view state behind (2026-10-22)
+
+Restoring an earlier snapshot archives every message after the anchor and writes the
+ledger back to that moment, but the frontend `restoreToSnapshot` only replaced the
+message list and token stats, and wiped the feedback/version maps wholesale. The UI
+therefore kept "future branch" state after the restore:
+
+- The "continue task" breakpoint (`unfinishedConv`) and the approved plan
+  (`approvedPlan`) still pointed at the archived execution trace; continuing would
+  resume from the wrong place;
+- The task summary and plan progress card still showed the future branch's result;
+- The queued list was not refreshed: queued messages archived with the future branch
+  stayed visible as if they would still be sent;
+- Wiping the feedback/version maps also dropped existing ratings for messages that
+  remained visible.
+
+- After a successful restore, clear `lastTaskSummary` / `plan` / `approvedPlan` /
+  `unfinishedConv`;
+- Reload feedback and versions per conversation instead of wiping the maps, so
+  messages that stayed visible keep their badges;
+- Refresh the queued list from the database: archived queued messages disappear from
+  the queue bar immediately.
+
+### Verification
+
+1 vitest added: messages/cursor replaced, four future-branch fields cleared, tokens
+cleared, feedback/versions/queue/snapshots reloaded, and the ledger written back.
+Frontend vitest **250/250** (+1) · Rust full suite **1302/1302** (unchanged, no
+backend changes) · `tsc` / `eslint` / clippy baseline 57/57 · i18n keys unchanged
+(2298, union 2300) · all three i18n gates, 21 gate self-tests, `check-docs`, and the
+production build pass. Tool and migration counts are unchanged: `TOOL_SPECS` to **204**;
+database migration count reaches **86**.
+
+---
 ## Unreleased — Batch 75: a rejected history edit no longer "pretends to rerun" (2026-10-22)
 
 Editing a historical user message means deleting that message and everything after
