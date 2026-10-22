@@ -6,6 +6,37 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 82: checkpoint forks no longer lose task state (2026-10-22)
+
+Scenario: "fork" on the timeline creates a new conversation from a checkpoint by
+copying messages and audit events, but the conversation ledger and task list
+(`conversation_todos`) were not copied. The new branch carried the full dialogue up to
+the anchor yet had no execution trace or todos: the task ledger card was empty,
+continuing the task started from scratch, and the per-round todo injection into the
+model context had nothing to inject — the branch looked like it continued history
+while silently dropping the task's current state.
+
+- `fork_conversation` now delegates to a testable `fork_conversation_conn`, and the
+  anchor kind decides whether task state is inherited:
+  - `checkpoint`: copies the ledger and task list recorded in that snapshot (snapshots
+    since migration 089 always carry a list; legacy ones only contribute the ledger);
+  - `latest`: nothing is cut off, so the current ledger and list are inherited;
+  - `message` / `build_failure` / `git_commit`: later trace may exist past the cutoff,
+    so the current ledger/list do not represent the branch — inheriting nothing is
+    safer than leaking the future branch into the new conversation;
+- Opening the new branch already reloads the task list, so no frontend change is needed.
+
+### Verification
+
+3 Rust unit tests added (a checkpoint fork inherits the snapshot ledger/list and copies
+only messages up to the anchor; a latest fork inherits current state; a message-anchor
+fork leaks neither the current ledger nor the list). Rust full suite **1320/1320**
+(+3) · frontend vitest **252/252** (no frontend changes) · `tsc` / `eslint` / clippy
+baseline 57/57 · i18n keys unchanged (2298, union 2300) · all three i18n gates,
+21 gate self-tests, `check-docs`, and the production build pass. `TOOL_SPECS` to **204**
+(unchanged in this batch), and database migration count reaches **89** (unchanged).
+
+---
 ## Unreleased — Batch 81: the timeline now has a "just finished" checkpoint (2026-10-22)
 
 Scenario: conversation snapshots were only saved before each request round, anchored

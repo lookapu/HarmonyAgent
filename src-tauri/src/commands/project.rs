@@ -1081,9 +1081,32 @@ pub fn fork_conversation(
     anchor_ref: Option<String>,
     state: State<DbState>,
 ) -> Result<Conversation, String> {
+    let (new_id, project_id) = {
+        let mut conn = state.0.lock().map_err(|e| e.to_string())?;
+        fork_conversation_conn(
+            &mut conn,
+            &from_id,
+            until_message_id.as_deref(),
+            anchor_kind.as_deref(),
+            anchor_ref.as_deref(),
+        )?
+    };
+    // 空会话 fork 等价于新建，同样允许
+    list_conversations(project_id, state, None, None)?
+        .into_iter()
+        .find(|c| c.id == new_id)
+        .ok_or_else(|| "会话派生失败".into())
+}
+
+fn fork_conversation_conn(
+    conn: &mut rusqlite::Connection,
+    from_id: &str,
+    until_message_id: Option<&str>,
+    anchor_kind: Option<&str>,
+    anchor_ref: Option<&str>,
+) -> Result<(String, String), String> {
     let new_id = Uuid::new_v4().to_string();
     let ts = now();
-    let mut conn = state.0.lock().map_err(|e| e.to_string())?;
     let tx = conn
         .transaction()
         .map_err(|e| e.to_string())?;
@@ -1092,7 +1115,7 @@ pub fn fork_conversation(
     let (project_id, title, work_mode, worktree_path, worktree_branch): (String, String, String, Option<String>, Option<String>) = tx
         .query_row(
             "SELECT project_id, title, work_mode, worktree_path, worktree_branch FROM conversations WHERE id = ?1",
-            [&from_id],
+            [from_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .map_err(|e| format!("源会话不存在: {e}"))?;
@@ -1104,12 +1127,60 @@ pub fn fork_conversation(
     .map_err(|e| e.to_string())?;
 
     // 2) 截止锚点：until 消息的 (created_at, rowid)，按序截断（同秒多条时不误带后续消息）
-    let requested_anchor = anchor_kind.as_deref().unwrap_or(if until_message_id.is_some() { "message" } else { "latest" });
+    let requested_anchor = anchor_kind.unwrap_or(if until_message_id.is_some() { "message" } else { "latest" });
     if !matches!(requested_anchor, "latest" | "message" | "checkpoint" | "build_failure" | "git_commit") {
         return Err("anchor_kind 仅支持 latest|message|checkpoint|build_failure|git_commit".into());
     }
-    let effective_ref = anchor_ref.as_ref().or(until_message_id.as_ref());
-    let until = resolve_conversation_branch_anchor(&tx, &from_id, requested_anchor, effective_ref.map(String::as_str))?;
+    let effective_ref = anchor_ref.or(until_message_id);
+    let until = resolve_conversation_branch_anchor(&tx, from_id, requested_anchor, effective_ref)?;
+
+    // 2.5) 任务状态随分支：检查点派生复制该时刻快照里的账本与清单；整库派生
+    //      （latest）没有截掉任何未来内容，直接继承当前账本与清单。按消息/构建失败/
+    //      提交锚点截断时，当前账本可能包含截断点之后的轨迹——宁可不继承，也不能
+    //      把未来分支的执行记录带进新分支。
+    let (branch_ledger, branch_todos): (Option<String>, Option<String>) = match requested_anchor {
+        "checkpoint" => {
+            let snapshot_id = effective_ref.ok_or_else(|| "检查点锚点缺少 anchor_ref".to_string())?;
+            tx.query_row(
+                "SELECT ledger_json, todos_json FROM conversation_snapshots WHERE id = ?1 AND conversation_id = ?2",
+                params![snapshot_id, from_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| "检查点不存在或不属于该会话".to_string())?
+        }
+        "latest" => {
+            let ledger: Option<String> = tx
+                .query_row("SELECT ledger FROM conversations WHERE id = ?1", [from_id], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?
+                .flatten();
+            let todos: Option<String> = tx
+                .query_row(
+                    "SELECT items_json FROM conversation_todos WHERE conversation_id = ?1",
+                    [from_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            (ledger, todos)
+        }
+        _ => (None, None),
+    };
+    if let Some(ledger) = branch_ledger {
+        tx.execute(
+            "UPDATE conversations SET ledger = ?1 WHERE id = ?2",
+            params![ledger, new_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(todos) = branch_todos {
+        tx.execute(
+            "INSERT OR REPLACE INTO conversation_todos (conversation_id, items_json, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![new_id, todos, ts],
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     // 3) 复制 messages（新 UUID；按 (created_at, rowid) 升序保持原顺序）
     let copied: usize = {
@@ -1186,13 +1257,9 @@ pub fn fork_conversation(
     );
 
     tx.commit().map_err(|e| e.to_string())?;
-    drop(conn);
     // 空会话 fork 等价于新建，同样允许
     let _ = copied;
-    list_conversations(project_id, state.clone(), None, None)?
-        .into_iter()
-        .find(|c| c.id == new_id)
-        .ok_or_else(|| "会话派生失败".into())
+    Ok((new_id, project_id))
 }
 
 fn resolve_conversation_branch_anchor(
@@ -2159,6 +2226,142 @@ mod tests {
         let err = resolve_conversation_branch_anchor(&conn, "anchors-id", "checkpoint", Some("snap-gone"))
             .unwrap_err();
         assert_eq!(err, "检查点锚点消息已删除");
+    }
+
+    #[test]
+    fn fork_from_checkpoint_inherits_snapshot_ledger_and_todos() {
+        let mut conn = test_conn();
+        seed(&conn, "fork-src", 6);
+        let anchor_rowid: i64 = conn
+            .query_row("SELECT rowid FROM messages WHERE id='m-003'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_snapshots
+               (id, conversation_id, msg_rowid, anchor_message_id, label, ledger_json, todos_json, tool_count, created_at)
+             VALUES ('snap-fork','fork-src',?1,'m-003','阶段 A','{\"goal\":\"旧目标\"}',
+                     '[{\"id\":\"t1\",\"content\":\"旧步骤\",\"status\":\"pending\"}]',1,1)",
+            [anchor_rowid],
+        )
+        .unwrap();
+        // 源会话当前状态属于更晚分支：检查点派生不得继承
+        conn.execute(
+            "UPDATE conversations SET ledger='{\"goal\":\"新目标\"}' WHERE id='fork-src'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_todos (conversation_id, items_json, updated_at)
+             VALUES ('fork-src','[{\"id\":\"t9\",\"content\":\"新步骤\",\"status\":\"pending\"}]',1)",
+            [],
+        )
+        .unwrap();
+
+        let (new_id, project_id) = fork_conversation_conn(
+            &mut conn,
+            "fork-src",
+            None,
+            Some("checkpoint"),
+            Some("snap-fork"),
+        )
+        .unwrap();
+
+        assert_eq!(project_id, "p1");
+        let ledger: Option<String> = conn
+            .query_row("SELECT ledger FROM conversations WHERE id=?1", [&new_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ledger.as_deref(), Some("{\"goal\":\"旧目标\"}"), "继承快照账本");
+        let todos: String = conn
+            .query_row(
+                "SELECT items_json FROM conversation_todos WHERE conversation_id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(todos.contains("旧步骤"));
+        assert!(!todos.contains("新步骤"), "不得继承检查点之后的清单");
+        let copied: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM messages WHERE conversation_id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 3, "只复制锚点及之前的消息");
+    }
+
+    #[test]
+    fn fork_latest_inherits_current_ledger_and_todos() {
+        let mut conn = test_conn();
+        seed(&conn, "fork-latest", 4);
+        conn.execute(
+            "UPDATE conversations SET ledger='{\"goal\":\"进行中\"}' WHERE id='fork-latest'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_todos (conversation_id, items_json, updated_at)
+             VALUES ('fork-latest','[{\"id\":\"t1\",\"content\":\"继续步骤\",\"status\":\"in_progress\"}]',1)",
+            [],
+        )
+        .unwrap();
+
+        let (new_id, _) = fork_conversation_conn(&mut conn, "fork-latest", None, None, None).unwrap();
+
+        let ledger: Option<String> = conn
+            .query_row("SELECT ledger FROM conversations WHERE id=?1", [&new_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ledger.as_deref(), Some("{\"goal\":\"进行中\"}"));
+        let todos: String = conn
+            .query_row(
+                "SELECT items_json FROM conversation_todos WHERE conversation_id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(todos.contains("继续步骤"));
+    }
+
+    #[test]
+    fn fork_from_message_anchor_does_not_inherit_current_task_state() {
+        let mut conn = test_conn();
+        seed(&conn, "fork-msg", 4);
+        conn.execute(
+            "UPDATE conversations SET ledger='{\"goal\":\"未来轨迹\"}' WHERE id='fork-msg'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_todos (conversation_id, items_json, updated_at)
+             VALUES ('fork-msg','[{\"id\":\"t9\",\"content\":\"未来步骤\",\"status\":\"pending\"}]',1)",
+            [],
+        )
+        .unwrap();
+
+        // 截断在更早的消息：当前账本/清单可能包含截断点之后的轨迹，不能带进分支
+        let (new_id, _) =
+            fork_conversation_conn(&mut conn, "fork-msg", Some("m-002"), None, None).unwrap();
+
+        let ledger: Option<String> = conn
+            .query_row("SELECT ledger FROM conversations WHERE id=?1", [&new_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ledger, None);
+        let todos: Option<String> = conn
+            .query_row(
+                "SELECT items_json FROM conversation_todos WHERE conversation_id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(todos, None);
+        let copied: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM messages WHERE conversation_id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 2);
     }
 
     fn insert_side_rows(conn: &rusqlite::Connection, conversation_id: &str) {
