@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod generated_media;
 pub mod logger;
 pub mod mcp_frames;
 pub mod net;

@@ -14838,15 +14838,47 @@ fn delete_conversation_inner(
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM messages WHERE conversation_id = ?1", [id])
         .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM conversations WHERE id = ?1", [id])
+    let deleted = conn
+        .execute("DELETE FROM conversations WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
     // 清理会话事件日志（仅追加真源，随会话删除级联清理；失败不影响会话本身删除）
     let _ = crate::agent::session_events::delete_conversation_events(&conn, id);
+    drop(conn);
     // 通知前端该会话已删除（前端据此清理流式桶/选中态）
     let _ = app.emit(
         "conversation-deleted",
         serde_json::json!({ "conversation_id": id }),
     );
+    // 回收该会话的生成产物（图片/视频/音频）。仅当会话确实被删除时才动手，
+    // 避免对不存在的 id 做无意义删除；放到后台线程，防止大目录阻塞命令返回。
+    if deleted > 0 {
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let conversation_id = id.to_string();
+            std::thread::spawn(move || {
+                match crate::utils::generated_media::remove_conversation(
+                    &data_dir,
+                    &conversation_id,
+                ) {
+                    Ok(true) => crate::utils::logger::log_event(
+                        "generated_media_removed",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "source": "conversation_deleted",
+                        }),
+                    ),
+                    Ok(false) => {}
+                    Err(error) => crate::utils::logger::log_event(
+                        "generated_media_cleanup_failed",
+                        serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "source": "conversation_deleted",
+                            "error": error.to_string(),
+                        }),
+                    ),
+                }
+            });
+        }
+    }
     Ok(())
 }
 

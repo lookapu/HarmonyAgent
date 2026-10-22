@@ -6,6 +6,40 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 67: deleting a conversation or clearing content reclaims generated media (2026-10-22)
+
+Scenario: generated images, videos, and audio live under
+`{app_data}/generated/<conversation_id>/<uuid>/`. Deleting a conversation only
+removed database rows, and clearing all content never touched the files, so media
+kept occupying disk indefinitely; crashes, locked files, or failed deletes also
+left unowned directories behind.
+
+- New `utils/generated_media`: a conversation id must be a single safe path segment
+  (empty, `.`, `..`, path separators, drive colons, and NUL are rejected), so
+  cleanup can never escape the generated root;
+- Deleting a conversation reclaims its directory only when the conversation row was
+  actually deleted, and runs on a background thread so large video files do not
+  block the command;
+- "Clear all content" removes the whole generated root after the database clear and
+  VACUUM;
+- A startup orphan sweep removes directories that belong to no live conversation;
+  if listing conversations fails, the sweep is skipped entirely (an empty set would
+  delete everything), and stray files or non-UTF-8 directory names are left alone;
+- Cleanup failures are logged as `generated_media_cleanup_failed` and never block
+  conversation deletion; the next startup sweep retries.
+
+### Verification
+
+Five new Rust unit tests: unsafe conversation ids are rejected without touching the
+generated root; per-conversation removal only affects the target; clear-all removes
+the whole root; the orphan sweep keeps live conversations, removes orphans, and
+leaves stray files; a missing root is a no-op. Rust **1288/1288** (+5) · frontend
+vitest **239/239** unchanged · `tsc` / `eslint` / clippy baseline 57/57 · i18n keys
+unchanged (**2297**, union **2299**) · three i18n gates, all 21 gate self-tests,
+`check-docs` and the production build pass. Tool count unchanged: `TOOL_SPECS` to **204**,
+migration count reaches **86**.
+
+---
 ## Unreleased — Batch 66: failed media tasks always release the composer (2026-10-22)
 
 Scenario: media generation emits `gen-start` and only then resolves the generation

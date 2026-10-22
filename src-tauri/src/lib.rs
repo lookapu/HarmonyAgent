@@ -186,8 +186,41 @@ pub fn run() {
             services::agent_limits::init_from_db();
 
             // 启动时数据维护：按保留策略滚动清理日志/成本明细（不阻塞启动）
-            if let Ok(conn) = pool_arc.lock() {
-                services::maintenance::run_startup_maintenance(&conn);
+            // 同时读取现存会话 id，供随后的生成产物孤儿清扫使用。
+            // 读取失败时返回 None 并跳过清扫——空集合会把全部产物当孤儿误删。
+            let live_conversations: Option<std::collections::HashSet<String>> =
+                if let Ok(conn) = pool_arc.lock() {
+                    services::maintenance::run_startup_maintenance(&conn);
+                    conn.prepare("SELECT id FROM conversations")
+                        .ok()
+                        .and_then(|mut stmt| {
+                            let ids: std::collections::HashSet<String> = stmt
+                                .query_map([], |row| row.get(0))
+                                .ok()?
+                                .filter_map(Result::ok)
+                                .collect();
+                            Some(ids)
+                        })
+                } else {
+                    None
+                };
+            // 生成产物孤儿清扫：删除 generated 下不属于任何现存会话的目录，
+            // 兜住删除会话时文件被占用、崩溃或删库失败留下的残留。
+            if let Some(live) = live_conversations {
+                if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                    let (removed, failed) =
+                        crate::utils::generated_media::sweep_orphans(&data_dir, &live);
+                    if removed > 0 || failed > 0 {
+                        crate::utils::logger::log_event(
+                            "generated_media_sweep",
+                            serde_json::json!({
+                                "removed": removed,
+                                "failed": failed,
+                                "live_conversations": live.len(),
+                            }),
+                        );
+                    }
+                }
             }
 
             // Execution Kernel Worker 心跳：每个桌面进程都有唯一实例身份。恢复扫描只回收

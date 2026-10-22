@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::db::DbState;
 use crate::services::maintenance;
@@ -27,7 +27,6 @@ pub fn export_backup(
             dir
         }
         None => {
-            use tauri::Manager;
             app.path()
                 .app_data_dir()
                 .map_err(|e| e.to_string())?
@@ -56,11 +55,33 @@ pub fn export_backup(
 /// 审批白名单。保留配置类（providers/models/mcp/skills/权限）与 API 知识库。
 /// 返回被删除的会话数与消息数（供前端展示）。
 #[tauri::command]
-pub fn clear_content_data(state: State<'_, DbState>) -> Result<(u64, u64), String> {
+pub fn clear_content_data(
+    app: AppHandle,
+    state: State<'_, DbState>,
+) -> Result<(u64, u64), String> {
     let mut conn = state.0.lock().map_err(|e| e.to_string())?;
     let (convs, msgs) = maintenance::clear_content_data(&mut conn).map_err(|e| e.to_string())?;
     // 大范围删除后回收文件空间，避免文件继续占盘
     let _ = maintenance::vacuum(&conn);
+    drop(conn);
+    // 会话已全部删除，生成产物（图片/视频/音频）一并回收；失败只记日志，
+    // 下次启动的孤儿清扫会兜底。
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        match crate::utils::generated_media::remove_all(&data_dir) {
+            Ok(true) => crate::utils::logger::log_event(
+                "generated_media_removed",
+                serde_json::json!({ "source": "clear_content_data" }),
+            ),
+            Ok(false) => {}
+            Err(error) => crate::utils::logger::log_event(
+                "generated_media_cleanup_failed",
+                serde_json::json!({
+                    "source": "clear_content_data",
+                    "error": error.to_string(),
+                }),
+            ),
+        }
+    }
     Ok((convs, msgs))
 }
 
