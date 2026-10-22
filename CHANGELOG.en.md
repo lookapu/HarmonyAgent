@@ -6,6 +6,37 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 81: the timeline now has a "just finished" checkpoint (2026-10-22)
+
+Scenario: conversation snapshots were only saved before each request round, anchored
+at the last visible message *before* that round, while the task's final reply is only
+persisted by `persist_turn` after the loop ends. Nothing was captured in between, so
+after a task completed the newest timeline entry still sat mid-task and restoring it
+archived the final answer; pure Q&A (no tools) produced no snapshot at all because of
+the pre-round "no execution trace, don't save" rule, leaving the timeline empty; and
+the newest snapshot in multi-round tasks was never the visible tail, so the "current"
+marker never appeared.
+
+- When a task finishes (after both the message and the final ledger are persisted), a
+  checkpoint is appended: it anchors the final reply and carries the final ledger
+  (empty when the completed task's ledger was cleared), so the newest timeline entry is
+  the "just finished" state and pure Q&A becomes rewindable too; failure to append it
+  does not affect task finalization;
+- Snapshot saving now deduplicates identical states: the same anchor + ledger + todo
+  list keeps a single row, so a pre-round save and the final append landing on the same
+  state (empty round, resuming right after a restore) do not create duplicate entries.
+
+### Verification
+
+3 Rust unit tests added (the final snapshot anchors the final reply and carries the
+persisted ledger; a completed task does not resurrect an old ledger; identical states
+are saved once). Rust full suite **1317/1317** (+3) · frontend vitest **252/252**
+(no frontend changes in this batch) · `tsc` / `eslint` / clippy baseline 57/57 · i18n
+keys unchanged (2298, union 2300) · all three i18n gates, 21 gate self-tests,
+`check-docs`, and the production build pass. `TOOL_SPECS` to **204** (unchanged in
+this batch), and database migration count reaches **89** (unchanged).
+
+---
 ## Unreleased — Batch 80: time travel brings the task list back with the history (2026-10-22)
 
 Scenario: the task list (`conversation_todos`) is conversation-level persisted state

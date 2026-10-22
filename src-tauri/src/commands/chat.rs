@@ -1310,6 +1310,11 @@ fn is_tool_failed(out: &str) -> bool {
 /// 加载上次任务持久化的账本（断点续跑继承；无账本或解析失败返回 None）
 fn load_task_ledger(state: &tauri::State<'_, DbState>, conversation_id: &str) -> Option<TaskLedger> {
     let conn = state.0.lock().ok()?;
+    load_task_ledger_from(&conn, conversation_id)
+}
+
+/// 在已持有的连接上读账本：收尾快照需要与刚落库的账本同源，不能再抢全局锁。
+fn load_task_ledger_from(conn: &rusqlite::Connection, conversation_id: &str) -> Option<TaskLedger> {
     conn.query_row(
         "SELECT ledger FROM conversations WHERE id = ?1",
         params![conversation_id],
@@ -1362,7 +1367,7 @@ pub struct SnapshotInfo {
     pub is_current: bool,
 }
 
-/// 保存会话快照：每轮工具执行后调用（上轮模型输出已入库、账本已派生）。
+/// 保存会话快照：轮前与收尾各调用一次（上轮模型输出已入库、账本已派生）。
 /// 快照 = 可见消息末端 rowid 锚点 + 当时账本 + 模型输出摘要；超限删最旧。
 /// 首轮（无任何执行痕迹）不保存——空会话快照无回溯意义。
 fn save_conversation_snapshot(
@@ -1407,6 +1412,21 @@ fn save_conversation_snapshot(
     // 未来分支，下一轮还会把这些未来待办注入模型上下文。始终写 JSON（空清单写 "[]"）。
     let todos_json = serde_json::to_string(&crate::agent::todo::get_with(conn, conversation_id))
         .map_err(|e| e.to_string())?;
+    // 同一锚点 + 同一账本 + 同一清单是同一个可回到的状态：轮前保存与收尾补存
+    // 都可能落在它上面（空轮、恢复后直接续跑），重复插入会让时间轴出现两条一样的检查点。
+    let duplicated: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM conversation_snapshots
+                 WHERE conversation_id = ?1 AND msg_rowid = ?2
+                   AND anchor_message_id IS ?3 AND ledger_json IS ?4 AND todos_json IS ?5)",
+            params![conversation_id, msg_rowid, anchor_message_id, ledger_json, todos_json],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if duplicated {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, anchor_message_id, label, ledger_json, todos_json, tool_count, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1433,6 +1453,25 @@ fn save_conversation_snapshot(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 收尾补存检查点：轮前快照只覆盖「本轮开始前」，任务完成后的最终回复没有锚点，
+/// 时间轴最新一条永远停在任务中途（纯问答甚至没有快照，时间轴为空）。
+/// 在收尾消息与账本都落库后调用，锚定最终回复并携带最终账本（完成态为 None）。
+fn save_final_snapshot(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    last_model_text: &str,
+    tool_count: usize,
+) {
+    let ledger = load_task_ledger_from(conn, conversation_id);
+    let _ = save_conversation_snapshot(
+        conn,
+        conversation_id,
+        ledger.as_ref(),
+        last_model_text,
+        tool_count,
+    );
 }
 
 /// 会话快照列表（时间轴，最新在前）；is_current 标记可见消息末端对应的快照
@@ -9061,6 +9100,16 @@ async fn finalize_run(inputs: FinalizeInputs<'_>) -> Result<(), ChatFlowError> {
             },
         )?;
     }
+    // 收尾检查点：消息与最终账本都落库后补一个锚定最终回复的快照，
+    // 时间轴才能回到「任务刚完成」的状态；快照是增值能力，失败不影响收尾。
+    if let Ok(conn) = state.0.lock() {
+        save_final_snapshot(
+            &conn,
+            conversation_id,
+            &round_state.last_model_text,
+            round_state.tool_runs.len(),
+        );
+    }
     Ok(())
 }
 
@@ -16335,6 +16384,74 @@ mod snapshot_tests {
             .query_row("SELECT COUNT(1) FROM conversation_snapshots", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, MAX_SNAPSHOTS_PER_CONVERSATION as i64);
+    }
+
+    #[test]
+    fn save_skips_duplicate_checkpoint_for_same_state() {
+        let conn = setup();
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "完成", 2);
+        let count = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT COUNT(1) FROM conversation_snapshots", [], |r| r.get(0))
+                .unwrap()
+        };
+        save_conversation_snapshot(&conn, "c1", None, "完成", 0).unwrap();
+        // 同一锚点 + 同一账本 + 同一清单：轮前与收尾重复落点只保留一条
+        save_conversation_snapshot(&conn, "c1", None, "完成", 0).unwrap();
+        assert_eq!(count(&conn), 1);
+        // 锚点前移后是新状态，必须新增检查点
+        insert_msg(&conn, "user", "继续", 3);
+        save_conversation_snapshot(&conn, "c1", None, "完成", 0).unwrap();
+        assert_eq!(count(&conn), 2);
+    }
+
+    #[test]
+    fn final_snapshot_anchors_latest_reply_with_persisted_ledger() {
+        let conn = setup();
+        insert_msg(&conn, "user", "做个任务", 1);
+        insert_msg(&conn, "tool", "build_project\nok", 2);
+        insert_msg(&conn, "assistant", "全部完成", 3);
+        // 未完成保留账本：收尾快照必须携带与库里一致的账本，续跑才能接上轨迹
+        let ledger = TaskLedger::from_tool_runs("做个任务", &[], "全部完成", 0);
+        let ledger_json = serde_json::to_string(&ledger).unwrap();
+        conn.execute(
+            "UPDATE conversations SET ledger = ?1 WHERE id = 'c1'",
+            params![ledger_json],
+        )
+        .unwrap();
+
+        save_final_snapshot(&conn, "c1", "全部完成", 1);
+
+        let (anchor_id, label, stored_ledger): (Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT anchor_message_id, label, ledger_json FROM conversation_snapshots WHERE conversation_id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(anchor_id.as_deref(), Some("m-3"), "收尾快照要落在最终回复上");
+        assert_eq!(label, "全部完成");
+        assert_eq!(stored_ledger.as_deref(), Some(ledger_json.as_str()));
+    }
+
+    #[test]
+    fn final_snapshot_for_completed_task_has_no_ledger() {
+        let conn = setup();
+        insert_msg(&conn, "user", "问题", 1);
+        insert_msg(&conn, "assistant", "答案", 2);
+
+        // 完成态账本已被清空：快照不能写回旧账本
+        save_final_snapshot(&conn, "c1", "答案", 0);
+
+        let (anchor_id, ledger_json): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT anchor_message_id, ledger_json FROM conversation_snapshots WHERE conversation_id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(anchor_id.as_deref(), Some("m-2"));
+        assert_eq!(ledger_json, None);
     }
 
     #[test]
