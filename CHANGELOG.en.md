@@ -6,6 +6,54 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 71: deleting the current conversation no longer leaves its view behind (2026-10-22)
+
+Scenario: after deleting the current conversation from the sidebar — especially the
+last one — the chat pane cleared only messages and streaming content. The queued
+bar, pending tool approvals, pending plan, task ledger, terminal entries, build
+logs, last-task summary, snapshots, feedback/version/token stats and diagnostic
+cards stayed on screen, and deleting the last conversation left a title for a
+conversation that no longer existed. When another window or a LAN client deleted a
+conversation, the `conversation-deleted` event reset only a subset of those fields,
+inconsistent with the full reset on project deletion. The delete action also read
+the current conversation to determine the project only after `await`; if the event
+listener cleared the selection first, the action returned early and the sidebar kept
+showing the deleted conversation.
+
+- Added `emptyConversationView()`: one complete empty state for the current
+  conversation view (messages, paging cursors, streaming content, tool/terminal/
+  build/sub-agent records, plan and approvals, todos, ask card, diagnostic cards,
+  queued messages, unfinished task, task summary, snapshots, feedback/version/token
+  stats);
+- Added `releaseConversationRuntime()`: releases the module-level per-conversation
+  caches (stream deltas, perf trace, optimistic message, tool-call dedupe sets and
+  terminal-run tombstones);
+- `conversation-deleted`, `project-deleted`, `conversations-cleared` and the
+  `deleteConversation` action now share both helpers; the latter two also clean
+  `pendingConfirmations` / `genStatus` / `taskLedgers`, which were previously missed;
+- The delete action snapshots the target conversation, its project and the
+  "is current" flag before calling the backend, so it can still refresh the sidebar
+  if the event arrives first; when the listener has already opened the next
+  conversation, the action only updates the list instead of clearing the view again;
+  if the list refresh fails after a successful delete, the conversation is removed
+  locally so it no longer lingers in the sidebar;
+- The second-click confirmation for deleting a conversation now states that running
+  tasks stop first, matching project deletion.
+
+### Verification
+
+Added 3 frontend vitest cases: `conversation-deleted` zeroes every view field after
+the current (last) conversation is deleted; `deleteConversation` resets the view and
+clears the per-conversation streaming bucket, pending confirmations, generation
+status and ledger after deleting the last conversation; and a failed list refresh
+still resets the view and removes the conversation locally. Rust full suite
+**1294/1294** (unchanged; no backend changes) · frontend vitest **245/245** (+3) ·
+`tsc` / `eslint` / clippy baseline 57/57 · i18n keys unchanged (2298, union 2300) ·
+all three i18n gates, 21 gate self-tests, `check-docs`, and the production build
+pass. Tool and migration counts are unchanged: `TOOL_SPECS` to **204**; database
+migration count reaches **86**.
+
+---
 ## Unreleased — Batch 70: deleting a project now stops its tasks and cleans conversation data (2026-10-22)
 
 Scenario: deleting a project relied on foreign-key cascades to remove conversations

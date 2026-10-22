@@ -133,6 +133,39 @@ export const emptyStreaming = (): StreamingState => ({
   toolRunning: 0,
 })
 
+/**
+ * 当前会话视图的空态：删除/清空当前会话后必须整体复位，避免旧排队项、
+ * 审批卡、计划、终端记录、快照与反馈统计挂到下一个会话上。
+ * 不含 streamings / pendingConfirmations / genStatus / taskLedgers ——
+ * 它们按 conversationId 聚合，由调用方精确清理对应键，不能误伤后台会话。
+ */
+export const emptyConversationView = () => ({
+  currentConversation: null,
+  messages: [],
+  olderHasMore: false,
+  loadingOlder: false,
+  streaming: emptyStreaming(),
+  toolRuns: [],
+  terminalEntries: [],
+  buildLogs: [],
+  agentRuns: [],
+  plan: null,
+  toolApprovals: [],
+  pendingPlan: null,
+  approvedPlan: null,
+  todos: [],
+  askCard: null,
+  diagnoseCards: [],
+  queuedList: [],
+  unfinishedConv: null,
+  lastTaskSummary: null,
+  snapshots: [],
+  loadingSnapshots: false,
+  feedbackMap: {},
+  versionMap: {},
+  tokenStats: null,
+})
+
 /** 会话/消息/流式/审批/计划切片实现（含全局事件监听注册，store 创建时执行一次） */
 export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (set, get) => {
   /**
@@ -168,6 +201,17 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         streaming: s.currentConversation ? streamings[s.currentConversation.id] ?? emptyStreaming() : emptyStreaming(),
       }
     })
+  }
+
+  /** 释放按会话维护的模块级运行缓存（流式增量、耗时追踪、乐观消息、工具去重墓碑）。 */
+  const releaseConversationRuntime = (conversationId: string) => {
+    pendingStreamDeltas.delete(conversationId)
+    sendTraces.get(conversationId)?.end()
+    sendTraces.delete(conversationId)
+    optimisticRunUserIds.delete(conversationId)
+    activeToolCallIds.delete(conversationId)
+    completedToolCallIds.delete(conversationId)
+    terminalRunIds.delete(conversationId)
   }
 
   /** 把一个或全部会话积攒的正文/思考增量一次性写入 Zustand。 */
@@ -662,31 +706,23 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     const state = get()
     const streamings = { ...state.streamings }
     delete streamings[conversation_id]
-    pendingStreamDeltas.delete(conversation_id)
-    const deletedTrace = sendTraces.get(conversation_id)
-    sendTraces.delete(conversation_id)
-    deletedTrace?.end()
+    releaseConversationRuntime(conversation_id)
     const pendingConfirmations = { ...state.pendingConfirmations }
     delete pendingConfirmations[conversation_id]
     const genStatus = { ...state.genStatus }
     delete genStatus[conversation_id]
+    const taskLedgers = { ...state.taskLedgers }
+    delete taskLedgers[conversation_id]
     if (state.currentConversation?.id === conversation_id) {
-      // 删除的是当前会话：清空视图，打开同项目第一个会话
+      // 删除的是当前会话：整体清空视图后，打开同项目第一个会话
       const remaining = state.conversations.filter((c) => c.id !== conversation_id)
       set({
+        ...emptyConversationView(),
         streamings,
         pendingConfirmations,
         genStatus,
+        taskLedgers,
         conversations: remaining,
-        currentConversation: null,
-        messages: [],
-        streaming: emptyStreaming(),
-        toolRuns: [],
-        agentRuns: [],
-        plan: null,
-        todos: [],
-        askCard: null,
-        unfinishedConv: null,
       })
       if (remaining.length > 0) {
         get().openConversation(remaining[0].id).catch(() => {})
@@ -696,6 +732,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         streamings,
         pendingConfirmations,
         genStatus,
+        taskLedgers,
         conversations: state.conversations.filter((c) => c.id !== conversation_id),
       })
     }
@@ -713,49 +750,20 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     const taskLedgers = { ...state.taskLedgers }
     for (const id of ids) {
       delete streamings[id]
-      pendingStreamDeltas.delete(id)
-      sendTraces.get(id)?.end()
-      sendTraces.delete(id)
+      releaseConversationRuntime(id)
       delete pendingConfirmations[id]
       delete genStatus[id]
       delete taskLedgers[id]
-      optimisticRunUserIds.delete(id)
-      activeToolCallIds.delete(id)
-      completedToolCallIds.delete(id)
-      terminalRunIds.delete(id)
     }
     const remaining = state.conversations.filter((c) => !ids.has(c.id))
     if (state.currentConversation && ids.has(state.currentConversation.id)) {
       set({
+        ...emptyConversationView(),
         streamings,
         pendingConfirmations,
         genStatus,
         taskLedgers,
         conversations: remaining,
-        currentConversation: null,
-        messages: [],
-        streaming: emptyStreaming(),
-        toolRuns: [],
-        terminalEntries: [],
-        buildLogs: [],
-        agentRuns: [],
-        plan: null,
-        toolApprovals: [],
-        pendingPlan: null,
-        approvedPlan: null,
-        todos: [],
-        askCard: null,
-        diagnoseCards: [],
-        queuedList: [],
-        unfinishedConv: null,
-        lastTaskSummary: null,
-        snapshots: [],
-        loadingSnapshots: false,
-        olderHasMore: false,
-        loadingOlder: false,
-        feedbackMap: {},
-        versionMap: {},
-        tokenStats: null,
       })
       if (remaining.length > 0) {
         get().openConversation(remaining[0].id).catch(() => {})
@@ -775,48 +783,20 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     const genStatus = { ...state.genStatus }
     for (const id of ids) {
       delete streamings[id]
-      pendingStreamDeltas.delete(id)
-      sendTraces.get(id)?.end()
-      sendTraces.delete(id)
+      releaseConversationRuntime(id)
       delete pendingConfirmations[id]
       delete genStatus[id]
-      optimisticRunUserIds.delete(id)
-      activeToolCallIds.delete(id)
-      completedToolCallIds.delete(id)
     }
     // 所有会话都已删除，按 run id 记录的游标/墓碑一并释放
     durableRunCursors.clear()
     terminalRunIds.clear()
     set({
+      ...emptyConversationView(),
       streamings,
       pendingConfirmations,
       genStatus,
       conversations: [],
-      currentConversation: null,
-      messages: [],
-      streaming: emptyStreaming(),
-      toolRuns: [],
-      terminalEntries: [],
-      buildLogs: [],
-      agentRuns: [],
-      plan: null,
-      toolApprovals: [],
-      pendingPlan: null,
-      approvedPlan: null,
-      todos: [],
-      askCard: null,
-      diagnoseCards: [],
       taskLedgers: {},
-      queuedList: [],
-      unfinishedConv: null,
-      lastTaskSummary: null,
-      snapshots: [],
-      loadingSnapshots: false,
-      olderHasMore: false,
-      loadingOlder: false,
-      feedbackMap: {},
-      versionMap: {},
-      tokenStats: null,
     })
   }).catch(() => {})
 
@@ -2381,25 +2361,56 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     },
 
     deleteConversation: async (id) => {
+      // 先快照目标与项目：删除成功后后端会广播 conversation-deleted，
+      // 监听器可能抢先清空 currentConversation，届时再读就拿不到项目和“是否当前会话”。
+      const before = get()
+      const target = before.conversations.find((c) => c.id === id)
+      const projectId = target?.project_id ?? before.currentConversation?.project_id ?? before.currentProject?.id
+      const isCurrent = before.currentConversation?.id === id
       await deleteConversationApi(id)
-      const projectId = get().currentConversation?.project_id
-      if (!projectId) return
-      const isCurrent = get().currentConversation?.id === id
-      const conversations = await listConversations(projectId)
-      // 流式分桶随会话清理（防泄漏；删除正在流式的会话由后端停止任务）
-      {
-        const streamings = { ...get().streamings }
-        delete streamings[id]
-        set({ streamings })
+      releaseConversationRuntime(id)
+      // 流式分桶/待确认/生成态/账本随会话清理（删除正在流式的会话由后端停止任务）
+      const streamings = { ...get().streamings }
+      delete streamings[id]
+      const pendingConfirmations = { ...get().pendingConfirmations }
+      delete pendingConfirmations[id]
+      const genStatus = { ...get().genStatus }
+      delete genStatus[id]
+      const taskLedgers = { ...get().taskLedgers }
+      delete taskLedgers[id]
+      if (!projectId) {
+        set({ streamings, pendingConfirmations, genStatus, taskLedgers })
+        return
+      }
+      // 删除已成功；列表刷新失败时至少本地移除，避免已删除会话继续挂在侧栏
+      let conversations = get().conversations.filter((c) => c.id !== id)
+      try {
+        conversations = await listConversations(projectId)
+      } catch {
+        // 保留本地过滤结果
+      }
+      // 后端广播的 conversation-deleted 可能先到：监听器已完成复位并打开下一个会话，
+      // 此时不能再整体清空，否则会把刚恢复的会话内容再闪掉一次。
+      const nowCurrent = get().currentConversation
+      if (isCurrent && nowCurrent && nowCurrent.id !== id) {
+        set({ conversations })
+        return
       }
       if (isCurrent) {
-        // 删除当前会话后自动打开第一个会话
-        set({ conversations, currentConversation: null, messages: [], streaming: emptyStreaming() })
+        // 删除当前会话后整体复位视图，再自动打开第一个剩余会话
+        set({
+          ...emptyConversationView(),
+          streamings,
+          pendingConfirmations,
+          genStatus,
+          taskLedgers,
+          conversations,
+        })
         if (conversations.length > 0) {
           await get().openConversation(conversations[0].id)
         }
       } else {
-        set({ conversations })
+        set({ streamings, pendingConfirmations, genStatus, taskLedgers, conversations })
       }
     },
 

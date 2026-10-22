@@ -102,7 +102,7 @@
     "newConversation": "新会话",
     "rename": "重命名",
     "deleteConversation": "删除会话（再次点击确认）",
-    "confirmDeleteConversation": "再次点击确认删除该会话全部消息",
+    "confirmDeleteConversation": "再次点击确认删除该会话全部消息（会先停止正在运行的任务）",
     "deleteProject": "删除项目（再次点击确认，磁盘文件将移入系统回收站）",
     "deleteProjectFail": "删除项目失败",
     "pinProject": "置顶项目（排序优先）",

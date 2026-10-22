@@ -102,7 +102,7 @@
     "newConversation": "New Chat",
     "rename": "Rename",
     "deleteConversation": "Delete conversation (click again to confirm)",
-    "confirmDeleteConversation": "Click again to confirm deleting all messages in this conversation",
+    "confirmDeleteConversation": "Click again to confirm deleting all messages in this conversation (running tasks stop first)",
     "deleteProject": "Delete project (click again to confirm; files move to system Recycle Bin/Trash)",
     "deleteProjectFail": "Failed to delete project",
     "pinProject": "Pin project (sorted first)",
