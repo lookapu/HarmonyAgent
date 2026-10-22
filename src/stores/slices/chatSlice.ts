@@ -38,13 +38,16 @@ import {
 import type { ChatMessage, TodoItem, PendingConfirmation, TaskLedger, ConversationBranchAnchor } from '../../api/project'
 import type { StateCreator } from 'zustand'
 import type {
+  AskCard,
   ChatSlice,
   DiagnoseCard,
   ImpactContract,
+  PendingPlan,
   ProjectState,
   StreamingState,
+  ToolApproval,
 } from '../projectStoreTypes'
-import { acceptsRunEvent, advancePlan, applyConsumedQueuedMessage, containsPersistedUserMessage, firstRunningIndex, reconcileRunUserMessage, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
+import { advancePlan, applyConsumedQueuedMessage, classifyRunEvent, containsPersistedUserMessage, firstRunningIndex, reconcileRunUserMessage, settleRunningRuns, toolRunFromExecutionStep, upsertMessageById } from './chatUtils'
 import { useGuardStore } from '../guardStore'
 import { startPerfTrace, waitForNextPaint } from '../../utils/perfTrace'
 import { setItem } from '../../utils/storage'
@@ -135,6 +138,7 @@ export const emptyStreaming = (): StreamingState => ({
   lastDeltaAt: null,
   lastHeartbeatAt: null,
   toolRunning: 0,
+  notice: null,
 })
 
 /**
@@ -201,6 +205,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             ? (prev?.lastDeltaAt ?? null)
             : (patch.lastDeltaAt !== undefined ? patch.lastDeltaAt : Date.now()),
           lastHeartbeatAt: patch.lastHeartbeatAt ?? prev?.lastHeartbeatAt ?? null,
+          // 出错即终态：「正在重试/正在续写」不能与错误卡并存（会让用户以为它还在努力）。
+          notice: isError ? null : (patch.notice !== undefined ? patch.notice : prev?.notice ?? null),
         }
       }
       return {
@@ -253,6 +259,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           content: bucket.content + delta.content,
           reasoning: bucket.reasoning + delta.reasoning,
           lastDeltaAt: now,
+          // 一旦有真实产出，「正在重试 / 正在续写 / 正在压缩」就不再成立，
+          // 必须立刻消失，否则旧提示会一直挂在新内容上方继续误导。
+          notice: null,
         }
         changed = true
       }
@@ -280,7 +289,13 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   const acceptsRun = (convId: string, runId?: string) => {
     const bucket = get().streamings[convId]
     if (!bucket) return false
-    return acceptsRunEvent(bucket.runId, runId)
+    const verdict = classifyRunEvent(bucket.runId, runId, terminalRunIds.get(convId))
+    if (verdict === 'reject') return false
+    // 握手前首包：发送时创建的乐观桶 runId 还是 null，后端 run-started 可能晚于
+    // 首个增量到达。此前这种事件被整包丢弃（首个 token 与预算预警一起丢），
+    // 这里就地把代次补绑到桶上，后续同代次事件与终态才能正确对齐。
+    if (verdict === 'bind' && runId) setBucket(convId, { runId })
+    return true
   }
 
   /**
@@ -391,7 +406,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       }
       if (isCurrent) {
         set({
-          toolRuns: [],
+          // 保留已完成/已失败的工具记录（此前整体清空，连做过什么都不剩），
+          // 只把卡在 running 的项收口——它们的执行者已经不会再回来了。
+          toolRuns: settleRunningRuns(s.toolRuns, '后端长时间无响应，工具结果未知'),
+          terminalEntries: settleRunningRuns(s.terminalEntries, '后端长时间无响应，工具结果未知'),
           agentRuns: [],
           // 超时停止：进度卡定档保留（展示已完成部分）
           plan: s.plan && s.plan.phase === 'running' ? { ...s.plan, phase: 'error' } : s.plan,
@@ -505,6 +523,23 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       startedAt: started_at || Date.now(),
       lastHeartbeatAt: Date.now(),
       lastDeltaAt: Date.now(),
+    })
+  }).catch(() => {})
+
+  // 非终态进度提示（重试 / 续写 / 压缩）：让「任务还在动」与「已经卡死」在界面上
+  // 可区分。载荷只带 kind 与计数，文案由前端按 i18n 渲染（后端不硬编码文案）。
+  // 下一次正文增量或终态事件都会清掉它，故这里只需覆盖写入。
+  listen<{
+    conversation_id: string
+    run_id?: string
+    kind: string
+    attempt?: number | null
+    total?: number | null
+  }>('chat-notice', (event) => {
+    const { conversation_id, run_id, kind, attempt, total } = event.payload
+    if (!acceptsRun(conversation_id, run_id)) return
+    setBucket(conversation_id, {
+      notice: { kind, attempt: attempt ?? null, total: total ?? null, at: Date.now() },
     })
   }).catch(() => {})
 
@@ -642,6 +677,15 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       }
     })()
     setBucket(conversation_id, null)
+    // 任务正常收尾时后端已执行 clear_pending_confirmations（等待者全部消失），
+    // 前端待确认表必须同步清空：否则侧栏「待确认」角标与切回恢复会一直挂着
+    // 无人应答的项，点开也没有任何响应。
+    set((s) => {
+      if (!s.pendingConfirmations[conversation_id]) return {}
+      const pendingConfirmations = { ...s.pendingConfirmations }
+      delete pendingConfirmations[conversation_id]
+      return { pendingConfirmations }
+    })
     // 结束发送性能追踪
     const sendTrace = sendTraces.get(conversation_id)
     if (sendTrace) {
@@ -684,6 +728,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         // 任务未完成（上限中止/用户停止/中途失败，有工具成果无最终总结）：
         // 保留"继续任务"按钮断点续跑；正常完成则清空
         unfinishedConv: unfinished ? { conversationId: conversation_id, runId: run_id } : null,
+        // 任务结束：提问卡已随后端收尾失效（等待者被清空）。此前这里只清审批与计划，
+        // 漏了 askCard，一旦后端因超时自行继续跑完，提问遮罩会永久盖住输入区。
+        askCard: null,
       })
     }
     // 刷新会话列表（标题/时间变化；保持搜索关键字过滤）。
@@ -906,6 +953,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           plan: state.plan && state.plan.phase === 'running' ? { ...state.plan, phase: 'error' } : state.plan,
           // 任务结束：挂起的提问卡无意义，一并关闭
           askCard: null,
+          // 仍标着「运行中」的工具卡已经没有等待者：「停止工具」随 isStreaming=false
+          // 一起隐藏，卡片会永久停在运行中。收口为失败并保留已产出的片段。
+          toolRuns: settleRunningRuns(state.toolRuns, '任务出错，工具未返回结果'),
+          terminalEntries: settleRunningRuns(state.terminalEntries, '任务出错，工具未返回结果'),
         })
       }
     },
@@ -984,6 +1035,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         unfinishedConv: unfinished ? { conversationId: conversation_id, runId: run_id } : state.unfinishedConv,
         // 停止任务：挂起的提问卡同步关闭（后端已关闭通道）
         askCard: null,
+        // 停止后「停止工具」按钮随 isStreaming=false 消失，仍在 running 的卡片
+        // 没有任何出口，只能等下次任务开始被清空——表现为「停了但还在转」。
+        toolRuns: settleRunningRuns(state.toolRuns, '任务已停止，工具未返回结果'),
+        terminalEntries: settleRunningRuns(state.terminalEntries, '任务已停止，工具未返回结果'),
       })
     }
   }).catch(() => {})
@@ -2309,18 +2364,62 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
             }
           }
         }
-        set((s) => ({
-          pendingConfirmations: map,
-          // 视图也以服务端为准：超时/强制中止后，已打开的审批弹窗与计划卡不能一直挂着。
-          // 不在快照里但查询期间新到的请求保留（见 knownBefore 的说明）。
-          toolApprovals: s.toolApprovals.filter(
-            (a) => ids.has(a.requestId) || !knownBefore.has(a.requestId),
-          ),
-          pendingPlan:
+        set((s) => {
+          // 回填：WebView 重载、或事件早于监听注册时，审批/提问/计划只存在于服务端快照里。
+          // 旧实现只做「删除失效项」，于是侧栏角标亮着、卡片却永远不出现，
+          // 后端还在那儿等满超时才静默拒绝。
+          const aliveApprovals = new Set(s.toolApprovals.map((a) => a.requestId))
+          const recoveredApprovals: ToolApproval[] = items
+            .filter((it) => it.kind === 'approval' && !aliveApprovals.has(it.request_id))
+            .map((it) => ({
+              requestId: it.request_id,
+              tool: it.tool ?? '',
+              args: it.args ?? '{}',
+              level: it.level ?? undefined,
+              desc: it.desc ?? undefined,
+              impact: it.impact ?? null,
+            }))
+          // 提问卡与计划卡只对当前会话展示，回填也只取当前会话的那一条
+          const currentId = s.currentConversation?.id
+          const servedAsk = currentId
+            ? items.find((it) => it.kind === 'ask' && it.conversation_id === currentId)
+            : undefined
+          const servedPlan = currentId
+            ? items.find((it) => it.kind === 'plan' && it.conversation_id === currentId)
+            : undefined
+          const keepAsk =
+            s.askCard && (ids.has(s.askCard.requestId) || !knownBefore.has(s.askCard.requestId))
+          const keepPlan =
             s.pendingPlan && (ids.has(s.pendingPlan.requestId) || !knownBefore.has(s.pendingPlan.requestId))
+          return {
+            pendingConfirmations: map,
+            // 视图也以服务端为准：超时/强制中止后，已打开的审批弹窗与计划卡不能一直挂着。
+            // 不在快照里但查询期间新到的请求保留（见 knownBefore 的说明）。
+            toolApprovals: [
+              ...s.toolApprovals.filter((a) => ids.has(a.requestId) || !knownBefore.has(a.requestId)),
+              ...recoveredApprovals,
+            ],
+            pendingPlan: keepPlan
               ? s.pendingPlan
-              : null,
-        }))
+              : servedPlan
+                ? ({
+                    requestId: servedPlan.request_id,
+                    conversationId: servedPlan.conversation_id,
+                    plan: servedPlan.plan ?? '',
+                  } satisfies PendingPlan)
+                : null,
+            askCard: keepAsk
+              ? s.askCard
+              : servedAsk
+                ? ({
+                    requestId: servedAsk.request_id,
+                    conversationId: servedAsk.conversation_id,
+                    question: servedAsk.question ?? '',
+                    options: servedAsk.options ?? [],
+                  } satisfies AskCard)
+                : null,
+          }
+        })
       } catch {
         // 后端不可用时保留旧数据
       }

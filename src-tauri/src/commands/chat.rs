@@ -237,6 +237,48 @@ pub struct ChatErrorEvent {
     pub status_code: Option<u16>,
 }
 
+/// 流式进行中的轻量进度提示（**非终态**）：重试、续写、压缩等「任务还在动，但暂时
+/// 没有新正文」的阶段。此前这些阶段只写任务日志，界面上就是无解释的转圈——用户
+/// 分不清「模型在思考」和「已经卡死」。前端渲染为居中小字，收到下一次正文增量或
+/// 终态事件时自动清除。
+///
+/// 只传 `kind` 与计数，文案由前端 i18n 渲染：把中文硬编码进载荷会让英文界面出现
+/// 中文提示，也无法被 i18n 键门禁覆盖。
+#[derive(Clone, Serialize)]
+pub struct ChatNoticeEvent {
+    pub conversation_id: String,
+    pub run_id: String,
+    /// stream_retry · continuation_interrupted · continuation_truncated · context_compact
+    pub kind: String,
+    /// 当前是第几次（从 1 计）；该 kind 不计数时省略
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<usize>,
+    /// 该 kind 的次数上限；该 kind 不计数时省略
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+}
+
+/// 发送一条非终态进度提示（失败静默：提示丢失不影响任务本身）。
+fn emit_chat_notice(
+    app: &AppHandle,
+    conversation_id: &str,
+    run_id: &str,
+    kind: &str,
+    attempt: Option<usize>,
+    total: Option<usize>,
+) {
+    let _ = app.emit(
+        "chat-notice",
+        ChatNoticeEvent {
+            conversation_id: conversation_id.to_string(),
+            run_id: run_id.to_string(),
+            kind: kind.to_string(),
+            attempt,
+            total,
+        },
+    );
+}
+
 /// 流式停止事件（用户点停止后推送，前端清空流式状态；部分内容已入库时会走 chat-done）
 #[derive(Clone, Serialize)]
 pub struct ChatStoppedEvent {
@@ -4105,6 +4147,24 @@ pub async fn stream_chat(
                 Some("任务执行线程异常退出"),
             );
         }
+        // panic 路径必须自己发终态事件：结构化 chat-error 在 stream_chat_body 里 emit，
+        // 而 panic 时 body 根本没执行到那一段。此前只有 invoke 的 reject 返回给发起方，
+        // 后台窗口、以及「用户切走再切回」的 WebView 都收不到终态，看门狗成了唯一兜底
+        // （要等 4~8 分钟）。任务已异常终止是确定事实，run_id 为空也要发，让前端立刻释放桶。
+        let _ = app.emit(
+            "chat-error",
+            ChatErrorEvent {
+                conversation_id: conversation_id.clone(),
+                run_id,
+                error: "任务执行异常终止（内部错误），本次任务已停止。请重试。".to_string(),
+                kind: "internal".to_string(),
+                title: "任务异常终止".to_string(),
+                reason: "任务执行线程异常退出（panic 或强制中止）".to_string(),
+                suggestion: "请重试；若反复出现，可在成本页导出诊断包反馈。".to_string(),
+                retryable: true,
+                status_code: None,
+            },
+        );
     }
     let idle_root = matches!(&result, Ok(Ok(())))
         .then(|| completed_conversation_root(&app, &conversation_id))
@@ -5787,6 +5847,9 @@ async fn assemble_round(inputs: AssembleInputs<'_>) -> Result<AssembleOutcome, C
     if assembled.compress {
         let old_limit = inputs.round_state.history_limit;
         inputs.round_state.history_limit = (inputs.round_state.history_limit / 2).max(MIN_HISTORY_KEEP);
+        // 摘要请求是非流式的、最长要跑 3×90s 且期间没有正文增量；不发提示就是
+        // 数分钟完全静默（`chat-context-warning` / `chat-compact` 前端都没订阅）。
+        emit_chat_notice(inputs.app, inputs.conversation_id, inputs.trace_id, "context_compact", None, None);
         let _ = inputs.app.emit(
             "chat-context-warning",
             serde_json::json!({
@@ -5980,24 +6043,37 @@ fn route_round_outcome(
             return Ok(RoundRoutingOutcome::Finish);
         }
         crate::agent::kernel_loop::KernelRoundControl::ReplayFrozen => {
+            let attempt = inputs.executor.round_counters().stream_replays;
             crate::utils::logger::log_event(
                 "stream_replay",
                 serde_json::json!({
                     "conversation_id": inputs.conversation_id,
-                    "attempt": inputs.executor.round_counters().stream_replays,
+                    "attempt": attempt,
                     "total": crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS,
                 }),
+            );
+            // 重放期间上游没有任何正文增量，界面只会静默转圈。明确告诉用户
+            // 「第几次、共几次」，让等待有解释（此前只有任务日志里有这件事）。
+            emit_chat_notice(
+                inputs.app,
+                inputs.conversation_id,
+                inputs.trace_id,
+                "stream_retry",
+                Some(attempt),
+                Some(crate::agent::kernel_loop::KERNEL_MAX_STREAM_REPLAYS),
             );
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::ContinueInterrupted { continuation_text: ct, reasoning_only } => {
             inputs.round_state.continuation_text = ct;
             inputs.round_state.continuation_reasoning_only = reasoning_only;
+            emit_chat_notice(inputs.app, inputs.conversation_id, inputs.trace_id, "continuation_interrupted", None, None);
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::ContinueTruncated { continuation_text: ct, reasoning_only } => {
             inputs.round_state.continuation_text = ct;
             inputs.round_state.continuation_reasoning_only = reasoning_only;
+            emit_chat_notice(inputs.app, inputs.conversation_id, inputs.trace_id, "continuation_truncated", None, None);
             return Ok(RoundRoutingOutcome::NextRound);
         }
         crate::agent::kernel_loop::KernelRoundControl::CorrectFakeCall { correction_text: ct, hint } => {
@@ -6222,6 +6298,9 @@ async fn request_round_outcome(
             let old_limit = inputs.round_state.history_limit;
             inputs.round_state.history_limit = (inputs.round_state.history_limit / 2).max(MIN_HISTORY_KEEP);
             inputs.stats.retry_count += 1;
+            // 超限恢复同样要跑一次非流式摘要请求，期间没有正文增量；
+            // 与主动压缩走同一个 notice，避免"重试了但界面什么都没说"。
+            emit_chat_notice(inputs.app, inputs.conversation_id, inputs.trace_id, "context_compact", None, None);
             let _ = inputs.app.emit(
                 "chat-context-warning",
                 serde_json::json!({
@@ -10310,6 +10389,10 @@ async fn stream_once(
     let mut tick_count: u64 = 0;
     let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<StreamParserEvent>();
+    // 解析线程把 usage / 原生 tool_calls 实时写进这个快照，主循环的 Done 超时兜底
+    // 据此保住「已经解析出来但还没发出」的工具调用。
+    let parse_progress = std::sync::Arc::new(std::sync::Mutex::new(StreamParseProgress::default()));
+    let parse_progress_thread = parse_progress.clone();
     let parse_state = state.0.clone();
     let parse_placeholder = placeholder.clone();
     let parse_conv = conversation_id.to_string();
@@ -10333,6 +10416,7 @@ async fn stream_once(
             parse_protocol,
             parse_placeholder,
             parse_rec_enabled,
+            parse_progress_thread,
         );
     });
 
@@ -10597,6 +10681,7 @@ async fn stream_once(
                 placeholder,
                 delivered_content,
                 delivered_reasoning,
+                &parse_progress,
             )
             .await
         }
@@ -10769,7 +10854,15 @@ async fn await_parse_done(
     placeholder: &mut Option<String>,
     delivered_content: String,
     delivered_reasoning: String,
+    progress: &std::sync::Mutex<StreamParseProgress>,
 ) -> Option<StreamParserEvent> {
+    // 解析线程已解析出的 usage / 工具调用（尚未通过 Done 送出）。
+    let progress_snapshot = || {
+        progress
+            .lock()
+            .map(|p| p.snapshot())
+            .unwrap_or((None, Vec::new()))
+    };
     // 从主循环已交付给前端的内容开始累积；收尾超时不能只保住队列尾部。
     let mut snapshot = (delivered_content, delivered_reasoning);
     let fut = async {
@@ -10783,12 +10876,14 @@ async fn await_parse_done(
                 Some(ev @ StreamParserEvent::Done { .. }) => return Some(ev),
                 Some(_) => {}
                 // 解析线程异常退出也要保住已展示内容，禁止后续持久化为空。
+                // usage / tool_calls 取实时快照：线程退出前可能已经解析出来了。
                 None => {
+                    let (usage, tool_calls) = progress_snapshot();
                     return Some(StreamParserEvent::Done {
                         text: snapshot.0.clone(),
                         reasoning: snapshot.1.clone(),
-                        usage: None,
-                        tool_calls: Vec::new(),
+                        usage,
+                        tool_calls,
                         rec_buf: None,
                         finished: false,
                         truncated: false,
@@ -10800,19 +10895,24 @@ async fn await_parse_done(
     match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
         Ok(r) => r,
         Err(_) => {
-            // 超时兜底：用快照组装伪 Done（usage/tool_calls/rec_buf 缺失，仅保正文）
+            // 超时兜底：正文用主循环快照，usage / tool_calls 用解析线程的实时快照。
+            // 早前这里把两者一起丢掉，导致「模型已经决定调工具、解析线程只是没来得及
+            // 发 Done」时，本轮被误判为无工具调用而提前收尾。
+            let (usage, tool_calls) = progress_snapshot();
             crate::utils::logger::log_event(
                 "stream_done_timeout",
                 serde_json::json!({
                     "chars": snapshot.0.chars().count(),
+                    "recovered_tool_calls": tool_calls.len(),
+                    "recovered_usage": usage.is_some(),
                     "note": "parse_thread_stuck_fallback_snapshot",
                 }),
             );
             Some(StreamParserEvent::Done {
                 text: snapshot.0,
                 reasoning: snapshot.1,
-                usage: None,
-                tool_calls: Vec::new(),
+                usage,
+                tool_calls,
                 rec_buf: None,
                 finished: false,
                 truncated: false,
@@ -10845,6 +10945,34 @@ enum StreamParserEvent {
     },
 }
 
+/// 解析线程的实时进度快照，供主循环在「等待 Done 超时」兜底时读取。
+///
+/// 只保住正文是不够的：解析线程可能已经把 `usage` 与原生 `tool_calls` 累积好，
+/// 只差发最后一个 Done。丢掉它们会让主循环误判「本轮没有工具调用」而提前收尾，
+/// 用户看到的就是「明明该动手，却只回了一句话」。
+#[derive(Default)]
+struct StreamParseProgress {
+    usage: Option<crate::agent::agent_kernel::KernelUsage>,
+    tool_calls: Vec<(String, String)>,
+}
+
+impl StreamParseProgress {
+    /// 从流式累积器刷新一次（解析线程每处理完一个块调用）。
+    fn refresh(&mut self, stream: &crate::agent::agent_kernel::KernelStreamAccumulator) {
+        self.usage = stream.usage();
+        self.tool_calls = stream
+            .finalized_tool_calls()
+            .into_iter()
+            .map(|call| (call.name, call.arguments))
+            .collect();
+    }
+
+    /// 取出可安全复制的副本（调用方持锁时调用，避免把锁带出作用域）。
+    fn snapshot(&self) -> (Option<crate::agent::agent_kernel::KernelUsage>, Vec<(String, String)>) {
+        (self.usage.clone(), self.tool_calls.clone())
+    }
+}
+
 /// 流式解析线程主体：独立 OS 线程承载全部同步解析（JSON 解析/增量提取/占位落库）。
 /// - 与 tokio worker 物理隔离：输入触发病理路径最坏烧满 1 核，worker/timer/停止/看门狗
 ///   全部不受影响（同步死循环无法被 abort 中断，线程化后不再钉死调度器）；
@@ -10860,6 +10988,7 @@ fn stream_parse_thread(
     protocol: String,
     mut placeholder: Option<String>,
     rec_enabled: bool,
+    progress: std::sync::Arc<std::sync::Mutex<StreamParseProgress>>,
 ) {
     // 行缓冲用原始字节累积：网络 chunk 边界可能切在多字节 UTF-8 字符中间，
     // 若逐 chunk 解码会产生 U+FFFD 替换符并永久写入消息，必须整行拼好后再统一解码。
@@ -11086,6 +11215,11 @@ fn stream_parse_thread(
             let _ = event_tx.send(StreamParserEvent::Reasoning(std::mem::take(
                 &mut reasoning_pending,
             )));
+        }
+        // 刷新进度快照：主循环若等不到 Done（解析线程被病态输入拖住），
+        // 兜底时还能拿到此刻已解析出的 usage 与工具调用。
+        if let Ok(mut snapshot) = progress.lock() {
+            snapshot.refresh(&kernel_stream);
         }
 
         if closed {

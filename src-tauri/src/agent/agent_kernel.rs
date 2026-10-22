@@ -766,7 +766,10 @@ impl KernelStreamGovernor {
 /// 停滞治理的共用策略默认值（与桌面 UI 流循环的 STREAM_SILENT_TIMEOUT /
 /// REASONING_ONLY_GRACE_SECS / STREAM_MAX_BYTES 语义一致；UI 切换到本组件后收敛于此）。
 pub const KERNEL_STREAM_SILENT_TIMEOUT: Duration = Duration::from_secs(60);
-pub const KERNEL_STREAM_REASONING_GRACE: Duration = Duration::from_secs(180);
+/// 只有 reasoning、没有正文时的总时长上限。原值 180s 在重放阶梯里会被乘成近 10 分钟
+/// 静默；120s 仍能覆盖复杂推理模型的首个思考段（实测常见的 60~100s），超过则判停滞
+/// 并走续写，损失可控——续写会带着已生成的 reasoning 继续。
+pub const KERNEL_STREAM_REASONING_GRACE: Duration = Duration::from_secs(120);
 pub const KERNEL_STREAM_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// OpenAI-compatible SSE 字节流行缓冲：跨 chunk 累积，按完整行提取 `data:` payload。

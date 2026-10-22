@@ -44,7 +44,60 @@ export function containsPersistedUserMessage(
 
 /** 运行代次匹配：无事件 ID 兼容旧后端；有 ID 时必须与当前任务一致。 */
 export function acceptsRunEvent(activeRunId: string | null | undefined, eventRunId?: string): boolean {
+  // 纯函数的判定口径保持不变：桶未握手（activeRunId 为空）时拒绝带代次的事件。
+  // 真正需要放行「握手前首包」的是 classifyRunEvent —— 它额外知道该代次是否
+  // 已经终态（墓碑），能在放行首包的同时拦住迟到的旧代次事件。
   return !eventRunId || activeRunId === eventRunId
+}
+
+/**
+ * 流式事件与桶代次的匹配结论。
+ * - `accept`：事件属于当前代次，或事件不带代次（旧后端/LAN 兼容）；
+ * - `bind`：桶尚未握手（发送时创建的乐观桶，`run-started` 还没到），
+ *   事件可作为首包接受，并由调用方就地把代次补绑到桶上；
+ * - `reject`：该代次已经终态，或桶已绑定其它代次。
+ */
+export type RunAcceptance = 'accept' | 'bind' | 'reject'
+
+export function classifyRunEvent(
+  activeRunId: string | null | undefined,
+  eventRunId: string | undefined,
+  terminalRunId: string | undefined,
+): RunAcceptance {
+  // 终态代次的迟到事件优先拦截：此时桶可能已被下一次发送重置成 runId=null，
+  // 单靠代次比较会把旧任务的尾包错误地当成本次首包。
+  if (eventRunId && terminalRunId === eventRunId) return 'reject'
+  if (acceptsRunEvent(activeRunId, eventRunId)) return 'accept'
+  if (activeRunId || !eventRunId) return 'reject'
+  return 'bind'
+}
+
+/** 可收口的工具运行记录（ToolRun / TerminalEntry 的最小公共形状）。 */
+interface SettleableRun {
+  status: 'running' | 'done' | 'error'
+  output?: string
+}
+
+/**
+ * 任务终止（停止 / 出错 / 看门狗判死）时把仍标记为 `running` 的工具卡收口。
+ *
+ * 停止按钮与「停止工具」入口都随 `isStreaming=false` 一起消失，若卡片继续显示
+ * 「运行中」，用户既拿不到结果、也没有任何入口去结束它，只能等下一次任务开始时
+ * 被整体清空——期间一直表现为「卡住」。已完成/已失败的记录原样保留，便于回看
+ * 这一步到底做了什么。
+ */
+export function settleRunningRuns<T extends SettleableRun>(runs: T[], note: string): T[] {
+  let changed = false
+  const next = runs.map((run) => {
+    if (run.status !== 'running') return run
+    changed = true
+    return {
+      ...run,
+      status: 'error' as T['status'],
+      output: run.output?.trim() ? run.output : note,
+    }
+  })
+  return changed ? next : runs
 }
 
 /** 把一次运行对应的用户消息收敛到已入库/已执行状态。

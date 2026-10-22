@@ -239,6 +239,13 @@ const writeDraftMap = (pid: string, m: Record<string, string>) => {
   else setJSON(STORAGE_KEYS.DRAFTS_PREFIX + pid, cleaned)
 }
 
+/**
+ * 程序滚动抑制窗口（ms）：`scrollTo` 本身会派发 scroll 事件，而虚拟列表测量收敛
+ * 前的那一帧往往算出「离底部 >120px」。不忽略这段时间，自动贴底会被自己的滚动
+ * 事件判成「用户上滑」而永久关闭。
+ */
+const SCROLL_IGNORE_MS = 120
+
 /** 稳定的短 ID 格式化函数：作为 MessageItem prop 时不因 Home 重渲染改变引用。 */
 const shortId = (id: string) => id.slice(0, 8)
 
@@ -799,6 +806,12 @@ export default function Home() {
   const [modelOptions, setModelOptions] = useState<ChatOptions>(() =>
     getJSON<ChatOptions>(STORAGE_KEYS.CHAT_OPTIONS, {}),
   )
+  /**
+   * `/plan` 的一次性计划模式：只对本条消息生效。
+   * 早前它直接写进全局 `modelOptions.plan_mode` 并持久化到 localStorage，此后**每条**
+   * 消息都要人工批准计划，而开关藏在模型设置里，用户很容易把它当成「任务卡死了」。
+   */
+  const [oncePlanMode, setOncePlanMode] = useState(false)
   const [planFeedback, setPlanFeedback] = useState('')
   // 工具审批弹窗：选择记忆范围（空=仅本次；session=本会话免审；project=本项目持久化免审）；拒绝理由反馈给模型
   const [approvalScope, setApprovalScope] = useState<'' | 'session' | 'project'>('')
@@ -808,6 +821,12 @@ export default function Home() {
   useEffect(() => {
     setApprovalScope('')
     setApprovalFeedback('')
+  }, [firstApprovalRequestId])
+  // 审批/提问的收起态：两者不再是全屏遮罩，收起后各留一条窄条（Esc 也能收起）。
+  // 新请求到来时必须自动展开——「我现在不想看」不等于「以后都不用看」。
+  const [approvalCollapsed, setApprovalCollapsed] = useState(false)
+  useEffect(() => {
+    if (firstApprovalRequestId) setApprovalCollapsed(false)
   }, [firstApprovalRequestId])
   // 工具风险分级展示：L0 只读=绿 / L1 写入=橙 / L2 危险=红
   const approvalRisk = (tool: string, authoritativeLevel?: string): { label: string; cls: string } => {
@@ -832,11 +851,37 @@ export default function Home() {
       setPlanFeedback('')
     }
   }, [pendingPlan])
-  // Agent 提问卡：新问题到来时重置回答输入
+  // Agent 提问卡：新问题到来时重置回答输入并展开（收起只是暂时避开，不是忽略）
   const [askAnswer, setAskAnswer] = useState('')
+  const [askCollapsed, setAskCollapsed] = useState(false)
   useEffect(() => {
-    if (askCard) setAskAnswer('')
+    if (askCard) {
+      setAskAnswer('')
+      setAskCollapsed(false)
+    }
   }, [askCard])
+  // Esc 收起待处理卡片。它们不再是全屏遮罩，也就没有「点空白处关闭」这种出口，
+  // 键盘必须有一个：这里只是收起（窄条还在、随时可展开），不是取消请求。
+  // 已经 preventDefault 的 Esc（输入框的斜杠/@ 候选面板）不抢，靠 defaultPrevented 让路。
+  useEffect(() => {
+    if (!askCard && toolApprovals.length === 0) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return
+      if (askCard) setAskCollapsed(true)
+      if (toolApprovals.length > 0) setApprovalCollapsed(true)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [askCard, toolApprovals.length])
+  /**
+   * 待你处理的总项数（侧栏角标）。取「当前会话待确认项」与「审批实时队列」的较大值——
+   * 两者有重叠（后端恢复路径也会把审批算进 pendingConfirmations），相加会重复计数。
+   * 卡片收起后若没有任何常驻指示，用户会以为「没东西等我」而一直干等。
+   */
+  const pendingAttention = Math.max(
+    currentConversation ? (pendingConfirmations[currentConversation.id]?.length ?? 0) : 0,
+    toolApprovals.length,
+  )
   // 上下文可视条：消息数 + 摘要状态 + token 预算占用（切换会话/收到新消息后刷新）
   const [ctxInfo, setCtxInfo] = useState<ConversationContextInfo | null>(null)
   const [ctxV2Detail, setCtxV2Detail] = useState<ConversationContextV2 | null>(null)
@@ -1502,6 +1547,13 @@ export default function Home() {
   // 智能贴底：流式输出期间，仅当用户已在底部附近时才自动跟随；用户上滑查看历史时不打断
   const scrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  /**
+   * 程序滚动抑制窗口（ms）：`scrollTo` 自己也会派发 scroll 事件，虚拟列表测量
+   * 收敛前的那一帧很容易算出「离底部 >120px」，于是被当成用户上滑，把跟随永久
+   * 关掉——流式输出从此跑出可视区。在这个窗口内 handleScroll 只同步位置记录，
+   * 不改贴底状态。
+   */
+  const ignoreScrollUntilRef = useRef(0)
   /** 会话切换标记：切换后首次内容落地时恢复该会话上次滚动位置（无记录则直跳底部，无动画） */
   const switchPendingRef = useRef(false)
   /** 滚动位置恢复流程进行中：恢复内部会按需加载旧页（触发 messages 变化），此标志抑制 effect 重复介入 */
@@ -1586,6 +1638,7 @@ export default function Home() {
     if (!el) return
     // low tier（软件渲染/无 GPU）禁用 smooth 动画，减少主线程合成压力
     const useSmooth = smooth && smoothScrollEnabled
+    ignoreScrollUntilRef.current = Date.now() + SCROLL_IGNORE_MS
     el.scrollTo({ top: el.scrollHeight, behavior: useSmooth ? 'smooth' : 'auto' })
     stickToBottomRef.current = true
     setShowScrollBottom(false)
@@ -1816,11 +1869,15 @@ export default function Home() {
     const el = scrollRef.current
     if (!el) return
     const near = isNearBottom()
-    stickToBottomRef.current = near
-    // showScrollBottom 仅在底部可见性切换时更新，避免每次滚动都触发全量重渲染
-    if (near !== showScrollBottomRef.current) {
-      showScrollBottomRef.current = near
-      setShowScrollBottom(!near)
+    // 程序滚动窗口内不判定贴底：自动贴底自身派发的 scroll 事件不代表用户意图，
+    // 用它的位置去改 stickToBottom 会让跟随被自己关掉。
+    if (Date.now() >= ignoreScrollUntilRef.current) {
+      stickToBottomRef.current = near
+      // showScrollBottom 仅在底部可见性切换时更新，避免每次滚动都触发全量重渲染
+      if (near !== showScrollBottomRef.current) {
+        showScrollBottomRef.current = near
+        setShowScrollBottom(!near)
+      }
     }
     // 记录当前会话滚动位置（切走后再切回时恢复）：记录视口顶部消息 id 作为锚点，
     // 分页场景下恢复时按锚点加载旧页后精确定位
@@ -1889,7 +1946,12 @@ export default function Home() {
           streamScrollRafRef.current = null
           if (!streamScrollActiveRef.current || !stickToBottomRef.current) return
           const el = scrollRef.current
-          if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
+          // 仅在实际没贴底时滚动：每帧无条件 scrollTo 会在 low tier（软件渲染）
+          // 上持续触发合成，也制造大量无用 scroll 事件。
+          if (el && el.scrollHeight - el.scrollTop - el.clientHeight > 1) {
+            ignoreScrollUntilRef.current = Date.now() + SCROLL_IGNORE_MS
+            el.scrollTo({ top: el.scrollHeight, behavior: 'auto' })
+          }
           streamScrollRafRef.current = requestAnimationFrame(loop)
         }
         streamScrollRafRef.current = requestAnimationFrame(loop)
@@ -2580,8 +2642,9 @@ export default function Home() {
     }
     setSlashCandidates(null)
     if (cmd.action === 'plan') {
-      // /plan：开启计划模式（Agent 先出计划，批准后才执行工具），并提示用户
-      updateModelOptions({ ...modelOptions, plan_mode: true })
+      // /plan：本条消息进入计划模式（Agent 先出计划，批准后才执行工具）。
+      // 一次性生效，不写全局选项——否则之后的每条消息都会被计划门拦住。
+      setOncePlanMode(true)
     }
     if (cmd.action === 'compact') {
       // /compact：手动压缩历史为摘要（后台完成后提示）
@@ -2657,6 +2720,7 @@ export default function Home() {
     setSlashCandidates(null)
     setPendingQuote(null)
     if (isStreaming) {
+      // 排队消息不带 options（由队列逐条消费），一次性计划模式保留到下一条即时消息
       queueUserMessage(text, false, refs.length ? refs : undefined, imgs.length ? imgs : undefined).catch((e) => {
         // 排队落库失败时不能吞掉用户输入；完整恢复编辑器或写回原会话草稿。
         restoreComposerInput(targetConversation.id, projectId, text, selectedRefs, quote, imgs)
@@ -2667,7 +2731,10 @@ export default function Home() {
         })
       })
     } else {
-      const delivered = await sendUserMessage(text, modelOptions, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
+      // 一次性计划模式：并入本次请求后立刻复位，不污染后续消息
+      const sendOptions = oncePlanMode ? { ...modelOptions, plan_mode: true } : modelOptions
+      if (oncePlanMode) setOncePlanMode(false)
+      const delivered = await sendUserMessage(text, sendOptions, refs.length ? refs : undefined, imgs.length ? imgs : undefined)
       if (!delivered) {
         // 没接手（同会话恰好开始流式，或用户消息未入库）：把输入还给用户，避免静默丢失
         restoreComposerInput(targetConversation.id, projectId, text, selectedRefs, quote, imgs)
@@ -4091,7 +4158,8 @@ export default function Home() {
           inputRef.current?.focus()
           break
         case 'slash_plan':
-          updateModelOptions({ ...modelOptions, plan_mode: true })
+          // 与输入框 /plan 同一语义：一次性生效，不改全局选项
+          setOncePlanMode(true)
           setDraft(t('home.slashPlanPrompt'))
           inputRef.current?.focus()
           break
@@ -4183,13 +4251,31 @@ export default function Home() {
         >
         {/* Logo */}
         <div className={`h-14 shrink-0 flex items-center gap-2.5 ${sidebarCollapsed ? 'justify-center px-2' : 'px-4'}`}>
-          <div className="w-8 h-8 rounded-[10px] bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shadow-lg shadow-[var(--accent)]/25 shrink-0">
+          <div className="relative w-8 h-8 rounded-[10px] bg-gradient-to-br from-[var(--accent)] to-[#8b5cf6] flex items-center justify-center shadow-lg shadow-[var(--accent)]/25 shrink-0">
             <Icon name="bolt" size={17} white />
+            {/* 折叠态角标退化为红点，位置贴在图标右上 */}
+            {pendingAttention > 0 && sidebarCollapsed && (
+              <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-[var(--warning)] ring-2 ring-[var(--bg-secondary)]" />
+            )}
           </div>
           <div className={`min-w-0 leading-tight ${sidebarCollapsed ? 'hidden' : ''}`}>
             <div className="text-[length:var(--app-text-md)] font-semibold tracking-wide">DevEco Switch</div>
             <div className="text-[length:var(--app-text-2xs)] text-[var(--text-muted)]">Agent Workspace</div>
           </div>
+          {/* 待处理角标：收起卡片后这是唯一常驻的「有事等你」信号，点击直接展开 */}
+          {pendingAttention > 0 && !sidebarCollapsed && (
+            <button
+              type="button"
+              onClick={() => {
+                setAskCollapsed(false)
+                setApprovalCollapsed(false)
+              }}
+              title={t('home.pendingBadgeHint')}
+              className="ml-auto shrink-0 rounded-md bg-[var(--warning)]/15 px-1.5 py-0.5 text-[length:var(--app-text-2xs)] font-medium tabular-nums text-[var(--warning)] transition-colors hover:bg-[var(--warning)]/25"
+            >
+              {t('home.pendingBadge', { count: pendingAttention })}
+            </button>
+          )}
         </div>
 
         {/* 添加项目 */}
@@ -6192,6 +6278,21 @@ export default function Home() {
                 })}
               </div>
             )}
+            {/* 一次性计划模式的可见标记：不显示的话，用户只会在发送后被计划门拦住，
+                却不知道请求是从哪儿来的（这正是它以前「像卡死」的原因）。 */}
+            {oncePlanMode && (
+              <div className="flex items-center gap-1.5 px-1 pb-1 text-[length:var(--app-text-2xs)] text-[var(--warning)]">
+                <Icon name="lightbulb" size={10} />
+                <span>{t('home.oncePlanMode')}</span>
+                <button
+                  type="button"
+                  onClick={() => setOncePlanMode(false)}
+                  className="underline transition-colors hover:text-[var(--text-primary)] hover:no-underline"
+                >
+                  {t('home.oncePlanModeCancel')}
+                </button>
+              </div>
+            )}
             <textarea
               ref={inputRef}
               value={draft}
@@ -7244,13 +7345,33 @@ export default function Home() {
 
 
       {/* ============ Agent 提问卡（ask_user 工具，自由文本回答闭环） ============ */}
+      {/* 曾经是 fixed inset-0 遮罩：盖住停止按钮与侧栏，且没有 Esc、没有关闭入口，
+          队列里只显示首项。现在改成不阻塞的悬浮卡（与诊断卡同一视觉语言）：
+          收起后留一条「等你回答」的窄条，随时可展开，Esc 即可收起。 */}
       {askCard && askCard.conversationId === currentConversation?.id && (
-        <div className="fixed inset-0 z-[var(--app-z-modal-blocking)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-          <div className="w-[480px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
+        <div className="fixed bottom-4 right-4 z-[var(--app-z-overlay)] flex w-[420px] max-w-[92vw] flex-col items-end gap-2">
+          {askCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setAskCollapsed(false)}
+              className="flex h-9 items-center gap-2 rounded-xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)]/95 px-3 text-[length:var(--app-text-xs)] text-[var(--accent)] shadow-lg backdrop-blur transition-colors hover:bg-[var(--bg-hover)]"
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--accent)]" />
+              <Icon name="headphones" size={13} />
+              {t('home.askCollapsed')}
+            </button>
+          ) : (
+          <div className="max-h-[70vh] w-full overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)]/95 p-4 shadow-2xl backdrop-blur animate-modal-in">
             <div className="flex items-center gap-2">
               <Icon name="headphones" size={14} className="text-[var(--accent)] shrink-0" />
               <span className="text-[length:var(--app-text-md)] font-semibold">{t('home.askTitle')}</span>
               <span className="text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] font-mono ml-auto">ask_user</span>
+              <IconButton
+                icon="close"
+                label={t('home.pendingCollapse')}
+                iconSize={12}
+                onClick={() => setAskCollapsed(true)}
+              />
             </div>
             <div className="mt-3 text-[length:var(--app-text-md)] leading-relaxed whitespace-pre-wrap break-words">{askCard.question}</div>
             {askCard.options.length > 0 && (
@@ -7293,6 +7414,7 @@ export default function Home() {
               </Button>
             </div>
           </div>
+          )}
         </div>
       )}
 
@@ -7300,12 +7422,34 @@ export default function Home() {
       {toolApprovals.length > 0 && (() => {
         const risk = approvalRisk(toolApprovals[0].tool, toolApprovals[0].level)
         return (
-        <div className="fixed inset-0 z-[var(--app-z-modal-blocking)] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
-          <div className="w-[460px] max-w-[92vw] rounded-2xl border border-[var(--border)] bg-[var(--bg-secondary)] shadow-2xl p-4 animate-modal-in">
+        <div className="fixed bottom-4 right-4 z-[var(--app-z-overlay)] flex w-[460px] max-w-[92vw] flex-col items-end gap-2">
+          {approvalCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setApprovalCollapsed(false)}
+              className="flex h-9 items-center gap-2 rounded-xl border border-[var(--warning)]/40 bg-[var(--bg-elevated)]/95 px-3 text-[length:var(--app-text-xs)] text-[var(--warning)] shadow-lg backdrop-blur transition-colors hover:bg-[var(--bg-hover)]"
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--warning)]" />
+              <Icon name="check" size={13} />
+              {t('home.approvalCollapsed', { count: toolApprovals.length })}
+            </button>
+          ) : (
+          <div className="max-h-[70vh] w-full overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)]/95 p-4 shadow-2xl backdrop-blur animate-modal-in">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-[var(--warning)] animate-pulse" />
               <span className="text-[length:var(--app-text-md)] font-semibold">{t('home.toolApprovalTitle')}</span>
+              {toolApprovals.length > 1 && (
+                <span className="text-[length:var(--app-text-2xs)] tabular-nums text-[var(--text-muted)]">
+                  {t('home.approvalQueueCount', { total: toolApprovals.length })}
+                </span>
+              )}
               <span className={`text-[length:var(--app-text-2xs)] px-2 py-0.5 rounded-md font-medium ml-auto ${risk.cls}`}>{risk.label}</span>
+              <IconButton
+                icon="close"
+                label={t('home.pendingCollapse')}
+                iconSize={12}
+                onClick={() => setApprovalCollapsed(true)}
+              />
             </div>
             <div className="mt-3 space-y-2">
               <div className="flex items-center gap-2">
@@ -7390,7 +7534,22 @@ export default function Home() {
                 {t('home.whitelistManage')}
               </button>
             </div>
-            <div className="flex items-center justify-end gap-2 mt-4">
+            <div className="flex items-center gap-2 mt-4">
+              {toolApprovals.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    // 会话级批量放行：逐条按「本会话允许」答复。逐条发而不是新造批量 IPC——
+                    // 审批通道是一条请求一个 oneshot 答复，批量接口会与既有的取消/超时语义打架。
+                    for (const item of [...toolApprovals]) {
+                      void resolveToolApproval(item.requestId, true, true, undefined, 'session')
+                    }
+                  }}
+                  className="mr-auto h-8 rounded-lg px-2 text-[length:var(--app-text-xs)] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--accent)]"
+                >
+                  {t('home.approvalAllowAllSession', { count: toolApprovals.length })}
+                </button>
+              )}
               <Button
                 variant="danger"
                 size="md"
@@ -7407,6 +7566,7 @@ export default function Home() {
               </Button>
             </div>
           </div>
+          )}
         </div>
         )
       })()}

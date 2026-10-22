@@ -55,6 +55,21 @@ export interface StreamingState {
   lastHeartbeatAt: number | null
   /** 该会话运行中工具数（chat-tool-start +1 / chat-tool-done -1；看门狗巡检不误杀执行中任务） */
   toolRunning: number
+  /** 非终态进度提示（重试 / 续写 / 压缩）。有正文增量或进入终态时清空，
+   *  让「还在动」与「已卡死」在界面上可区分。文案由前端按 kind 走 i18n。 */
+  notice: StreamingNotice | null
+}
+
+/** 后端 `chat-notice` 事件载荷（文案不硬编码在事件里，由前端 i18n 渲染）。 */
+export interface StreamingNotice {
+  /** stream_retry · continuation_interrupted · continuation_truncated · context_compact */
+  kind: string
+  /** 当前第几次（从 1 计）；不计数时为 null */
+  attempt: number | null
+  /** 该 kind 的次数上限；不计数时为 null */
+  total: number | null
+  /** 收到提示的时间戳（ms），用于按会话展示与去重 */
+  at: number
 }
 
 /** 结构化友好错误（对应后端 errors::FriendlyError） */

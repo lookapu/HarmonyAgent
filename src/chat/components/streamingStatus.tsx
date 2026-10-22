@@ -1,7 +1,7 @@
 import { memo, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useShallow } from 'zustand/react/shallow'
-import { useProjectStore, type AgentRun, type ToolRun } from '../../stores/projectStore'
+import { useProjectStore, type AgentRun, type StreamingNotice, type ToolRun } from '../../stores/projectStore'
 import Icon from '../../icons/Icon'
 import { fmtElapsed } from '../chatUtils'
 import { StreamingMessage } from './messageBlocks'
@@ -144,12 +144,13 @@ export const SilentStreamHint = memo(function SilentStreamHint({
   active: boolean
 }) {
   const { t } = useTranslation()
-  const { startedAt, lastDeltaAt, remediationCount, remediationBlockers } = useProjectStore(
+  const { startedAt, lastDeltaAt, notice, remediationCount, remediationBlockers } = useProjectStore(
     useShallow((state) => {
       const bucket = conversationId ? state.streamings[conversationId] : undefined
       return {
         startedAt: bucket?.startedAt ?? null,
         lastDeltaAt: bucket?.lastDeltaAt ?? null,
+        notice: bucket?.notice ?? null,
         remediationCount: bucket?.remediationCount ?? 0,
         remediationBlockers: bucket?.remediationBlockers ?? EMPTY_BLOCKERS,
       }
@@ -187,6 +188,17 @@ export const SilentStreamHint = memo(function SilentStreamHint({
       </div>
     )
   }
+  // 后端明确告知的「正在重试 / 续写 / 压缩」优先于按时间推断的静默提示：
+  // 前者知道自己在等什么，后者只能猜。没有对应 kind 时退回静默提示。
+  const noticeText = describeNotice(t, notice)
+  if (noticeText) {
+    return (
+      <div className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--accent)]">
+        <Icon name="spark" size={12} />
+        <span className="animate-pulse">{noticeText}</span>
+      </div>
+    )
+  }
   if (silentSeconds < 15) return null
   return (
     <div className="flex items-center gap-2 text-[length:var(--app-text-xs)] text-[var(--text-muted)] animate-pulse">
@@ -195,3 +207,26 @@ export const SilentStreamHint = memo(function SilentStreamHint({
     </div>
   )
 })
+
+/** 把后端进度提示的 kind 翻成当前语言文案；未知 kind 返回空串（不渲染）。 */
+function describeNotice(
+  t: ReturnType<typeof useTranslation>['t'],
+  notice: StreamingNotice | null,
+): string {
+  if (!notice) return ''
+  switch (notice.kind) {
+    case 'stream_retry':
+      // attempt/total 都缺省时退回不带计数的文案，避免出现「第 null 次」。
+      return notice.attempt && notice.total
+        ? t('home.noticeStreamRetry', { attempt: notice.attempt, total: notice.total })
+        : t('home.noticeStreamRetryPlain')
+    case 'continuation_interrupted':
+      return t('home.noticeContinuationInterrupted')
+    case 'continuation_truncated':
+      return t('home.noticeContinuationTruncated')
+    case 'context_compact':
+      return t('home.noticeContextCompact')
+    default:
+      return ''
+  }
+}

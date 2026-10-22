@@ -309,10 +309,11 @@ describe('pending confirmations sync', () => {
       pendingConfirmations: {},
       toolApprovals: [],
       pendingPlan: null,
+      askCard: null,
     })
   })
 
-  it('服务端已无记录时关闭失效的审批弹窗与计划卡', async () => {
+  it('服务端快照既关闭失效项、也回填前端缺失的审批', async () => {
     useProjectStore.setState({
       pendingConfirmations: {
         c1: [{ conversation_id: 'c1', kind: 'approval', request_id: 'stale' } as never],
@@ -320,15 +321,46 @@ describe('pending confirmations sync', () => {
       toolApprovals: [{ requestId: 'stale', tool: 'run_command' } as never],
       pendingPlan: { requestId: 'stale-plan', conversationId: 'c1', plan: 'x' } as never,
     })
-    const live = { conversation_id: 'c1', kind: 'approval', request_id: 'live' } as never
+    const live = {
+      conversation_id: 'c1',
+      kind: 'approval',
+      request_id: 'live',
+      tool: 'run_command',
+      args: '{"cmd":"ls"}',
+      level: 'L2',
+      desc: '执行命令',
+    } as never
     vi.mocked(listPendingConfirmations).mockResolvedValue([live])
 
     await useProjectStore.getState().refreshPendingConfirmations()
 
     const state = useProjectStore.getState()
-    expect(state.toolApprovals).toEqual([])
+    // 失效项消失；服务端仍挂着的审批被回填。
+    // 旧实现只删不补 ⇒ 侧栏角标亮着、卡片永远不出现，后端却在等超时。
+    expect(state.toolApprovals.map((a) => a.requestId)).toEqual(['live'])
+    expect(state.toolApprovals[0]).toMatchObject({ tool: 'run_command', level: 'L2' })
     expect(state.pendingPlan).toBeNull()
     expect(state.pendingConfirmations).toEqual({ c1: [live] })
+  })
+
+  it('WebView 重载后按服务端快照回填提问卡', async () => {
+    const ask = {
+      conversation_id: 'c1',
+      kind: 'ask',
+      request_id: 'ask-1',
+      question: '要部署到哪台设备？',
+      options: ['真机', '模拟器'],
+    } as never
+    vi.mocked(listPendingConfirmations).mockResolvedValue([ask])
+
+    await useProjectStore.getState().refreshPendingConfirmations()
+
+    expect(useProjectStore.getState().askCard).toMatchObject({
+      requestId: 'ask-1',
+      conversationId: 'c1',
+      question: '要部署到哪台设备？',
+      options: ['真机', '模拟器'],
+    })
   })
 
   it('同步途中新到达的确认项不被旧快照关闭', async () => {

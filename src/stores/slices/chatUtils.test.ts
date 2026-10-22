@@ -6,7 +6,9 @@ import {
   escapeHtml,
   toHtml,
   acceptsRunEvent,
+  classifyRunEvent,
   containsPersistedUserMessage,
+  settleRunningRuns,
   firstRunningIndex,
   reconcileRunUserMessage,
   upsertMessageById,
@@ -73,6 +75,54 @@ describe('acceptsRunEvent', () => {
   it('握手前拒绝带代次事件，同时兼容旧后端无代次事件', () => {
     expect(acceptsRunEvent(null, 'run-new')).toBe(false)
     expect(acceptsRunEvent('run-new')).toBe(true)
+  })
+})
+
+describe('settleRunningRuns', () => {
+  it('只收口 running 项，已完成/已失败的记录原样保留', () => {
+    const runs = [
+      { id: 'a', status: 'running' as const, output: '' },
+      { id: 'b', status: 'done' as const, output: 'ok' },
+      { id: 'c', status: 'error' as const, output: 'boom' },
+    ]
+    const next = settleRunningRuns(runs, '任务已停止')
+    expect(next[0]).toMatchObject({ status: 'error', output: '任务已停止' })
+    expect(next[1]).toEqual(runs[1])
+    expect(next[2]).toEqual(runs[2])
+  })
+
+  it('已产出部分输出时不覆盖，保留现场', () => {
+    const runs = [{ id: 'a', status: 'running' as const, output: 'compiling...' }]
+    expect(settleRunningRuns(runs, '任务已停止')[0]).toMatchObject({
+      status: 'error',
+      output: 'compiling...',
+    })
+  })
+
+  it('没有 running 项时返回原数组引用，避免无谓重渲染', () => {
+    const runs = [{ id: 'a', status: 'done' as const, output: 'ok' }]
+    expect(settleRunningRuns(runs, 'x')).toBe(runs)
+  })
+})
+
+describe('classifyRunEvent', () => {
+  it('已终态代次的迟到事件一律拒绝，即使桶已被下一次发送重置', () => {
+    expect(classifyRunEvent(null, 'run-old', 'run-old')).toBe('reject')
+    expect(classifyRunEvent('run-new', 'run-old', 'run-old')).toBe('reject')
+  })
+
+  it('乐观桶遇握手前首包放行并要求补绑代次', () => {
+    expect(classifyRunEvent(null, 'run-new', undefined)).toBe('bind')
+  })
+
+  it('同代次或无代次事件直接接受，不触发补绑', () => {
+    expect(classifyRunEvent('run-new', 'run-new', undefined)).toBe('accept')
+    expect(classifyRunEvent('run-new', undefined, undefined)).toBe('accept')
+    expect(classifyRunEvent(null, undefined, undefined)).toBe('accept')
+  })
+
+  it('桶已绑定其它代次时拒绝串台事件', () => {
+    expect(classifyRunEvent('run-new', 'run-other', undefined)).toBe('reject')
   })
 })
 

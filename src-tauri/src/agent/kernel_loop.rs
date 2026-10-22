@@ -32,9 +32,14 @@ pub const KERNEL_MAX_EMPTY_ROUNDS: usize = 2;
 /// 超过后收尾并明确提示，避免无限续写空转
 pub const KERNEL_MAX_INTERRUPT_RETRY_ROUNDS: usize = 3;
 /// 产出前中断重放次数上限：流在输出任何内容前即中断（服务端断流/代理重置）时，
-/// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制）；连续 5 次 0 产出
-/// 中断多为本地网络故障，超过后走下方续写收尾
-pub const KERNEL_MAX_STREAM_REPLAYS: usize = 5;
+/// 用冻结请求原样重发（对齐 DeepSeek-Reasonix 冻结请求重放机制）；连续 0 产出中断
+/// 多为本地网络故障。原值 5 次 × 60s 静默线 = 最坏 5 分钟后才有第一句解释，用户
+/// 已经在干瞪眼；收到 3 次仍无产出就交还给用户判断（配合 `chat-notice` 提示）。
+pub const KERNEL_MAX_STREAM_REPLAYS: usize = 3;
+/// 流式恢复阶梯的**总**预算：重放 / 中断续写 / 截断续写三层各自有上限，但串联起来
+/// 是相乘的量级（3 次重放 + 3 次中断续写 + 8 次截断续写）。这里对三层总数设硬顶，
+/// 超过即停止自愈、保留已生成内容并说明原因，避免单轮累积十几分钟无有效输出。
+pub const KERNEL_MAX_STREAM_RECOVERIES: usize = 6;
 /// "叙述式假调用"纠正次数上限：模型在正文里写"已调用工具"却不输出标记时，
 /// 自动注入纠正提示继续（历史格式污染导致模型模仿，纠正后重走标记协议）
 pub const KERNEL_MAX_FAKE_CALL_CORRECTIONS: usize = 3;
@@ -289,6 +294,20 @@ impl KernelRoundRouter {
                 },
             };
         }
+        // 恢复阶梯总预算：重放 / 中断续写 / 截断续写各自有上限，串起来却是相乘量级。
+        // 超预算即停止自愈，与「续写次数耗尽」同样落穿到 Proceed（正常收尾），
+        // 但补一条注记说明原因，避免用户以为任务是模型自己决定停的。
+        let recoveries = self.stream_replays + self.interrupted_rounds + self.continuation_rounds;
+        if (input.interrupted || input.truncated) && recoveries >= KERNEL_MAX_STREAM_RECOVERIES {
+            notices.push(
+                "\n\n> ⚠️ 网络/输出异常已连续自动恢复多次仍未稳定，已保留以上内容并停止重试；可重新发送指令重试，或换一个模型。"
+                    .to_string(),
+            );
+            return KernelRoundDecision {
+                notices,
+                control: KernelRoundControl::Proceed,
+            };
+        }
         // 冻结重放：中断且 text 空且无工具调用且重放次数未耗尽
         if input.interrupted
             && text_empty
@@ -523,6 +542,70 @@ mod tests {
         assert!(matches!(decision.control, KernelRoundControl::StopEmpty { .. }));
     }
 
+    /// 恢复阶梯三层各自有上限，串联起来曾是相乘量级（重放 × 中断续写 × 截断续写）。
+    /// 总预算必须在中途终止它，并留下可见注记，而不是让用户对着静默界面等十几分钟。
+    #[test]
+    fn stream_recovery_stack_shares_one_budget() {
+        let mut router = KernelRoundRouter::new();
+        let frozen = KernelRoundInput {
+            text: "",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: true,
+            degenerate: false,
+            has_native_tool_calls: false,
+        };
+        let mut recoveries = 0;
+        let mut hit_budget = false;
+        // 上限 + 2 轮：总预算生效后下一次 decide 必须给出 Proceed，不会无限自愈。
+        for _ in 0..(KERNEL_MAX_STREAM_RECOVERIES + 2) {
+            let decision = router.decide(&frozen);
+            match decision.control {
+                KernelRoundControl::ReplayFrozen
+                | KernelRoundControl::ContinueInterrupted { .. }
+                | KernelRoundControl::ContinueTruncated { .. } => recoveries += 1,
+                KernelRoundControl::Proceed => {
+                    assert!(
+                        decision.notices.iter().any(|n| n.contains("停止重试")),
+                        "超预算收尾必须告知用户原因"
+                    );
+                    hit_budget = true;
+                    break;
+                }
+                other => panic!("恢复阶梯不该出现该控制：{other:?}"),
+            }
+        }
+        assert!(hit_budget, "总预算必须终止恢复阶梯");
+        assert_eq!(recoveries, KERNEL_MAX_STREAM_RECOVERIES);
+    }
+
+    /// 冻结重放是有上限的：无产出的连续中断不能一直原样重发。
+    #[test]
+    fn frozen_replays_stop_at_their_own_cap() {
+        let mut router = KernelRoundRouter::new();
+        let frozen = KernelRoundInput {
+            text: "",
+            has_reasoning: false,
+            truncated: false,
+            interrupted: true,
+            degenerate: false,
+            has_native_tool_calls: false,
+        };
+        let mut replays = 0;
+        for _ in 0..(KERNEL_MAX_STREAM_REPLAYS + 5) {
+            if matches!(router.decide(&frozen).control, KernelRoundControl::ReplayFrozen) {
+                replays += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(replays, KERNEL_MAX_STREAM_REPLAYS);
+        assert!(
+            KERNEL_MAX_STREAM_REPLAYS <= KERNEL_MAX_STREAM_RECOVERIES,
+            "单层上限不应超过总预算，否则总预算形同虚设"
+        );
+    }
+
     #[test]
     fn round_router_proceeds_on_tool_only_response() {
         // 工具调用响应可能无正文（text 空但 has_native_tool_calls=true），应正常 Proceed
@@ -575,13 +658,13 @@ mod tests {
             degenerate: false,
             has_native_tool_calls: false,
         };
-        // 前 5 次中断：ReplayFrozen
-        for _ in 0..5 {
+        // 重放次数未耗尽：ReplayFrozen（上限由常量决定，不再硬编码）
+        for _ in 0..KERNEL_MAX_STREAM_REPLAYS {
             let decision = router.decide(&input);
             assert!(decision.notices.is_empty());
             assert!(matches!(decision.control, KernelRoundControl::ReplayFrozen));
         }
-        // 第 6 次中断：ContinueInterrupted
+        // 重放耗尽后：ContinueInterrupted（仍在总预算内）
         let decision = router.decide(&input);
         assert!(decision.notices.is_empty());
         assert!(matches!(decision.control, KernelRoundControl::ContinueInterrupted { .. }));
@@ -620,15 +703,20 @@ mod tests {
             degenerate: false,
             has_native_tool_calls: false,
         };
-        // 前 8 次截断：ContinueTruncated
-        for _ in 0..8 {
+        // 总预算内的截断：ContinueTruncated。
+        // 注意这里由 `KERNEL_MAX_STREAM_RECOVERIES`（6）而非续写上限（8）先触发——
+        // 续写与其他恢复层共享同一笔预算，单层上限不再能独占到 8 次。
+        for _ in 0..KERNEL_MAX_STREAM_RECOVERIES {
             let decision = router.decide(&input);
             assert!(matches!(decision.control, KernelRoundControl::ContinueTruncated { .. }));
         }
-        // 第 9 次截断：Proceed（续写次数耗尽，落穿后续 UI 门）
+        // 预算耗尽：停止自愈（Proceed 落穿后续 UI 门）并说明原因
         let decision = router.decide(&input);
-        assert!(decision.notices.is_empty());
         assert!(matches!(decision.control, KernelRoundControl::Proceed));
+        assert!(
+            decision.notices.iter().any(|n| n.contains("停止重试")),
+            "预算耗尽必须告知用户，不能静默收尾"
+        );
     }
 
     #[test]
