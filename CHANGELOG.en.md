@@ -6,6 +6,61 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 70: deleting a project now stops its tasks and cleans conversation data (2026-10-22)
+
+Scenario: deleting a project relied on foreign-key cascades to remove conversations
+and messages, but running tasks were never told. They kept calling the model and
+writing `session_events` / `task_runs`, creating fresh orphan rows; the
+project-level conversation lock stayed held; tools could keep writing files after
+the directory had been moved to the Recycle Bin. Six conversation side tables
+without cascades (feedback, versions, task traces, events, todos, reminders) were
+left behind, and due reminders could still fire for deleted conversations. The
+project-scoped approval whitelist has no foreign key, so it kept an "always allow"
+grant for a project that no longer existed, and generated media waited for the next
+startup sweep. Other windows and LAN clients received no event. When deletion
+failed (for example, the directory was locked and could not be moved), the
+frontend only logged to the console, so the second confirmation click appeared to
+do nothing.
+
+- Before deleting, read all conversation ids and stop each runtime via the shared
+  `stop_conversation_runtime` (stop flag, unanswered questions, durable approval
+  revocation, task abort, project conversation lock, budgets/guards/session
+  context), then move the directory and delete rows;
+- Added `purge_project_content`: clear the six side tables for known
+  conversations, delete the project-scoped approval whitelist, delete the project
+  row (cascading conversations/messages/tool traces/run events/project memories),
+  then sweep orphans to catch conversations created between reading ids and
+  deleting rows;
+- Reclaim generated media (images/video/audio) per conversation on a background
+  thread; failures are logged as `generated_media_cleanup_failed`;
+- Emit `project-deleted` (project id plus all conversation ids) and
+  `projects-changed` after deletion; add `project-deleted` to the LAN event
+  whitelist;
+- The frontend chat slice listens for `project-deleted` and clears streaming
+  buckets, pending confirmations, generation status, task ledgers and tool-call
+  sets in one pass; if the current conversation was deleted it resets the whole
+  conversation view;
+- `refreshProjects` now clears the current project reference, file tree, branches
+  and directory cache when the project has disappeared; `projects-changed`
+  reloads project data only after the list refresh completes, so it no longer
+  queries a deleted project;
+- Deletion failures now raise an error notification instead of being silent, and
+  the confirmation copy states that running tasks will be stopped first.
+
+### Verification
+
+Added 1 Rust unit test: project deletion clears the six side tables and the
+project-scoped approval whitelist, cascades conversations/messages, prunes side
+rows of a conversation created inside the deletion window, and leaves another
+project's data untouched. Added 2 frontend vitest cases: `refreshProjects` clears
+the reference and caches once the current project is gone, and `project-deleted`
+resets the runtime state of all affected conversations in one pass. Rust full
+suite **1294/1294** (+1) · frontend vitest **242/242** (+2) · `tsc` / `eslint` /
+clippy baseline 57/57 · i18n +1 key (2298, union 2300) · all three i18n gates,
+21 gate self-tests, `check-docs`, and the production build pass. Tool counts are
+unchanged: `TOOL_SPECS` to **204**; database migration count reaches **86**.
+
+---
 ## Unreleased — Batch 69: clearing content now stops running tasks first (2026-10-22)
 
 Scenario: "Clear all content data" in Settings previously only deleted database rows

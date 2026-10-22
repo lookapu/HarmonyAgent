@@ -6589,3 +6589,56 @@ clippy 基线 57/57 · i18n 键无变化（2297，并集 2299）· 21 道门禁�
 - tokio abort 只在 await 点生效，同步段中的工具写入仍可能完成一次后才退出；
   这些残留由启动清扫兜底；
 - 审批撤销失败只有日志，没有 UI 提示：清空本身并不依赖该撤销成功，保持静默。
+
+### 6.87 第七十批：删除项目也要先停任务、清干净会话数据（2026-10-22）
+
+#### 6.87.1 起点：级联删了会话，任务与附属数据不知道
+
+删除项目只做三件事：把磁盘目录移入回收站、删项目级 MCP/技能、删项目行。会话靠
+`conversations.project_id → projects.id ON DELETE CASCADE` 被级联删除，但：
+
+- 运行中的任务没被通知：继续请求模型、写 `session_events` / `task_runs`，生成新的
+  孤儿行；项目级会话锁仍被占用；工具可能在目录已进回收站后继续写文件；
+- 六张没有外键级联的会话附属表（反馈/版本/任务轨迹/事件/待办/提醒）永久残留，
+  `message_reminders` 到期后还会向已删除的会话投递；
+- `tool_approval_whitelist` 以项目 id 为主键、没有外键，会留下对不存在项目的
+  「本项目始终允许」；
+- 该项目的生成产物要等下次启动清扫才回收；
+- 其他窗口与 LAN 收不到任何事件（`project-deleted` 不存在，`projects-changed`
+  删除路径也从未 emit）；
+- 删除失败（目录被占用无法移入回收站）只进 console，前端二次确认后毫无反应。
+
+#### 6.87.2 修法：复用运行态停止，再按项目清理
+
+- `delete_project` 先读项目路径与全部会话 id，逐个调用
+  `stop_conversation_runtime`（abort 原因 `project_deleted`）；审批撤销失败只记
+  `conversation_runtime_stop_failed` 后继续——随后项目行与会话行都会删除，
+  活动调用已被 abort；
+- 新增 `purge_project_content`：按已知会话清六张附属表 → 删项目级审批白名单 →
+  删项目行（级联）→ `prune_orphan_conversation_data` 兜底，覆盖「读取 id 与删库
+  之间」新建的会话；
+- 生成产物在后台线程按会话回收，成功/失败分别记 `generated_media_removed` /
+  `generated_media_cleanup_failed`；
+- 删除后广播 `project-deleted`（项目 id + 会话 id 列表）与 `projects-changed`；
+  LAN 白名单加入 `project-deleted`；
+- 前端 `chatSlice` 监听 `project-deleted`：一次性清理这些会话的流式桶、待确认项、
+  生成状态、任务账本与工具调用集合；当前会话在其中时复位整个对话视图；
+- `refreshProjects` 在项目消失时清空 `currentProject` / 文件树 / 分支 / 目录缓存；
+  Home 的 `projects-changed` 改为等列表刷新完成后再决定是否重载；
+- 删除失败弹错误通知；确认文案明确会先停止运行中的任务。
+
+#### 6.87.3 验证
+
+新增 1 条 Rust 单测：六张附属表与项目级白名单清空、项目/会话/消息级联删除、
+窗口内新会话的孤儿行被兜底清理、另一个项目完全不受影响。
+前端新增 2 条 vitest：项目消失后 `refreshProjects` 清空引用与缓存；
+`project-deleted` 一次性复位全部受影响会话。Rust 全量 **1294/1294**（+1）·
+前端 vitest **242/242**（+2）· `tsc` / `eslint` / clippy 基线 57/57 ·
+i18n 新增 1 键（2298，并集 2300）· 21 道门禁自测、`check-docs` 与生产构建通过。
+
+#### 6.87.4 仍未覆盖
+
+- 与清空内容相同的竞态：读取会话 id 之后、删库之前从 LAN/另一窗口发起的新任务
+  可能落在停止窗口外；其库内残留由孤儿清扫兜底，运行态需等任务自行结束；
+- `skill_usage` 与 `agent_audit_events` 保留：只含统计与审计元数据，不含会话正文；
+- 审批撤销失败仍只有日志，没有 UI 提示：项目与会话行随后整体删除，不依赖撤销成功。

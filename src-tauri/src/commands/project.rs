@@ -1,6 +1,8 @@
+use crate::commands::chat::{ChatCancel, ChatLock};
 use crate::db::models::{ChatMessage, Conversation, Project, ProjectInspect};
 use crate::db::DbState;
 use crate::utils::path::normalize_path;
+use crate::utils::task_registry::TaskRegistry;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::Serialize;
 use std::fs;
@@ -220,6 +222,38 @@ pub fn trust_project(id: String, state: State<DbState>) -> Result<Project, Strin
     get_project_by_id(&state, &id)
 }
 
+/// 项目下的全部会话 id（删除项目前用于停止运行态与回收生成产物）。
+fn project_conversation_ids(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM conversations WHERE project_id = ?1")?;
+    let rows = stmt.query_map([project_id], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// 删除项目行前的会话内容清理：先按已知会话清附属表（没有外键级联），再删项目行
+/// （级联会话/消息/工具轨迹/运行事件/项目记忆），最后扫一遍孤儿，兜住读取 id
+/// 与删库之间新建的会话。项目级审批白名单没有外键，必须一并显式删除。
+/// 返回清理的附属表行数。
+pub(crate) fn purge_project_content(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    conversation_ids: &[String],
+) -> rusqlite::Result<usize> {
+    let mut removed = 0;
+    for id in conversation_ids {
+        removed += crate::services::maintenance::delete_conversation_side_tables(conn, id)?;
+    }
+    conn.execute(
+        "DELETE FROM tool_approval_whitelist WHERE project_id = ?1",
+        [project_id],
+    )?;
+    conn.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+    removed += crate::services::maintenance::prune_orphan_conversation_data(conn);
+    Ok(removed)
+}
+
 /// 删除项目（级联删除会话/消息/权限/索引缓存；清理项目级 MCP 服务器与技能配置）
 /// 磁盘上的项目目录移入系统回收站（可恢复），不做物理删除；失败则中止删除保持数据一致。
 #[tauri::command]
@@ -228,13 +262,42 @@ pub fn delete_project(
     id: String,
     state: State<DbState>,
     manager: State<'_, crate::services::mcp_manager::McpManager>,
+    cancel: State<'_, ChatCancel>,
+    lock: State<'_, ChatLock>,
+    registry: State<'_, TaskRegistry>,
 ) -> Result<(), String> {
-    // 先取项目路径：删除 DB 前把磁盘目录移入回收站（目录不存在时跳过，视为用户已手动删除）
-    let path: Option<String> = {
+    // 先取项目路径与全部会话 id：路径用于移入回收站，id 用于停止运行态与产物回收
+    let (path, conversation_ids): (Option<String>, Vec<String>) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        conn.query_row("SELECT path FROM projects WHERE id = ?1", [&id], |r| r.get::<_, String>(0))
-            .ok()
+        let path = conn
+            .query_row("SELECT path FROM projects WHERE id = ?1", [&id], |r| r.get::<_, String>(0))
+            .ok();
+        let ids = project_conversation_ids(&conn, &id).map_err(|e| e.to_string())?;
+        (path, ids)
     };
+    // 先停运行态再动磁盘：否则正在跑的工具会在目录被移入回收站后继续写文件。
+    // 与删除单个会话共用同一套链路；审批撤销失败只记日志，随后项目行与会话行都会
+    // 被删除，活动调用已被 abort。
+    for conversation_id in &conversation_ids {
+        if let Err(error) = crate::commands::chat::stop_conversation_runtime(
+            conversation_id,
+            &state,
+            &cancel,
+            &lock,
+            &registry,
+            "project_deleted",
+        ) {
+            crate::utils::logger::log_event(
+                "conversation_runtime_stop_failed",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "project_id": id,
+                    "source": "project_delete",
+                    "error": error,
+                }),
+            );
+        }
+    }
     if let Some(p) = &path {
         let norm = normalize_path(p);
         let dir = Path::new(&norm);
@@ -281,10 +344,18 @@ pub fn delete_project(
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM skills WHERE project_id = ?1", [&id])
             .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM projects WHERE id = ?1", [&id])
-            .map_err(|e| e.to_string())?;
+        purge_project_content(&conn, &id, &conversation_ids).map_err(|e| e.to_string())?;
         (mcp_ids, skill_dirs, repo_roots)
     };
+    // 通知其他窗口/LAN：项目已删除；聊天切片据此一次性清掉该项目全部会话的运行态。
+    let _ = app.emit(
+        "project-deleted",
+        serde_json::json!({
+            "project_id": id,
+            "conversation_ids": &conversation_ids,
+        }),
+    );
+    let _ = app.emit("projects-changed", serde_json::json!({ "project_id": id }));
     // 断开项目级 MCP 连接（子进程不残留到应用退出）
     manager.disconnect(&mcp_ids);
     // 技能目录引用计数清理：行已删，仅当无其他作用域引用同一目录时才删磁盘文件
@@ -314,6 +385,45 @@ pub fn delete_project(
         let root = normalize_path(&p);
         if !root.is_empty() {
             crate::services::symbol_index::invalidate_cache(Path::new(&root));
+        }
+    }
+    // 回收该项目下全部会话的生成产物（图片/视频/音频）。项目行已删、会话已级联，
+    // 这里只按删前收集的 id 清理；后台线程避免大目录阻塞命令返回。
+    if !conversation_ids.is_empty() {
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let project_id = id.clone();
+            let ids = conversation_ids.clone();
+            std::thread::spawn(move || {
+                let mut removed = 0usize;
+                for conversation_id in &ids {
+                    match crate::utils::generated_media::remove_conversation(
+                        &data_dir,
+                        conversation_id,
+                    ) {
+                        Ok(true) => removed += 1,
+                        Ok(false) => {}
+                        Err(error) => crate::utils::logger::log_event(
+                            "generated_media_cleanup_failed",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "project_id": project_id,
+                                "source": "project_deleted",
+                                "error": error.to_string(),
+                            }),
+                        ),
+                    }
+                }
+                if removed > 0 {
+                    crate::utils::logger::log_event(
+                        "generated_media_removed",
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "conversations": removed,
+                            "source": "project_deleted",
+                        }),
+                    );
+                }
+            });
         }
     }
     Ok(())
@@ -2007,5 +2117,122 @@ mod tests {
         assert!(build.0 <= 1004);
         assert!(commit.0 <= 1005);
         assert!(commit.1 >= build.1);
+    }
+
+    fn insert_side_rows(conn: &rusqlite::Connection, conversation_id: &str) {
+        conn.execute(
+            "INSERT INTO message_feedback (id, message_id, conversation_id, feedback, created_at)
+             VALUES (?1, ?1, ?2, 'like', 1)",
+            params![format!("f-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_versions (id, conversation_id, user_message_id, content, created_at)
+             VALUES (?1, ?2, ?1, 'v', 1)",
+            params![format!("v-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_runs (id, conversation_id, started_at, finished_at)
+             VALUES (?1, ?2, 1, 1)",
+            params![format!("t-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (conversation_id, seq, event_type) VALUES (?1, 1, 'user_message')",
+            [conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_todos (conversation_id) VALUES (?1)",
+            [conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_reminders (id, conversation_id, kind, prompt, scheduled_at, created_at)
+             VALUES (?1, ?2, 'after', 'p', 1, 1)",
+            params![format!("r-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+    }
+
+    fn assert_side_rows(conn: &rusqlite::Connection, conversation_id: &str, expected: i64) {
+        for table in crate::services::maintenance::CONVERSATION_SIDE_TABLES {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE conversation_id = ?1"),
+                    [conversation_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "表 {table} 中 {conversation_id} 的行数不符");
+        }
+    }
+
+    #[test]
+    fn purge_project_content_clears_side_tables_whitelist_and_late_conversations() {
+        let conn = test_conn();
+        for (pid, path) in [("p1", "/tmp/purge-p1"), ("p2", "/tmp/purge-p2")] {
+            conn.execute(
+                "INSERT INTO projects (id, name, path, kind, trusted, index_state, created_at)
+                 VALUES (?1, ?1, ?2, 'harmony', 1, 'ready', 1)",
+                params![pid, path],
+            )
+            .unwrap();
+        }
+        for (pid, cid) in [("p1", "c1"), ("p1", "c2"), ("p1", "c-late"), ("p2", "c3")] {
+            conn.execute(
+                "INSERT INTO conversations (id, project_id, title, created_at, updated_at)
+                 VALUES (?1, ?2, 't', 1, 1)",
+                params![cid, pid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, content, created_at)
+                 VALUES (?1, ?2, 'user', 'hi', 1)",
+                params![format!("m-{cid}"), cid],
+            )
+            .unwrap();
+            insert_side_rows(&conn, cid);
+        }
+        conn.execute(
+            "INSERT INTO tool_approval_whitelist (project_id, tool, created_at)
+             VALUES ('p1', 'run_shell', 1), ('p2', 'write_file', 1)",
+            [],
+        )
+        .unwrap();
+
+        // 只传 c1/c2：c-late 模拟「读取会话 id 之后、删库之前」新建的会话，
+        // 它会随项目级联删除，附属行由删库后的孤儿清扫兜底。
+        let removed = purge_project_content(
+            &conn,
+            "p1",
+            &["c1".to_string(), "c2".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            removed,
+            crate::services::maintenance::CONVERSATION_SIDE_TABLES.len() * 3,
+            "两个已知会话与窗口内新会话的附属行都应清理"
+        );
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM projects WHERE id = 'p1'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM conversations WHERE project_id = 'p1'"), 0);
+        for cid in ["c1", "c2", "c-late"] {
+            assert_side_rows(&conn, cid, 0);
+            assert_eq!(
+                count(&format!("SELECT COUNT(*) FROM messages WHERE conversation_id = '{cid}'")),
+                0
+            );
+        }
+        assert_eq!(count("SELECT COUNT(*) FROM tool_approval_whitelist WHERE project_id = 'p1'"), 0);
+
+        // 另一个项目完全不受影响
+        assert_eq!(count("SELECT COUNT(*) FROM projects WHERE id = 'p2'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM conversations WHERE id = 'c3'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM messages WHERE conversation_id = 'c3'"), 1);
+        assert_side_rows(&conn, "c3", 1);
+        assert_eq!(count("SELECT COUNT(*) FROM tool_approval_whitelist WHERE project_id = 'p2'"), 1);
     }
 }

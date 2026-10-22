@@ -1257,18 +1257,21 @@ export default function Home() {
       setKnowledgeCandidate(payload)
     }).then((u) => !cancelled && unlisteners.push(u)).catch(() => {})
     // 项目新增/删除等变更：刷新列表；若变更的是当前项目，同步重载其动态数据
-    // （对话框顶部信息、右侧栏各 tab 内容随之更新）
+    // （对话框顶部信息、右侧栏各 tab 内容随之更新）。
+    // 重载必须等列表刷新完成：删除项目时 refreshProjects 会清空 currentProject，
+    // 否则这里会对着已删除的项目继续拉文件树/分支。
     listen<{ project_id?: string }>('projects-changed', (e) => {
-      void refreshProjects()
       const pid = (e.payload as { project_id?: string })?.project_id
-      if (pid && useProjectStore.getState().currentProject?.id === pid) {
-        void useProjectStore.getState().loadFileTree()
-        void loadMemories()
-        void loadToolStats()
-        void loadToolTokenStats()
-        void useProjectStore.getState().refreshGitBranches()
-        void loadRecentRuns()
-      }
+      void refreshProjects().then(() => {
+        if (pid && useProjectStore.getState().currentProject?.id === pid) {
+          void useProjectStore.getState().loadFileTree()
+          void loadMemories()
+          void loadToolStats()
+          void loadToolTokenStats()
+          void useProjectStore.getState().refreshGitBranches()
+          void loadRecentRuns()
+        }
+      }).catch(() => {})
     }).then((u) => !cancelled && unlisteners.push(u)).catch(() => {})
     // 项目标识文件（框架标志文件）变更：刷新各处项目信息；类型变化时弹提示——
     // 新增/删除 build-profile.json5、package.json、go.mod 等会改变项目身份，
@@ -3750,7 +3753,14 @@ export default function Home() {
     }
     setConfirmDeleteProjectId(null)
     const target = projects.find((p) => p.id === id)
-    await removeProject(id)
+    try {
+      await removeProject(id)
+    } catch (e) {
+      // 删除失败（如磁盘目录被占用无法移入回收站）必须让用户看见，否则二次确认后
+      // 界面毫无反应，用户会以为项目已删而实际仍在。
+      sendNotification(t('home.deleteProjectFail'), String(e), 'error')
+      return
+    }
     useAuditStore.getState().log({
       category: 'project.remove',
       label: t('home.auditLabelProjectRemove'),

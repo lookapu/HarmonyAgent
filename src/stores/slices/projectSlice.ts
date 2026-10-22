@@ -49,11 +49,13 @@ export const createProjectSlice: StateCreator<ProjectState, [], [], ProjectSlice
   refreshProjects: async () => {
     const projects = await listProjects()
     set({ projects })
-    // 保持当前项目引用最新（trusted 等字段刷新）
+    // 保持当前项目引用最新（trusted 等字段刷新）；项目已被其他窗口/LAN 删除时
+    // 清空引用，避免继续对不存在的项目加载文件树与分支。
     const cur = get().currentProject
     if (cur) {
       const fresh = projects.find((p) => p.id === cur.id)
       if (fresh) set({ currentProject: fresh })
+      else set({ currentProject: null, gitBranches: null, fileTree: null, dirCache: {} })
     }
   },
 

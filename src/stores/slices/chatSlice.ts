@@ -701,6 +701,70 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     }
   }).catch(() => {})
 
+  // 项目被删除（含另一窗口/LAN）：项目下会话随外键级联删除，后端已先停止运行任务。
+  // 必须一次性清掉全部受影响会话的流式桶/审批/生成状态，否则界面仍指向已删除数据。
+  listen<{ project_id: string; conversation_ids: string[] }>('project-deleted', (event) => {
+    const ids = new Set(event.payload?.conversation_ids ?? [])
+    if (ids.size === 0) return
+    const state = get()
+    const streamings = { ...state.streamings }
+    const pendingConfirmations = { ...state.pendingConfirmations }
+    const genStatus = { ...state.genStatus }
+    const taskLedgers = { ...state.taskLedgers }
+    for (const id of ids) {
+      delete streamings[id]
+      pendingStreamDeltas.delete(id)
+      sendTraces.get(id)?.end()
+      sendTraces.delete(id)
+      delete pendingConfirmations[id]
+      delete genStatus[id]
+      delete taskLedgers[id]
+      optimisticRunUserIds.delete(id)
+      activeToolCallIds.delete(id)
+      completedToolCallIds.delete(id)
+      terminalRunIds.delete(id)
+    }
+    const remaining = state.conversations.filter((c) => !ids.has(c.id))
+    if (state.currentConversation && ids.has(state.currentConversation.id)) {
+      set({
+        streamings,
+        pendingConfirmations,
+        genStatus,
+        taskLedgers,
+        conversations: remaining,
+        currentConversation: null,
+        messages: [],
+        streaming: emptyStreaming(),
+        toolRuns: [],
+        terminalEntries: [],
+        buildLogs: [],
+        agentRuns: [],
+        plan: null,
+        toolApprovals: [],
+        pendingPlan: null,
+        approvedPlan: null,
+        todos: [],
+        askCard: null,
+        diagnoseCards: [],
+        queuedList: [],
+        unfinishedConv: null,
+        lastTaskSummary: null,
+        snapshots: [],
+        loadingSnapshots: false,
+        olderHasMore: false,
+        loadingOlder: false,
+        feedbackMap: {},
+        versionMap: {},
+        tokenStats: null,
+      })
+      if (remaining.length > 0) {
+        get().openConversation(remaining[0].id).catch(() => {})
+      }
+    } else {
+      set({ streamings, pendingConfirmations, genStatus, taskLedgers, conversations: remaining })
+    }
+  }).catch(() => {})
+
   // 设置页「清空全部内容数据」：后端先停掉全部运行中任务再清库。
   // 这里必须整体复位，否则侧栏会话、流式桶、审批卡仍是已删除的数据。
   listen<{ conversation_ids: string[] }>('conversations-cleared', (event) => {
