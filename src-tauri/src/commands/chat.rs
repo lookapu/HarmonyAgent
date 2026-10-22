@@ -14829,20 +14829,15 @@ fn delete_conversation_inner(
     crate::agent::jobs::drop_conversation_jobs(id);
 
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    // 先删依赖消息/会话但无外键级联的表，避免孤儿数据残留
-    conn.execute("DELETE FROM message_feedback WHERE conversation_id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM message_versions WHERE conversation_id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM task_runs WHERE conversation_id = ?1", [id])
+    // 先删没有外键级联的附属表（反馈/版本/任务轨迹/事件/待办/提醒），避免孤儿残留。
+    // 其中 message_reminders 若不清，删除会话后仍会到期并弹出「定时提醒」。
+    crate::services::maintenance::delete_conversation_side_tables(&conn, id)
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM messages WHERE conversation_id = ?1", [id])
         .map_err(|e| e.to_string())?;
     let deleted = conn
         .execute("DELETE FROM conversations WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
-    // 清理会话事件日志（仅追加真源，随会话删除级联清理；失败不影响会话本身删除）
-    let _ = crate::agent::session_events::delete_conversation_events(&conn, id);
     drop(conn);
     // 通知前端该会话已删除（前端据此清理流式桶/选中态）
     let _ = app.emit(

@@ -6,6 +6,42 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 68: deleting a conversation or clearing content no longer leaves side data behind (2026-10-22)
+
+Scenario one: when a conversation was deleted, `conversation_todos` and
+`message_reminders` had no foreign-key cascade, so their rows remained forever.
+A due reminder was still injected into the conversation and raised a desktop
+"Reminder" notification even though the conversation no longer existed — a phantom
+notification the user could not locate, and `every` reminders kept firing.
+
+Scenario two: "Clear all content" missed `session_events` (the complete event
+transcript of user messages, assistant replies, and tool calls), conversation
+todos, and reminders. Users believed content was gone while the transcript was
+still in the database.
+
+- Added a `CONVERSATION_SIDE_TABLES` registry (feedback / versions / task runs /
+  events / todos / reminders) shared by single-conversation deletion, clear-all,
+  and the startup sweep, so future tables cannot be missed again;
+- Conversation deletion explicitly clears every side table instead of relying on a
+  cascade being declared;
+- Clear-all empties every table in the registry inside the same transaction;
+- Startup maintenance removes historical orphan rows left by older versions,
+  logs `orphan_conversation_data_pruned`, and reclaims space;
+- Audit events (`agent_audit_events`) and skill usage (`skill_usage`) are kept:
+  they contain run metadata and statistics only, not conversation content, and are
+  separate audit/analytics scopes.
+
+### Verification
+
+Two new Rust unit tests plus one extended test: single-conversation deletion only
+clears the target, the startup sweep removes orphans only, and clear-all covers the
+events/todos/reminders tables that were previously missed. Rust **1290/1290** (+2) ·
+frontend vitest **239/239** unchanged · `tsc` / `eslint` / clippy baseline 57/57 ·
+i18n keys unchanged (**2297**, union **2299**) · three i18n gates, all 21 gate
+self-tests, `check-docs` and the production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 67: deleting a conversation or clearing content reclaims generated media (2026-10-22)
 
 Scenario: generated images, videos, and audio live under

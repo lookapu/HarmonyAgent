@@ -7,6 +7,8 @@
 //! - **配置类**（providers/models/mcp/skills）：不清理，用户主动删除
 //!
 //! 滚动清理调用点：request_logs 每次插入后、task_runs 每次插入后、应用启动时。
+//! 会话删除/清空时还要显式清理没有外键级联的附属表（见 [`CONVERSATION_SIDE_TABLES`]），
+//! 启动时再做一次孤儿清扫，兜住旧版本留下的残留。
 
 use rusqlite::Connection;
 
@@ -14,6 +16,51 @@ use rusqlite::Connection;
 pub const REQUEST_LOG_KEEP: i64 = 2000;
 /// task_runs 保留天数
 pub const TASK_RUN_KEEP_DAYS: i64 = 180;
+
+/// 没有外键级联的会话附属表：删除会话或清空内容时必须显式清理，
+/// 否则会留下孤儿行（提醒还会继续到期投递，事件日志会留下完整对话原文）。
+/// 有 `REFERENCES conversations(id) ON DELETE CASCADE` 的表交给数据库级联。
+pub const CONVERSATION_SIDE_TABLES: &[&str] = &[
+    "message_feedback",
+    "message_versions",
+    "task_runs",
+    "session_events",
+    "conversation_todos",
+    "message_reminders",
+];
+
+/// 删除单个会话的附属表行。返回删除行数。
+pub fn delete_conversation_side_tables(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<usize> {
+    let mut removed = 0;
+    for &table in CONVERSATION_SIDE_TABLES {
+        removed += conn.execute(
+            &format!("DELETE FROM {table} WHERE conversation_id = ?1"),
+            [conversation_id],
+        )?;
+    }
+    Ok(removed)
+}
+
+/// 启动时清理历史孤儿：会话已不存在、附属表仍有残留的行。
+/// 覆盖旧版本删除会话时漏删的数据。返回删除行数。
+pub fn prune_orphan_conversation_data(conn: &Connection) -> usize {
+    let mut removed = 0;
+    for &table in CONVERSATION_SIDE_TABLES {
+        removed += conn
+            .execute(
+                &format!(
+                    "DELETE FROM {table} WHERE NOT EXISTS (
+                        SELECT 1 FROM conversations WHERE conversations.id = {table}.conversation_id)"
+                ),
+                [],
+            )
+            .unwrap_or(0);
+    }
+    removed
+}
 
 /// 滚动清理 request_logs：只保留最近 `keep` 条，删除更旧的。
 /// 返回删除行数。
@@ -42,10 +89,12 @@ pub fn clear_content_data(conn: &mut Connection) -> rusqlite::Result<(u64, u64)>
     let tx = conn.transaction()?;
     let deleted_msgs = tx.execute("DELETE FROM messages", [])?;
     let deleted_convs = tx.execute("DELETE FROM conversations", [])?;
-    tx.execute("DELETE FROM message_feedback", [])?;
-    tx.execute("DELETE FROM message_versions", [])?;
+    // 无外键级联的附属表必须显式清空：session_events 是完整对话事件原文，
+    // conversation_todos / message_reminders 是会话内容与定时任务。
+    for &table in CONVERSATION_SIDE_TABLES {
+        tx.execute(&format!("DELETE FROM {table}"), [])?;
+    }
     tx.execute("DELETE FROM tool_runs", [])?;
-    tx.execute("DELETE FROM task_runs", [])?;
     tx.execute("DELETE FROM request_logs", [])?;
     tx.execute("DELETE FROM project_memories", [])?;
     tx.execute("DELETE FROM tool_approval_whitelist", [])?;
@@ -64,8 +113,16 @@ pub fn vacuum(conn: &Connection) -> rusqlite::Result<()> {
 pub fn run_startup_maintenance(conn: &Connection) {
     let pruned_logs = prune_request_logs(conn, REQUEST_LOG_KEEP);
     let pruned_runs = prune_task_runs(conn, TASK_RUN_KEEP_DAYS);
-    if pruned_logs > 0 || pruned_runs > 0 {
+    // 兜住旧版本删除会话时留下的附属表孤儿（提醒/事件/待办等）
+    let pruned_orphans = prune_orphan_conversation_data(conn);
+    if pruned_logs > 0 || pruned_runs > 0 || pruned_orphans > 0 {
         let _ = vacuum(conn);
+    }
+    if pruned_orphans > 0 {
+        crate::utils::logger::log_event(
+            "orphan_conversation_data_pruned",
+            serde_json::json!({ "rows": pruned_orphans }),
+        );
     }
 }
 
@@ -102,9 +159,12 @@ mod tests {
                 title TEXT,
                 created_at INTEGER NOT NULL
             );
-            CREATE TABLE message_feedback (id TEXT PRIMARY KEY, message_id TEXT);
+            CREATE TABLE message_feedback (id TEXT PRIMARY KEY, message_id TEXT, conversation_id TEXT NOT NULL);
             CREATE TABLE message_versions (id TEXT PRIMARY KEY, conversation_id TEXT);
             CREATE TABLE tool_runs (id TEXT PRIMARY KEY, conversation_id TEXT);
+            CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, seq INTEGER NOT NULL);
+            CREATE TABLE conversation_todos (conversation_id TEXT PRIMARY KEY, items_json TEXT NOT NULL DEFAULT '[]');
+            CREATE TABLE message_reminders (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, prompt TEXT NOT NULL);
             CREATE TABLE project_memories (id TEXT PRIMARY KEY, project_id TEXT, content TEXT);
             CREATE TABLE tool_approval_whitelist (project_id TEXT, tool TEXT);",
         )
@@ -175,7 +235,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO message_feedback (id, message_id) VALUES ('f1', 'm1')",
+            "INSERT INTO message_feedback (id, message_id, conversation_id) VALUES ('f1', 'm1', 'c1')",
             [],
         )
         .unwrap();
@@ -206,6 +266,21 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (conversation_id, seq) VALUES ('c1', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_todos (conversation_id) VALUES ('c1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_reminders (id, conversation_id, prompt) VALUES ('r1', 'c1', '提醒')",
+            [],
+        )
+        .unwrap();
 
         let (convs, msgs) = clear_content_data(&mut conn).unwrap();
         assert_eq!(convs, 1);
@@ -217,6 +292,9 @@ mod tests {
             "message_versions",
             "tool_runs",
             "task_runs",
+            "session_events",
+            "conversation_todos",
+            "message_reminders",
             "request_logs",
             "project_memories",
             "tool_approval_whitelist",
@@ -226,5 +304,85 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "表 {table} 应被清空");
         }
+    }
+
+    fn insert_side_rows(conn: &Connection, conversation_id: &str) {
+        conn.execute(
+            "INSERT INTO message_feedback (id, message_id, conversation_id) VALUES (?1, ?1, ?2)",
+            params![format!("f-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_versions (id, conversation_id) VALUES (?1, ?2)",
+            params![format!("v-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_runs (id, conversation_id, started_at, finished_at) VALUES (?1, ?2, 1, 1)",
+            params![format!("t-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (conversation_id, seq) VALUES (?1, 1)",
+            params![conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_todos (conversation_id) VALUES (?1)",
+            params![conversation_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_reminders (id, conversation_id, prompt) VALUES (?1, ?2, 'p')",
+            params![format!("r-{conversation_id}"), conversation_id],
+        )
+        .unwrap();
+    }
+
+    fn assert_side_rows(conn: &Connection, conversation_id: &str, expected: i64) {
+        for &table in CONVERSATION_SIDE_TABLES {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE conversation_id = ?1"),
+                    [conversation_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "表 {table} 中 {conversation_id} 的行数不符");
+        }
+    }
+
+    #[test]
+    fn delete_conversation_side_tables_only_targets_one_conversation() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO conversations (id, title, created_at) VALUES ('live', 't', 1)",
+            [],
+        )
+        .unwrap();
+        insert_side_rows(&conn, "live");
+        insert_side_rows(&conn, "gone");
+
+        let removed = delete_conversation_side_tables(&conn, "gone").unwrap();
+        assert_eq!(removed, CONVERSATION_SIDE_TABLES.len());
+        assert_side_rows(&conn, "gone", 0);
+        assert_side_rows(&conn, "live", 1);
+    }
+
+    #[test]
+    fn orphan_prune_removes_only_missing_conversations() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO conversations (id, title, created_at) VALUES ('live', 't', 1)",
+            [],
+        )
+        .unwrap();
+        insert_side_rows(&conn, "live");
+        insert_side_rows(&conn, "gone");
+
+        let removed = prune_orphan_conversation_data(&conn);
+        assert_eq!(removed, CONVERSATION_SIDE_TABLES.len());
+        assert_side_rows(&conn, "gone", 0);
+        assert_side_rows(&conn, "live", 1);
     }
 }
