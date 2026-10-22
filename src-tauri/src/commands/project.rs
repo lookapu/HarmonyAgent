@@ -1,4 +1,4 @@
-use crate::commands::chat::{ChatCancel, ChatLock};
+use crate::commands::chat::{ChatCancel, ChatLock, PlanApprovalState, ToolApprovalState};
 use crate::db::models::{ChatMessage, Conversation, Project, ProjectInspect};
 use crate::db::DbState;
 use crate::utils::path::normalize_path;
@@ -278,6 +278,8 @@ pub fn delete_project(
     // 先停运行态再动磁盘：否则正在跑的工具会在目录被移入回收站后继续写文件。
     // 与删除单个会话共用同一套链路；审批撤销失败只记日志，随后项目行与会话行都会
     // 被删除，活动调用已被 abort。
+    let approval = app.state::<ToolApprovalState>();
+    let plan_state = app.state::<PlanApprovalState>();
     for conversation_id in &conversation_ids {
         if let Err(error) = crate::commands::chat::stop_conversation_runtime(
             conversation_id,
@@ -285,6 +287,10 @@ pub fn delete_project(
             &cancel,
             &lock,
             &registry,
+            crate::commands::chat::PendingConfirmTables {
+                approval: &approval,
+                plan: &plan_state,
+            },
             "project_deleted",
         ) {
             crate::utils::logger::log_event(

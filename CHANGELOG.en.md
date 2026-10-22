@@ -6,6 +6,43 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 79: forced aborts no longer leave unanswerable approvals/plans behind (2026-10-22)
+
+Scenario: while a task is waiting on tool approval or plan review, deleting a
+conversation, clearing all content, deleting a project, or reloading the WebView
+aborts the tokio task immediately. Abort skips the `remove` cleanup inside the
+waiting future, but entries in `ToolApprovalState` / `PlanApprovalState` do not
+disappear with the future: after deletion/clearing they leak in memory, and after a
+reload the frontend restores a "pending" badge and approval dialog from
+`list_pending_confirmations` even though the task no longer exists. Approving or
+rejecting then has no effect, and the dialog only goes away after a restart.
+
+- `ToolApprovalState` / `PlanApprovalState` gain `clear_conversation`: deleting a
+  conversation, clearing all content, deleting a project, and the task shell being
+  dropped (WebView reload) all clear the target conversation's approval/plan wait
+  entries; the watchdog now reuses the same implementation instead of keeping its
+  own `retain`;
+- The task shell clears leftovers after `join` returns (covering panics and other
+  non-cooperative exits) before unregistering;
+- `list_pending_confirmations` gains a backstop: entries whose wait channel is closed
+  (the waiter is gone) are discarded and their interaction ledger rows are marked
+  `interrupted`, so badges and restore-on-open never point at dead requests;
+- The frontend periodic sync now treats the server as the source of truth: expired
+  approval dialogs and plan cards close automatically; requests that arrive while
+  the query is in flight are protected by a "known before the query" set and are
+  not closed by the stale snapshot.
+
+### Verification
+
+2 Rust unit tests added (a forced stop clears only the target conversation's
+approvals/plans and closes the wait channels; closed waiters are pruned from the
+list) and 2 frontend unit tests (a stale server snapshot closes the dialog and plan
+card; a confirmation arriving mid-sync is not closed by the stale snapshot). Rust
+full suite **1311/1311** (+2) · frontend vitest **252/252** (+2) · `tsc` / `eslint` /
+clippy baseline 57/57 · i18n keys unchanged (2298, union 2300) · all three i18n
+gates, 21 gate self-tests, `check-docs`, and the production build pass. `TOOL_SPECS` to **204** and database migration count reaches **88** (both unchanged in this batch).
+
+---
 ## Unreleased — Batch 78: rewinding history no longer resurrects the rolled-back branch's task (2026-10-22)
 
 Scenario: restoring a historical snapshot or deleting a run of messages only rewrites

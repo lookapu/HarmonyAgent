@@ -380,6 +380,35 @@ pub struct ToolApprovalState(
     >,
 );
 
+impl ToolApprovalState {
+    /// 清掉某会话的全部待审批通道。
+    ///
+    /// abort 会跳过审批 Future 内的 remove 收尾（等待表条目不随 Future drop），
+    /// 残留项会让前端重载/重开会话时恢复出永远不可能生效的审批弹窗。
+    pub fn clear_conversation(&self, conversation_id: &str) {
+        if let Ok(mut map) = self.0.lock() {
+            map.retain(|_, (_, _, conv, _)| conv != conversation_id);
+        }
+    }
+
+    /// 丢弃等待者已消失的审批通道（任务 panic / abort 竞态留下的残项），
+    /// 返回被丢弃的 request_id 供审批账本收尾。
+    pub fn prune_closed(&self) -> Vec<String> {
+        let Ok(mut map) = self.0.lock() else {
+            return Vec::new();
+        };
+        let stale: Vec<String> = map
+            .iter()
+            .filter(|(_, (tx, _, _, _))| tx.is_closed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            map.remove(id);
+        }
+        stale
+    }
+}
+
 /// 会话级“始终允许此工具”记忆：(会话 id, 工具名)，用户审批弹窗勾选后本会话内免审
 #[derive(Default)]
 pub struct SessionToolAllowState(pub StdMutex<std::collections::HashSet<(String, String)>>);
@@ -634,6 +663,31 @@ pub struct PlanApprovalState(
     pub StdMutex<std::collections::HashMap<String, PendingPlanRequest>>,
 );
 
+impl PlanApprovalState {
+    /// 清掉某会话的全部待确认计划（语义同 [`ToolApprovalState::clear_conversation`]）。
+    pub fn clear_conversation(&self, conversation_id: &str) {
+        if let Ok(mut map) = self.0.lock() {
+            map.retain(|_, pending| pending.conversation_id != conversation_id);
+        }
+    }
+
+    /// 丢弃等待者已消失的计划通道，返回被丢弃的 request_id 供审批账本收尾。
+    pub fn prune_closed(&self) -> Vec<String> {
+        let Ok(mut map) = self.0.lock() else {
+            return Vec::new();
+        };
+        let stale: Vec<String> = map
+            .iter()
+            .filter(|(_, pending)| pending.tx.is_closed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            map.remove(id);
+        }
+        stale
+    }
+}
+
 /// 计划待确认事件（前端渲染可编辑计划卡片，确认后调用 resolve_plan_review 回复）
 #[derive(Clone, Serialize)]
 pub struct ChatPlanEvent {
@@ -880,9 +934,26 @@ pub fn list_pending_confirmations(
         ids
     };
 
+    // 2. 先回收无人等待的通道：任务被 abort/panic 后等待表可能残留死项，
+    //    角标与切回恢复都不能指向这种请求（等待方已不存在，点了也不会生效）。
+    for request_id in approval.prune_closed() {
+        let _ = crate::agent::interactions::finish(
+            &request_id,
+            "interrupted",
+            serde_json::json!({ "reason": "reply_channel_lost" }),
+        );
+    }
+    for request_id in plan_state.prune_closed() {
+        let _ = crate::agent::interactions::finish(
+            &request_id,
+            "interrupted",
+            serde_json::json!({ "reason": "reply_channel_lost" }),
+        );
+    }
+
     let mut out: Vec<PendingConfirmation> = Vec::new();
 
-    // 2. 工具权限审批
+    // 3. 工具权限审批
     {
         let map = approval.0.lock().map_err(|e| e.to_string())?;
         for (request_id, (_tx, tool, conv, args)) in map.iter() {
@@ -907,7 +978,7 @@ pub fn list_pending_confirmations(
         }
     }
 
-    // 3. 计划审批
+    // 4. 计划审批
     {
         let map = plan_state.0.lock().map_err(|e| e.to_string())?;
         for (request_id, req) in map.iter() {
@@ -929,7 +1000,7 @@ pub fn list_pending_confirmations(
         }
     }
 
-    // 4. Agent 提问
+    // 5. Agent 提问
     for conv_id in &conv_ids {
         if let Some(ev) = crate::agent::ask::pending(conv_id) {
             out.push(PendingConfirmation {
@@ -3633,6 +3704,18 @@ impl RegisteredChatTask {
     }
 }
 
+/// 清掉会话级待确认项（审批/计划/提问）。
+///
+/// 任务被 abort/panic 时，等待中的审批与计划 Future 不会执行各自的 remove 收尾；
+/// 不清会让前端重载后从 `list_pending_confirmations` 恢复出无人应答的弹窗。
+fn clear_pending_confirmations(app: &AppHandle, conversation_id: &str) {
+    app.state::<ToolApprovalState>()
+        .clear_conversation(conversation_id);
+    app.state::<PlanApprovalState>()
+        .clear_conversation(conversation_id);
+    crate::agent::ask::cancel_conversation(conversation_id);
+}
+
 impl Drop for RegisteredChatTask {
     fn drop(&mut self) {
         if !self.armed {
@@ -3643,6 +3726,7 @@ impl Drop for RegisteredChatTask {
         // 阻塞下一次发送。已入库的正文占位仍可由“继续任务”恢复。
         let run_id = self.app.state::<TaskRegistry>().run_id(&self.conversation_id);
         self.abort.abort();
+        clear_pending_confirmations(&self.app, &self.conversation_id);
         if !run_id.is_empty() {
             crate::agent::runtime::transition_global(
                 &run_id,
@@ -3937,7 +4021,9 @@ pub async fn stream_chat(
     // 登记成功后才放行；接收端若已异常退出，join 会返回实际错误。
     let _ = start_tx.send(());
     let result = join.await;
-    // 「立即插入」属于发起的那个任务：任务结束仍未消费就作废。
+    // 任务已结束（正常收尾/panic/被 abort）：等待表里若还有本会话的审批/计划/提问，
+    // 都已没有等待者，必须先清掉再注销登记，避免重开前端恢复出无人应答的弹窗。
+    clear_pending_confirmations(&app, &conversation_id);
     // 否则下一个任务的首轮安全点会突然把旧队列全部强制并入，并提示"已按你的要求插入"。
     app.state::<ChatForceMerge>().clear_for(&conversation_id, generation);
     if matches!(&result, Err(e) if !e.is_cancelled()) {
@@ -15177,6 +15263,15 @@ pub(crate) fn delete_conversation_sync(
     delete_conversation_inner(id, app, state, &cancel, &lock, &registry)
 }
 
+/// 运行收尾需要一起清空的两张待确认等待表。
+///
+/// abort 会同时跳过审批与计划 Future 的 remove 收尾，两者总是一起清理；
+/// 打包成一个参数，避免收尾函数参数继续膨胀（clippy too_many_arguments）。
+pub(crate) struct PendingConfirmTables<'a> {
+    pub approval: &'a ToolApprovalState,
+    pub plan: &'a PlanApprovalState,
+}
+
 /// 停止某个会话的进程内运行态：协作式停止标志、未答复提问、审批持久撤销、
 /// tokio 任务 abort、项目级会话锁、预算/护栏/会话上下文/后台作业。
 ///
@@ -15189,6 +15284,7 @@ pub(crate) fn stop_conversation_runtime(
     cancel: &ChatCancel,
     lock: &ChatLock,
     registry: &TaskRegistry,
+    pending: PendingConfirmTables<'_>,
     abort_reason: &str,
 ) -> Result<(), String> {
     // 1. 协作式停止：设置一次性停止标志（安全点会消费），并关闭未答复的提问
@@ -15199,8 +15295,12 @@ pub(crate) fn stop_conversation_runtime(
     let revocation = crate::agent::broker_approval::stop_and_revoke(
         state, id, crate::agent::broker_approval::StopReason::ConversationDeleted,
     );
-    // 2. 立即 abort 正在运行的 tokio 任务，并从注册表移除（看门狗不再追猎）
+    // 2. 立即 abort 正在运行的 tokio 任务，并从注册表移除（看门狗不再追猎）；
+    //    abort 同时跳过审批/计划 Future 内的 remove 收尾，等待表必须同步清掉，
+    //    否则重开前端会恢复出无人应答的审批弹窗。
     registry.abort_conversation_with_reason(id, abort_reason);
+    pending.approval.clear_conversation(id);
+    pending.plan.clear_conversation(id);
     // 3. 释放项目级会话锁：仅当持有者确实是本会话时才移除，避免误删其他会话的锁
     if let Ok(mut g) = lock.0.lock() {
         if g.values().any(|v| v == id) {
@@ -15222,12 +15322,18 @@ fn delete_conversation_inner(
     lock: &tauri::State<'_, ChatLock>,
     registry: &TaskRegistry,
 ) -> Result<(), String> {
+    let approval = app.state::<ToolApprovalState>();
+    let plan_state = app.state::<PlanApprovalState>();
     stop_conversation_runtime(
         id,
         state,
         cancel,
         lock,
         registry,
+        PendingConfirmTables {
+            approval: &approval,
+            plan: &plan_state,
+        },
         "conversation_deleted",
     )?;
 
@@ -15311,6 +15417,8 @@ mod stop_runtime_tests {
         let lock = ChatLock::default();
         lock.0.lock().unwrap().insert("proj".into(), "conv".into());
         let registry = TaskRegistry::default();
+        let approval = ToolApprovalState::default();
+        let plan_state = PlanApprovalState::default();
 
         assert!(stop_conversation_runtime(
             "conv",
@@ -15318,6 +15426,10 @@ mod stop_runtime_tests {
             &cancel,
             &lock,
             &registry,
+            PendingConfirmTables {
+                approval: &approval,
+                plan: &plan_state,
+            },
             "conversation_deleted",
         )
         .is_err());
@@ -15342,6 +15454,8 @@ mod stop_runtime_tests {
         let cancel = ChatCancel::default();
         let lock = ChatLock::default();
         let registry = TaskRegistry::default();
+        let approval = ToolApprovalState::default();
+        let plan_state = PlanApprovalState::default();
 
         stop_conversation_runtime(
             "conv",
@@ -15349,6 +15463,10 @@ mod stop_runtime_tests {
             &cancel,
             &lock,
             &registry,
+            PendingConfirmTables {
+                approval: &approval,
+                plan: &plan_state,
+            },
             "conversation_deleted",
         )
         .unwrap();
@@ -15361,6 +15479,100 @@ mod stop_runtime_tests {
             )
             .unwrap();
         assert_eq!(revoked, 1);
+    }
+
+    /// 强制中止（清空内容/删除会话/删除项目）会跳过审批 Future 的 remove 收尾：
+    /// 等待表必须同步清掉目标会话的条目，否则重开前端会恢复出无人应答的弹窗。
+    #[test]
+    fn force_stop_clears_only_target_conversation_confirmations() {
+        let db = db_with_approval_tables();
+        let cancel = ChatCancel::default();
+        let lock = ChatLock::default();
+        let registry = TaskRegistry::default();
+        let approval = ToolApprovalState::default();
+        let plan_state = PlanApprovalState::default();
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<(bool, Option<String>)>();
+        approval.0.lock().unwrap().insert(
+            "req-a".into(),
+            (tx, "run_command".into(), "conv".into(), "{}".into()),
+        );
+        let (other_tx, _other_rx) = tokio::sync::oneshot::channel::<(bool, Option<String>)>();
+        approval.0.lock().unwrap().insert(
+            "req-other".into(),
+            (other_tx, "write_file".into(), "other".into(), "{}".into()),
+        );
+        let (plan_tx, _plan_rx) = tokio::sync::oneshot::channel::<PlanReview>();
+        plan_state.0.lock().unwrap().insert(
+            "req-plan".into(),
+            PendingPlanRequest {
+                conversation_id: "conv".into(),
+                plan: "计划".into(),
+                tx: plan_tx,
+            },
+        );
+
+        stop_conversation_runtime(
+            "conv",
+            &db,
+            &cancel,
+            &lock,
+            &registry,
+            PendingConfirmTables {
+                approval: &approval,
+                plan: &plan_state,
+            },
+            "content_cleared",
+        )
+        .unwrap();
+
+        let approvals = approval.0.lock().unwrap();
+        assert!(!approvals.contains_key("req-a"), "目标会话的审批通道必须清掉");
+        assert!(approvals.contains_key("req-other"), "其他会话的待审批不受影响");
+        drop(approvals);
+        assert!(!plan_state.0.lock().unwrap().contains_key("req-plan"));
+        // 通道被丢弃：等待中的审批 Future（若仍存活）立即收到 Err，而不是挂到超时
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    /// 任务 panic / abort 竞态下等待者先于表项消失：列表查询必须回收这些死项，
+    /// 否则角标一直显示“待确认”，点开也无人应答。
+    #[test]
+    fn closed_waiters_are_pruned_from_confirmation_lists() {
+        let approval = ToolApprovalState::default();
+        let plan_state = PlanApprovalState::default();
+        let (live_tx, _live_rx) = tokio::sync::oneshot::channel::<(bool, Option<String>)>();
+        let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<(bool, Option<String>)>();
+        drop(dead_rx);
+        approval.0.lock().unwrap().insert(
+            "live".into(),
+            (live_tx, "run_command".into(), "conv".into(), "{}".into()),
+        );
+        approval.0.lock().unwrap().insert(
+            "dead".into(),
+            (dead_tx, "run_command".into(), "conv".into(), "{}".into()),
+        );
+        let (live_plan_tx, _live_plan_rx) = tokio::sync::oneshot::channel::<PlanReview>();
+        let (dead_plan_tx, dead_plan_rx) = tokio::sync::oneshot::channel::<PlanReview>();
+        drop(dead_plan_rx);
+        for (id, tx) in [("live-plan", live_plan_tx), ("dead-plan", dead_plan_tx)] {
+            plan_state.0.lock().unwrap().insert(
+                id.into(),
+                PendingPlanRequest {
+                    conversation_id: "conv".into(),
+                    plan: "计划".into(),
+                    tx,
+                },
+            );
+        }
+
+        assert_eq!(approval.prune_closed(), vec!["dead".to_string()]);
+        assert_eq!(plan_state.prune_closed(), vec!["dead-plan".to_string()]);
+        assert!(approval.0.lock().unwrap().contains_key("live"));
+        assert!(plan_state.0.lock().unwrap().contains_key("live-plan"));
     }
 }
 

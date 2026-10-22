@@ -2250,15 +2250,46 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     refreshPendingConfirmations: async () => {
       const project = get().currentProject
       if (!project) return
+      // 查询发出时已存在的请求 id：服务端快照里没有它们才算“已失效”；
+      // 查询期间新到达的审批/计划不能被旧快照误关（弹窗一关，任务就永远等不到答复）。
+      const knownBefore = new Set<string>()
+      for (const arr of Object.values(get().pendingConfirmations)) {
+        for (const p of arr) knownBefore.add(p.request_id)
+      }
+      for (const a of get().toolApprovals) knownBefore.add(a.requestId)
+      const openPlan = get().pendingPlan
+      if (openPlan) knownBefore.add(openPlan.requestId)
       try {
         const items = await listPendingConfirmationsApi(project.id)
+        const ids = new Set(items.map((it) => it.request_id))
         const map: Record<string, PendingConfirmation[]> = {}
         for (const it of items) {
           const list = map[it.conversation_id] ?? []
           list.push(it)
           map[it.conversation_id] = list
         }
-        set({ pendingConfirmations: map })
+        // 查询期间新到达、但快照里还没有的项：保留在待确认表里，等下一次同步
+        for (const [cid, arr] of Object.entries(get().pendingConfirmations)) {
+          for (const p of arr) {
+            if (!knownBefore.has(p.request_id) && !ids.has(p.request_id)) {
+              if (!map[cid]) map[cid] = []
+              map[cid].push(p)
+              ids.add(p.request_id)
+            }
+          }
+        }
+        set((s) => ({
+          pendingConfirmations: map,
+          // 视图也以服务端为准：超时/强制中止后，已打开的审批弹窗与计划卡不能一直挂着。
+          // 不在快照里但查询期间新到的请求保留（见 knownBefore 的说明）。
+          toolApprovals: s.toolApprovals.filter(
+            (a) => ids.has(a.requestId) || !knownBefore.has(a.requestId),
+          ),
+          pendingPlan:
+            s.pendingPlan && (ids.has(s.pendingPlan.requestId) || !knownBefore.has(s.pendingPlan.requestId))
+              ? s.pendingPlan
+              : null,
+        }))
       } catch {
         // 后端不可用时保留旧数据
       }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::commands::chat::{self, ChatCancel, ChatLock};
+use crate::commands::chat::{self, ChatCancel, ChatLock, PlanApprovalState, ToolApprovalState};
 use crate::db::DbState;
 use crate::services::maintenance;
 use crate::utils::task_registry::TaskRegistry;
@@ -79,6 +79,8 @@ pub fn clear_content_data(
     let cancel = app.state::<ChatCancel>();
     let lock = app.state::<ChatLock>();
     let registry = app.state::<TaskRegistry>();
+    let approval = app.state::<ToolApprovalState>();
+    let plan_state = app.state::<PlanApprovalState>();
     let mut stop_failures = 0usize;
     for id in &ids {
         if let Err(error) = chat::stop_conversation_runtime(
@@ -87,6 +89,10 @@ pub fn clear_content_data(
             &cancel,
             &lock,
             &registry,
+            chat::PendingConfirmTables {
+                approval: &approval,
+                plan: &plan_state,
+            },
             "content_cleared",
         ) {
             // 审批持久撤销失败不阻塞清空：tool_runs/run_events 随后会被整体清空，

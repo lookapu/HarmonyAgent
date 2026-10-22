@@ -394,20 +394,10 @@ fn watchdog_loop(app: AppHandle) {
                     .unwrap_or_default();
                 // abort 会跳过审批/计划 Future 内的正常 remove 收尾；先删除对应 Sender，
                 // 防止待确认表永久残留并让前端一直显示“待确认”。
-                if let Ok(mut approvals) = app
-                    .state::<crate::commands::chat::ToolApprovalState>()
-                    .0
-                    .lock()
-                {
-                    approvals.retain(|_, (_, _, conversation_id, _)| conversation_id != &cid);
-                }
-                if let Ok(mut plans) = app
-                    .state::<crate::commands::chat::PlanApprovalState>()
-                    .0
-                    .lock()
-                {
-                    plans.retain(|_, pending| pending.conversation_id != cid);
-                }
+                app.state::<crate::commands::chat::ToolApprovalState>()
+                    .clear_conversation(&cid);
+                app.state::<crate::commands::chat::PlanApprovalState>()
+                    .clear_conversation(&cid);
                 crate::agent::ask::cancel_conversation(&cid);
                 if let Err(error) = crate::agent::broker_approval::stop_and_revoke(
                     &app.state::<crate::db::DbState>(), &cid,

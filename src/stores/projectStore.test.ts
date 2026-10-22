@@ -28,6 +28,7 @@ vi.mock('../api/project', async (importOriginal) => {
     getTaskLedger: vi.fn(),
     listMessageFeedback: vi.fn(),
     listMessageVersions: vi.fn(),
+    listPendingConfirmations: vi.fn(),
   }
 })
 
@@ -41,6 +42,7 @@ import {
   listMessageVersions,
   listMessages,
   listMessagesPage,
+  listPendingConfirmations,
   listProjects,
   listQueuedMessages,
   listSnapshots,
@@ -282,5 +284,60 @@ describe('project deletion sync', () => {
     expect(listMessageVersions).toHaveBeenCalledWith('c1')
     expect(listQueuedMessages).toHaveBeenCalledWith('c1')
     expect(listSnapshots).toHaveBeenCalledWith('c1')
+  })
+})
+
+describe('pending confirmations sync', () => {
+  beforeEach(() => {
+    useProjectStore.setState({
+      currentProject: project('p1'),
+      currentConversation: conversation('c1'),
+      pendingConfirmations: {},
+      toolApprovals: [],
+      pendingPlan: null,
+    })
+  })
+
+  it('服务端已无记录时关闭失效的审批弹窗与计划卡', async () => {
+    useProjectStore.setState({
+      pendingConfirmations: {
+        c1: [{ conversation_id: 'c1', kind: 'approval', request_id: 'stale' } as never],
+      },
+      toolApprovals: [{ requestId: 'stale', tool: 'run_command' } as never],
+      pendingPlan: { requestId: 'stale-plan', conversationId: 'c1', plan: 'x' } as never,
+    })
+    const live = { conversation_id: 'c1', kind: 'approval', request_id: 'live' } as never
+    vi.mocked(listPendingConfirmations).mockResolvedValue([live])
+
+    await useProjectStore.getState().refreshPendingConfirmations()
+
+    const state = useProjectStore.getState()
+    expect(state.toolApprovals).toEqual([])
+    expect(state.pendingPlan).toBeNull()
+    expect(state.pendingConfirmations).toEqual({ c1: [live] })
+  })
+
+  it('同步途中新到达的确认项不被旧快照关闭', async () => {
+    let release!: () => void
+    vi.mocked(listPendingConfirmations).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve([])
+        }),
+    )
+    const syncing = useProjectStore.getState().refreshPendingConfirmations()
+    // 查询未返回时，新审批通过事件进入视图与待确认表
+    useProjectStore.setState({
+      pendingConfirmations: {
+        c1: [{ conversation_id: 'c1', kind: 'approval', request_id: 'new' } as never],
+      },
+      toolApprovals: [{ requestId: 'new', tool: 'run_command' } as never],
+    })
+    release()
+    await syncing
+
+    const state = useProjectStore.getState()
+    expect(state.toolApprovals.map((a) => a.requestId)).toEqual(['new'])
+    expect(state.pendingConfirmations.c1.map((p) => p.request_id)).toEqual(['new'])
   })
 })
