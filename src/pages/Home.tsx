@@ -581,6 +581,11 @@ export default function Home() {
   }, [todos])
   // 用户点击停止后立即进入本地“停止中”状态，直到对应流式桶真正收敛。
   const [stopRequested, setStopRequested] = useState(false)
+  // 媒体生成尝试代次与停止意图：generateMedia 要等任务结束才返回，停止时记下
+  // 当前代次，结束时据此区分「用户主动停止」与真实失败；晚到的旧尝试结果
+  // （失败/停止）也不得覆盖随后启动的新任务。
+  const genAttemptRef = useRef(0)
+  const genStopAttemptRef = useRef(0)
   // 右侧栏 Web 预览：待打开地址 + 当前 iframe 地址
   // 不预填开发机地址：绿色版里没有 5173 的开发服务器，预填只会让人看到"拒绝连接"
   // （本机实际反馈）。留空并给出提示，由用户填自己要看的地址。
@@ -1987,8 +1992,10 @@ export default function Home() {
   /** 当前会话生成媒体任务状态（gen-* 事件驱动：生成中禁用发送、输入区展示状态条） */
   const currentGen = currentConversation ? genStatus[currentConversation.id] : undefined
   useEffect(() => {
-    if (!isStreaming) setStopRequested(false)
-  }, [isStreaming])
+    // 媒体生成没有流式桶：currentGen 由 gen-error 清除。两者都结束才复位，
+    // 否则媒体停止按钮置上的 stopRequested 会永久拦住后续发送。
+    if (!isStreaming && !currentGen) setStopRequested(false)
+  }, [isStreaming, currentGen])
   // 预计算最后一条助手消息 ID，供虚拟列表复用，避免每条消息渲染时都访问数组
   const lastAssistantId = useMemo(() => {
     if (isStreaming) return null
@@ -2687,6 +2694,7 @@ export default function Home() {
     if (!targetConversation) return
     const mode = genMode
     const imgs = pickedImages
+    const attempt = ++genAttemptRef.current
     // 先清空输入区：invoke 要等整个生成任务结束后才 resolve
     setDraft('')
     setPickedImages([])
@@ -2694,15 +2702,23 @@ export default function Home() {
     setGenMenuOpen(false)
     try {
       await generateMedia(targetConversation.id, mode, text, undefined, imgs.length ? imgs : undefined)
+      if (genAttemptRef.current === attempt) genStopAttemptRef.current = 0
     } catch (e) {
-      useNotificationStore.getState().push({
-        tone: 'error',
-        title: t('home.genFailed', '生成失败'),
-        body: String(e ?? ''),
-      })
+      const stoppedByUser = genStopAttemptRef.current === attempt
+      // 已有新尝试接管：旧任务晚到的失败不得回滚输入或弹错误
+      if (genAttemptRef.current !== attempt) return
+      genStopAttemptRef.current = 0
+      // 主动停止也恢复输入（便于修改后重试），但停止是用户意图，不能报成失败
       setDraft((cur) => (cur.trim() ? `${text}\n\n${cur}` : text))
       setPickedImages((cur) => [...imgs, ...cur].slice(0, 4))
       setGenMode(mode)
+      if (!stoppedByUser) {
+        useNotificationStore.getState().push({
+          tone: 'error',
+          title: t('home.genFailed', '生成失败'),
+          body: String(e ?? ''),
+        })
+      }
     }
   }
 
@@ -6249,6 +6265,7 @@ export default function Home() {
                 </span>
                 <button
                   onClick={() => {
+                    genStopAttemptRef.current = genAttemptRef.current
                     setStopRequested(true)
                     void stopGeneration()
                   }}

@@ -171,6 +171,31 @@ pub async fn generate_media(
     }
 }
 
+/// 停止轮询间隔：图片/音频是同步请求、视频轮询每 10 秒才看一次停止标志。
+/// 用户点停止后不应再等整个请求跑完，这里每 200ms 检查一次。
+const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 让生成请求与停止请求竞速：命中停止即丢弃生成 future（reqwest 连接随 drop 取消）。
+/// 视频轮询内部的 `is_stopped` 检查仍保留，作为服务层兜底。
+async fn race_with_stop<T, F>(
+    cancel: &ChatCancel,
+    conversation_id: &str,
+    work: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let stop = async {
+        while !is_cancelled(cancel, conversation_id) {
+            tokio::time::sleep(STOP_POLL_INTERVAL).await;
+        }
+    };
+    tokio::select! {
+        result = work => result,
+        _ = stop => Err("任务已停止".to_string()),
+    }
+}
+
 /// 生成任务主体：选模型 → 调生成服务 → 结果入库 → 事件推送
 #[allow(clippy::too_many_arguments)]
 async fn generate_media_body(
@@ -247,10 +272,19 @@ async fn generate_media_body(
             is_stopped: &is_stopped,
             on_progress: &on_progress,
         };
-        match generation::generate(&req).await {
+        match race_with_stop(cancel, &conversation_id, generation::generate(&req)).await {
             Ok(f) => f,
             Err(e) => {
-                let msg = format!("{}生成失败: {e}", kind_label);
+                // 主动停止不是失败：invoke 仍以错误返回（调用方据此恢复输入），
+                // 但文案不能用「生成失败」，否则用户会以为任务真的坏了。
+                let stopped = is_cancelled(cancel, &conversation_id);
+                let msg = if stopped {
+                    "已停止生成".to_string()
+                } else {
+                    format!("{}生成失败: {e}", kind_label)
+                };
+                // 失败/停止都不会产出消息：清掉本次请求的独立目录，避免半成品堆积
+                let _ = std::fs::remove_dir_all(&out_dir);
                 let _ = app.emit(
                     "gen-error",
                     GenErrorEvent {
@@ -432,4 +466,28 @@ fn persist_generation_message(
         modified_files_json: None,
         duration_ms: None,
     })
+}
+
+#[cfg(test)]
+mod stop_race_tests {
+    use super::*;
+    use std::future::pending;
+
+    /// 停止标志已置位时，即使生成 future 永不完成也立即返回，
+    /// 不再等图片/音频请求自己超时。
+    #[tokio::test]
+    async fn stop_request_cancels_in_flight_generation() {
+        let cancel = ChatCancel::default();
+        cancel.0.lock().unwrap().insert("conv".into());
+        let result = race_with_stop(&cancel, "conv", pending::<Result<(), String>>()).await;
+        assert_eq!(result, Err("任务已停止".to_string()));
+    }
+
+    /// 没有停止请求时原样透传生成结果，停止轮询不能抢走已完成的成功结果。
+    #[tokio::test]
+    async fn completed_generation_passes_through() {
+        let cancel = ChatCancel::default();
+        let result = race_with_stop(&cancel, "conv", async { Ok::<_, String>("files") }).await;
+        assert_eq!(result, Ok("files"));
+    }
 }

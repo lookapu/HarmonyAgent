@@ -6,6 +6,35 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 65: media generation can actually be stopped (2026-10-22)
+
+Scenario: while an image/video/audio generation is running, the user clicks "Stop" on
+the status bar. Four problems existed: the button set the chat-stream `stopRequested`
+flag, but media has no streaming bucket, so the flag never reset and later sends were
+silently blocked until an app restart; image/audio requests had no stop check at all
+and ran to completion; video could take up to 10 seconds (one poll interval) to notice;
+and an intentional stop was reported as "Generation failed" with a red toast.
+
+- `generate_media_body` now races the generation future against a 200 ms stop poll;
+  a stop drops the request (the reqwest connection is cancelled with the future), so
+  image and audio can also be stopped mid-flight;
+- Stopped and failed attempts both remove that request's private output directory, so
+  partial files do not accumulate;
+- An intentional stop returns "Generation stopped"; the frontend restores the prompt
+  and generation mode without showing a failure notification;
+- `stopRequested` resets once the media status (`currentGen`) clears, so the composer
+  no longer locks up.
+
+### Verification
+
+Two new Rust unit tests (tokio timer driven): a pre-set stop flag cancels a generation
+future that never completes; without a stop request the successful result passes
+through unchanged. Rust **1281/1281** (+2) · frontend vitest **239/239** unchanged ·
+`tsc` / `eslint` / clippy baseline green · i18n keys unchanged (**2297**, union
+**2299**) · i18n gates, all 21 gate self-tests, `check-docs` and the production build
+pass. Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 64: new tasks no longer inherit the previous stop flag (2026-10-22)
 
 Scenario one: the user stops a conversation and immediately generates a video. The
