@@ -46,6 +46,14 @@ export function planMessageDelete(
   return streaming ? 'blocked-running' : 'cascade'
 }
 
+/** 历史编辑重跑在「删除后续消息」失败后的取舍：目标消息若仍在库里（多半被运行态
+ * 闸门拒绝），旧历史没有被截断，继续发送只会把新内容追加到旧分支，编辑变成重复
+ * 发送，必须中止；只有确认它已不在（并发删除/本就消失）才继续重跑。读不回
+ * （null）按仍在处理，失败关闭，宁可让用户重试。 */
+export function canRerunAfterDeleteFailure(targetId: string, remainingIds: string[] | null): boolean {
+  return remainingIds !== null && !remainingIds.includes(targetId)
+}
+
 /** 恢复划词选区高亮。快照 Range 的边界节点可能因 DOM 更新失效：Chromium 会把失效边界
  * 归一化到最近的存活节点（选区收缩），此时改用保存的完整文本在容器内重建 Range；
  * 容器本身也被重建时，退化为在所有消息正文中按文本搜索。 */

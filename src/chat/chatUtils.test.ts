@@ -3,6 +3,7 @@ import {
   fmtElapsed,
   impactDisplay,
   interruptedTailMessage,
+  canRerunAfterDeleteFailure,
   planMessageDelete,
   planUserMessageEdit,
   sanitizeToolMarkers,
@@ -84,6 +85,21 @@ describe('planMessageDelete', () => {
     const assistant = chatMsg('assistant', 'a1', { queued: 0 })
     expect(planMessageDelete(assistant, false)).toBe('cascade')
     expect(planMessageDelete(assistant, true)).toBe('blocked-running')
+  })
+})
+
+describe('canRerunAfterDeleteFailure', () => {
+  it('目标消息仍在库里：历史未被截断，中止重跑', () => {
+    expect(canRerunAfterDeleteFailure('u1', ['u0', 'u1', 'a1'])).toBe(false)
+  })
+
+  it('目标已不在（并发删除/本就消失）：允许继续重跑', () => {
+    expect(canRerunAfterDeleteFailure('u1', ['u0'])).toBe(true)
+    expect(canRerunAfterDeleteFailure('u1', [])).toBe(true)
+  })
+
+  it('读不回消息列表：失败关闭，中止重跑', () => {
+    expect(canRerunAfterDeleteFailure('u1', null)).toBe(false)
   })
 })
 

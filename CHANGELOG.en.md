@@ -6,6 +6,35 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 75: a rejected history edit no longer "pretends to rerun" (2026-10-22)
+
+Editing a historical user message means deleting that message and everything after
+it, then sending the edited content again. A task can start while the edit dialog is
+open (or be waiting in the project queue, or between two turns). The backend gate
+added in batch 73 then rejects the deletion, but the frontend catch said "delete
+failed, still rerun with the new content": the old history was never truncated, yet
+the new content was appended as an ordinary message — one edit became two prompts and
+the model context still carried the old branch. A deletion failure for any other
+reason produced the same "thought it replaced, actually appended" outcome.
+
+- After a failed deletion, re-read the message list to confirm whether the target is
+  still there: if it is (deletion rejected/failed), abort the rerun, restore the
+  edited content to the composer, and show the failure reason; only continue when the
+  target is confirmed gone (concurrent deletion / already absent);
+- If the message list cannot be read, treat the target as still present (fail closed):
+  make the user retry rather than append a duplicate branch;
+- The decision is `canRerunAfterDeleteFailure`, with unit tests for all three cases
+  (still present / gone / unreadable).
+
+### Verification
+
+3 vitest cases added (abort while present, continue when gone, abort when unreadable).
+Rust full suite **1302/1302** (unchanged, no backend changes) · frontend vitest
+**249/249** (+3) · `tsc` / `eslint` / clippy baseline 57/57 · i18n keys unchanged
+(2298, union 2300) · all three i18n gates, 21 gate self-tests, `check-docs`, and the
+production build pass. Tool and migration counts are unchanged: `TOOL_SPECS` to **204**; database migration count reaches **86**.
+
+---
 ## Unreleased — Batch 74: time-travel restore passes the task gate and no longer lands on ghost anchors (2026-10-22)
 
 Scenario: restoring a snapshot (time travel) only checked `ChatLock`, which is held

@@ -115,6 +115,7 @@ import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { EmptyState as UiEmptyState } from '../components/ui/EmptyState'
 import { useEscapeKey } from '../hooks/useEscapeKey'
 import {
+  canRerunAfterDeleteFailure,
   fmtElapsed,
   impactDisplay,
   interruptedTailMessage,
@@ -7662,8 +7663,26 @@ export default function Home() {
               setEditTarget(null)
               try {
                 await removeMessage(target.id)
-              } catch {
-                // 删除失败（如消息已不存在）：仍按新内容重跑，避免任务无法继续
+              } catch (e) {
+                // 删除失败先确认目标是否还在：还在说明历史没被截断（多半是弹窗
+                // 打开期间任务启动，后端拒绝删除），继续发送会把新内容追加到旧
+                // 分支；只有确认目标已消失（并发删除）才允许按新内容重跑。
+                const remainingIds = await listMessages(target.conversation_id)
+                  .then((msgs) => msgs.map((m) => m.id))
+                  .catch(() => null)
+                if (!canRerunAfterDeleteFailure(target.id, remainingIds)) {
+                  if (currentProject) {
+                    restoreComposerInput(target.conversation_id, currentProject.id, content, refs ?? [], null, [])
+                  } else {
+                    setDraft((cur) => (cur.trim() ? `${content}\n\n${cur}` : content))
+                  }
+                  useNotificationStore.getState().push({
+                    tone: 'warn',
+                    title: t('home.editFailed'),
+                    body: String(e ?? ''),
+                  })
+                  return
+                }
               }
               const delivered = await sendUserMessage(content, undefined, refs)
               if (!delivered) {
