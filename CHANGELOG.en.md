@@ -6,6 +6,38 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 64: new tasks no longer inherit the previous stop flag (2026-10-22)
+
+Scenario one: the user stops a conversation and immediately generates a video. The
+media task reads the previous task's stop flag at its first stop check and fails with
+"task stopped"; the flag stays set, so every later video generation is cancelled at
+once. Scenario two: after a stop, a new chat task cleared the old flag only late in
+startup, so a Stop arriving between successful registration and that clear was
+discarded — the task kept running even though the user clicked Stop.
+
+- `ChatCancel` gains `clear_stale_stop`, whose meaning is "a new task registered
+  successfully"; it clears only this conversation;
+- `stream_chat` and `generate_media` clear the stale flag only after
+  `TaskRegistry::register` succeeds and before the task body is released. A failed
+  registration means the old task is still running, so nothing is cleared and a Stop
+  aimed at that task is not swallowed;
+- The late clear inside `stream_chat_inner` is removed: Stop requests that arrive
+  after release now stay visible to the project-lock wait and the normal safe points;
+- A `stale_stop_cleared` log line is written when a leftover flag is actually removed,
+  so "Stop leaking into the next task" is easy to audit.
+
+### Verification
+
+Two new Rust unit tests: a new task clears only its own conversation's stale flag,
+leaves another conversation's stop request untouched, and reports no false removal
+when repeated; a stop requested after registration stays sticky for the whole task
+and is cleared only when the next task starts. Rust **1279/1279** (+2) · frontend
+vitest **239/239** unchanged · `tsc` / `eslint` / clippy baseline green · i18n keys
+unchanged (**2297**, union **2299**) · i18n gates, all 21 gate self-tests,
+`check-docs` and the production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 63: take over other conversations' queued messages when the project lock frees (2026-10-22)
 
 Scenario: conversation A is running and the user switches to conversation B to send a

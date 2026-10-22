@@ -85,7 +85,7 @@ impl Drop for RegisteredGenTask {
 pub async fn generate_media(
     app: AppHandle,
     state: State<'_, DbState>,
-    _cancel: State<'_, ChatCancel>,
+    cancel: State<'_, ChatCancel>,
     conversation_id: String,
     kind: String,
     prompt: String,
@@ -145,6 +145,15 @@ pub async fn generate_media(
         TaskRegistry::ensure_watchdog(app.clone());
         generation
     };
+    // 与 stream_chat 一致：登记成功即新任务，上一任务的停止标志不能遗传，
+    // 否则媒体生成会在第一次停止检查时立刻自我取消。登记失败分支已返回，
+    // 不会误清正在运行任务的停止请求。
+    if cancel.clear_stale_stop(&conversation_id) {
+        crate::utils::logger::log_event(
+            "stale_stop_cleared",
+            serde_json::json!({ "conversation_id": conversation_id, "task": "media" }),
+        );
+    }
     let mut registered = RegisteredGenTask {
         app: app.clone(),
         conversation_id: conversation_id.clone(),

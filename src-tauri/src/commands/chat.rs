@@ -309,6 +309,23 @@ pub struct ChatLock(pub StdMutex<HashMap<String, String>>);
 #[derive(Default)]
 pub struct ChatCancel(pub StdMutex<HashSet<String>>);
 
+impl ChatCancel {
+    /// 新任务登记成功后调用：清除上一任务遗留的停止标志。
+    ///
+    /// 停止是任务级的一次性信号（并行工具共享同一标志，见 `is_cancelled`）。
+    /// 新任务若继承旧标志，聊天任务会在启动阶段被误判成"用户已停止"，媒体生成
+    /// 则会在第一次停止检查时自我取消——而这份停止请求早已随上一任务结束失效。
+    ///
+    /// **只能在 `TaskRegistry::register` 成功后调用**：登记失败说明旧任务仍在运行，
+    /// 此时清除会吞掉用户针对旧任务的停止请求。返回是否真的清掉了遗留标志。
+    pub(crate) fn clear_stale_stop(&self, conversation_id: &str) -> bool {
+        self.0
+            .lock()
+            .map(|mut set| set.remove(conversation_id))
+            .unwrap_or(false)
+    }
+}
+
 /// 「立即插入」请求表：conversation_id -> 发起请求时的任务代次。
 /// 用户点排队条上的"立即插入"时置位，安全点无条件把排队消息并入当前任务。
 /// 与"发送到 Agent"（agent_owned 消息在安全点并入）的区别只在**不由模型决定**：这里是用户
@@ -3403,7 +3420,7 @@ pub async fn stream_chat(
     app: AppHandle,
     state: State<'_, DbState>,
     _lock: State<'_, ChatLock>,
-    _cancel: State<'_, ChatCancel>,
+    cancel: State<'_, ChatCancel>,
     _approval: State<'_, ToolApprovalState>,
     _plan_review: State<'_, PlanApprovalState>,
     conversation_id: String,
@@ -3503,6 +3520,15 @@ pub async fn stream_chat(
         TaskRegistry::ensure_watchdog(app.clone());
         generation
     };
+    // 登记成功即新任务：上一任务的一次性停止标志不能遗传。必须放在 register 之后
+    // （失败分支已返回，不能吞掉旧任务的停止请求），并尽量贴近放行点，让放行后
+    // 到达的停止请求都能被任务主体看到。
+    if cancel.clear_stale_stop(&conversation_id) {
+        crate::utils::logger::log_event(
+            "stale_stop_cleared",
+            serde_json::json!({ "conversation_id": conversation_id, "task": "chat" }),
+        );
+    }
     // 首条已从队列认领：立即通知前端清掉「排队中」标记（后续行仍保持排队）。
     // 带上完整消息：批量发送时这条只存在于排队条，前端要据此补进时间线。
     if let Some(qid) = queued_message_id.as_deref() {
@@ -6364,10 +6390,8 @@ async fn stream_chat_inner(
             lease_expires_at,
         },
     );
-    // 清除该会话历史停止标志（一次性标志，避免残留影响本次请求）
-    if let Ok(mut set) = cancel.0.lock() {
-        set.remove(&conversation_id);
-    }
+    // 停止标志已在任务登记成功后清除（见 stream_chat）；此处不能再清，
+    // 否则会把登记之后、跑到这里之前到达的停止请求一并吞掉。
     // 重置任务级工具预算（防打转护栏，每次任务独立计数）
     tool_limits::reset_task_budget(&conversation_id);
     // 重置任务护栏（目标锚定/失速检测/失败黑名单），以用户最新消息为目标
@@ -11561,6 +11585,38 @@ mod tool_execution_policy_tests {
         cancel.0.lock().unwrap().insert("conv".into());
         assert!(is_cancelled(&cancel, "conv"));
         assert!(is_cancelled(&cancel, "conv"));
+    }
+
+    /// 新任务登记成功后只清除本会话的遗留停止标志；其他会话正在被停止的请求
+    /// 不能被误清，已清除的标志再清一次也不能假装"又清了一条"。
+    #[test]
+    fn new_task_clears_only_its_own_stale_stop() {
+        let cancel = ChatCancel::default();
+        cancel
+            .0
+            .lock()
+            .unwrap()
+            .extend(["done".to_string(), "running".to_string()]);
+
+        assert!(cancel.clear_stale_stop("done"));
+        assert!(!is_cancelled(&cancel, "done"));
+        assert!(is_cancelled(&cancel, "running"));
+        assert!(!cancel.clear_stale_stop("done"));
+    }
+
+    /// 登记后的清理必须发生在放行之前：放行后用户点停止，标志在整个任务内保持
+    /// 粘性（并行工具都能看到），直到下一任务登记成功才被清除。
+    #[test]
+    fn stop_after_task_start_stays_sticky_until_next_task() {
+        let cancel = ChatCancel::default();
+        assert!(!cancel.clear_stale_stop("conv"));
+
+        cancel.0.lock().unwrap().insert("conv".into());
+        assert!(is_cancelled(&cancel, "conv"));
+        assert!(is_cancelled(&cancel, "conv"));
+
+        assert!(cancel.clear_stale_stop("conv"));
+        assert!(!is_cancelled(&cancel, "conv"));
     }
 
     #[test]
