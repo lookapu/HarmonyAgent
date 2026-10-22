@@ -1511,10 +1511,15 @@ fn restore_snapshot_conn(
             params![conversation_id, anchor],
         )
         .map_err(|e| e.to_string())?;
-    // 3. 账本写回快照时刻（断点续跑/继续任务继承该点执行轨迹）
+    // 3. 账本写回快照时刻（断点续跑/继续任务继承该点执行轨迹），同时抬升
+    //    Run 恢复水位：锚点之后被归档的 Run 只留审计，重开会话不能再复活未来分支。
     tx.execute(
-        "UPDATE conversations SET ledger = ?1 WHERE id = ?2",
-        params![ledger_json, conversation_id],
+        "UPDATE conversations SET ledger = ?1, history_rewritten_at_ms = ?2 WHERE id = ?3",
+        params![
+            ledger_json,
+            chrono::Utc::now().timestamp_millis(),
+            conversation_id
+        ],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -3166,6 +3171,14 @@ fn delete_message_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<
         [&conversation_id],
     )
     .map_err(|e| e.to_string())?;
+    // 删除即改写历史：被删段所属的 Run 不能再作为「未完成任务」被恢复
+    if removed > 0 {
+        tx.execute(
+            "UPDATE conversations SET history_rewritten_at_ms = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().timestamp_millis(), conversation_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(removed as u64)
 }
@@ -3211,7 +3224,12 @@ mod delete_message_tests {
                 ledger_json TEXT,
                 tool_count INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                history_rewritten_at_ms INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO conversations (id) VALUES ('c1'), ('c2');",
         )
         .unwrap();
         conn
@@ -3303,6 +3321,33 @@ mod delete_message_tests {
     }
 
     #[test]
+    fn deleting_messages_advances_run_recovery_floor() {
+        let conn = setup();
+        insert_message(&conn, "m1", "c1", 0);
+        insert_message(&conn, "m2", "c1", 0);
+        insert_message(&conn, "m3", "c2", 0);
+
+        delete_message_conn(&conn, "m2").unwrap();
+
+        let floor: i64 = conn
+            .query_row(
+                "SELECT history_rewritten_at_ms FROM conversations WHERE id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(floor > 0, "删除即改写历史：被删段的 Run 不能再被恢复");
+        let other: i64 = conn
+            .query_row(
+                "SELECT history_rewritten_at_ms FROM conversations WHERE id = 'c2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 0, "其他会话的 Run 恢复水位不受影响");
+    }
+
+    #[test]
     fn running_task_rejects_delete_before_any_write() {
         let conn = setup();
         insert_message(&conn, "m1", "c1", 0);
@@ -3368,6 +3413,14 @@ mod delete_message_tests {
             "消息删除失败时附属数据清理必须回滚"
         );
         assert_eq!(strings(&conn, "SELECT user_message_id FROM message_versions"), vec!["m1"]);
+        let floor: i64 = conn
+            .query_row(
+                "SELECT history_rewritten_at_ms FROM conversations WHERE id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, 0, "删除失败回滚时不能抬升 Run 恢复水位");
     }
 }
 
@@ -15943,7 +15996,8 @@ mod snapshot_tests {
     fn setup() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE conversations (id TEXT PRIMARY KEY, ledger TEXT);
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, ledger TEXT,
+                 history_rewritten_at_ms INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
                  content TEXT NOT NULL DEFAULT '', queued INTEGER NOT NULL DEFAULT 0, agent_owned INTEGER NOT NULL DEFAULT 0,
                  hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
@@ -16177,6 +16231,74 @@ mod snapshot_tests {
 
         assert_eq!((res.archived, res.restored), (2, 0));
         assert_eq!(visible(&conn), 3, "旧快照继续按 rowid 恢复");
+    }
+
+    #[test]
+    fn restore_invalidates_run_recovery_before_rewrite() {
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE agent_runs (
+                run_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, goal TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL, phase TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
+                last_event_seq INTEGER NOT NULL DEFAULT 0, recovery_count INTEGER NOT NULL DEFAULT 0,
+                resume_policy TEXT NOT NULL DEFAULT 'continue', acceptance_json TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}', error TEXT, started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, finished_at INTEGER, parent_run_id TEXT,
+                recovery_plan_json TEXT, recovery_mode TEXT NOT NULL DEFAULT 'fresh',
+                goal_contract_json TEXT, remediation_count INTEGER NOT NULL DEFAULT 0,
+                heartbeat_at INTEGER, lease_expires_at INTEGER, quality_json TEXT, approved_plan TEXT
+            );",
+        )
+        .unwrap();
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "A1", 2);
+        save_conversation_snapshot(&conn, "c1", None, "A 阶段", 1).unwrap();
+        let snap: String = conn
+            .query_row("SELECT id FROM conversation_snapshots", [], |r| r.get(0))
+            .unwrap();
+        // 未来分支的中断 Run：恢复前它是「最近一次运行」，恢复后必须失效
+        conn.execute(
+            "INSERT INTO agent_runs (run_id,conversation_id,state,phase,started_at,updated_at)
+             VALUES ('future-run','c1','interrupted','recovery_required',1,2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::agent::runtime::latest_run(&conn, "c1")
+                .unwrap()
+                .map(|run| run.run_id)
+                .as_deref(),
+            Some("future-run")
+        );
+
+        restore_snapshot_conn(&conn, "c1", &snap).unwrap();
+
+        let floor: i64 = conn
+            .query_row(
+                "SELECT history_rewritten_at_ms FROM conversations WHERE id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(floor > 2, "恢复必须抬升 Run 恢复水位：{floor}");
+        assert!(
+            crate::agent::runtime::latest_run(&conn, "c1").unwrap().is_none(),
+            "被归档未来分支的中断 Run 不能再复活成未完成任务"
+        );
+        // 恢复之后新启动的 Run 仍正常参与恢复
+        conn.execute(
+            "INSERT INTO agent_runs (run_id,conversation_id,state,phase,started_at,updated_at)
+             VALUES ('new-run','c1','interrupted','recovery_required',?1,?1)",
+            [floor + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::agent::runtime::latest_run(&conn, "c1")
+                .unwrap()
+                .map(|run| run.run_id)
+                .as_deref(),
+            Some("new-run")
+        );
     }
 
     #[tokio::test]

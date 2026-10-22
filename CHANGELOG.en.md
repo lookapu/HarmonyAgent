@@ -6,6 +6,37 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 78: rewinding history no longer resurrects the rolled-back branch's task (2026-10-22)
+
+Scenario: restoring a historical snapshot or deleting a run of messages only rewrites
+`messages` and the ledger; `agent_runs` / `run_events` must be retained as the audit
+source of truth. But when a conversation is reopened, the frontend reads the "latest
+durable Run" to restore the unfinished task, partial output, and tool trace. After time
+travel that latest Run usually belongs to the archived future branch, so the
+rolled-back unfinished task reappears in the UI and its interrupted output can even be
+injected into the rewound conversation. Batch 76 only cleared the in-process view
+state; switching conversations or reloading brought it back.
+
+- Migration 088 adds `history_rewritten_at_ms` to `conversations`: restoring a
+  snapshot or deleting messages raises the Run recovery floor in the same transaction;
+- `latest_run` only returns Runs started after the floor. Runs before it (including
+  the future branch) remain fully available in `agent_runs` / `run_events` for audit,
+  but are no longer returned as resumable state; a floor of 0 keeps the old behavior;
+- Runs started after the rewrite recover normally; resend/regenerate is unaffected;
+- The floor shares the message/ledger transaction, so either everything commits or
+  everything rolls back — never "messages rewound but the Run is still resumable".
+
+### Verification
+
+3 Rust unit tests added (floor filtering with a fresh Run, snapshot restore raising
+the floor and hiding the future branch, message deletion raising the floor with
+rollback on failure). Rust full suite **1309/1309** (+3) · frontend vitest
+**250/250** (unchanged, no frontend changes) · `tsc` / `eslint` / clippy baseline
+57/57 · i18n keys unchanged (2298, union 2300) · all three i18n gates,
+21 gate self-tests, `check-docs`, and the production build pass. Tool count
+unchanged: `TOOL_SPECS` to **204**; database migration count reaches **88**.
+
+---
 ## Unreleased — Batch 77: snapshot anchors resolve by message id, so reused rowids no longer land on new messages (2026-10-22)
 
 Scenario: time-travel snapshots and branch checkpoints both recorded their anchor as

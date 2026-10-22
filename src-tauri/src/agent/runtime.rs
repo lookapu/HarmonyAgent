@@ -1081,11 +1081,28 @@ pub fn set_approved_plan(
     tx.commit().map_err(|e| e.to_string())
 }
 
+/// 会话最近一次可恢复 Run。
+///
+/// `history_rewritten_at_ms` 是历史改写水位：回到历史点/删除消息后，水位之前启动的
+/// Run 仍保留在 agent_runs/run_events 里作审计，但它们属于被归档的未来分支，检查点
+/// 可能指向已不可见的消息。继续把它们当「未完成任务」恢复，等于把回退掉的工作重新
+/// 带回当前对话；因此这里只返回水位之后启动的 Run（水位为 0 时行为不变）。
 pub fn latest_run(conn: &Connection, conversation_id: &str) -> Result<Option<AgentRun>, String> {
+    let rewound_at: i64 = conn
+        .query_row(
+            "SELECT COALESCE(history_rewritten_at_ms,0) FROM conversations WHERE id=?1",
+            [conversation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
     let run_id: Option<String> = conn
         .query_row(
-            "SELECT run_id FROM agent_runs WHERE conversation_id=?1 ORDER BY started_at DESC LIMIT 1",
-            [conversation_id],
+            "SELECT run_id FROM agent_runs
+             WHERE conversation_id=?1 AND (?2=0 OR started_at>?2)
+             ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            params![conversation_id, rewound_at],
             |r| r.get(0),
         )
         .optional()
@@ -1200,7 +1217,7 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(
             "PRAGMA foreign_keys=ON;
-             CREATE TABLE conversations(id TEXT PRIMARY KEY);
+             CREATE TABLE conversations(id TEXT PRIMARY KEY,history_rewritten_at_ms INTEGER NOT NULL DEFAULT 0);
              INSERT INTO conversations(id) VALUES ('c');
              CREATE TABLE agent_runs(run_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),goal TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,phase TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,last_event_seq INTEGER NOT NULL DEFAULT 0,recovery_count INTEGER NOT NULL DEFAULT 0,resume_policy TEXT NOT NULL DEFAULT 'continue',acceptance_json TEXT,metadata_json TEXT NOT NULL DEFAULT '{}',error TEXT,started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,finished_at INTEGER,parent_run_id TEXT,recovery_plan_json TEXT,recovery_mode TEXT NOT NULL DEFAULT 'fresh',goal_contract_json TEXT,remediation_count INTEGER NOT NULL DEFAULT 0,heartbeat_at INTEGER,lease_expires_at INTEGER,quality_json TEXT,approved_plan TEXT);
              CREATE TABLE run_events(event_id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES agent_runs(run_id),conversation_id TEXT NOT NULL REFERENCES conversations(id),seq INTEGER NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(run_id,seq));
@@ -1706,5 +1723,32 @@ mod tests {
         let events = events_after(&c, "child", 0, 20).unwrap();
         assert_eq!(events.last().unwrap().event_type, "recovery.completed");
         assert_eq!(get_run(&c, "child").unwrap().unwrap().last_event_seq, 4);
+    }
+
+    #[test]
+    fn latest_run_ignores_runs_started_before_history_rewrite() {
+        let c = conn();
+        c.execute(
+            "INSERT INTO agent_runs (run_id,conversation_id,state,phase,started_at,updated_at,finished_at)
+             VALUES ('old','c','completed','done',100,100,150),
+                    ('future','c','interrupted','recovery_required',300,300,350)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(latest_run(&c, "c").unwrap().unwrap().run_id, "future");
+
+        c.execute("UPDATE conversations SET history_rewritten_at_ms=400 WHERE id='c'", []).unwrap();
+        assert!(
+            latest_run(&c, "c").unwrap().is_none(),
+            "时间旅行/删除消息之前启动的 Run 全部失效：被归档的未来分支不能复活，旧检查点也不再作为续跑依据"
+        );
+
+        c.execute(
+            "INSERT INTO agent_runs (run_id,conversation_id,state,phase,started_at,updated_at)
+             VALUES ('fresh','c','interrupted','recovery_required',401,401)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(latest_run(&c, "c").unwrap().unwrap().run_id, "fresh", "改写后新启动的 Run 正常参与恢复");
     }
 }
