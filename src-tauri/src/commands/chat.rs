@@ -14797,13 +14797,19 @@ pub(crate) fn delete_conversation_sync(
     delete_conversation_inner(id, app, state, &cancel, &lock, &registry)
 }
 
-fn delete_conversation_inner(
+/// 停止某个会话的进程内运行态：协作式停止标志、未答复提问、审批持久撤销、
+/// tokio 任务 abort、项目级会话锁、预算/护栏/会话上下文/后台作业。
+///
+/// 删除会话与「一键清空内容」共用。即使审批持久撤销失败，本地停止与运行态清理
+/// 也一定已完成；调用方可据此决定是否继续删库（删除会话要求撤销成功，
+/// 清空全部内容则记录失败后继续，因为 tool_runs/run_events 随后会被整体清空）。
+pub(crate) fn stop_conversation_runtime(
     id: &str,
-    app: &AppHandle,
-    state: &tauri::State<'_, DbState>,
-    cancel: &tauri::State<'_, ChatCancel>,
-    lock: &tauri::State<'_, ChatLock>,
+    state: &DbState,
+    cancel: &ChatCancel,
+    lock: &ChatLock,
     registry: &TaskRegistry,
+    abort_reason: &str,
 ) -> Result<(), String> {
     // 1. 协作式停止：设置一次性停止标志（安全点会消费），并关闭未答复的提问
     if let Ok(mut set) = cancel.0.lock() {
@@ -14814,19 +14820,36 @@ fn delete_conversation_inner(
         state, id, crate::agent::broker_approval::StopReason::ConversationDeleted,
     );
     // 2. 立即 abort 正在运行的 tokio 任务，并从注册表移除（看门狗不再追猎）
-    registry.abort_conversation(id);
-    revocation?;
+    registry.abort_conversation_with_reason(id, abort_reason);
     // 3. 释放项目级会话锁：仅当持有者确实是本会话时才移除，避免误删其他会话的锁
     if let Ok(mut g) = lock.0.lock() {
         if g.values().any(|v| v == id) {
             g.retain(|_, v| v != id);
         }
     }
-    // 4. 清理进程内运行态预算/护栏（防内存随会话创建/删除单调增长）
+    // 4. 清理进程内运行态预算/护栏/上下文（drop_session 含后台作业）
     crate::services::tool_limits::clear_task_budget(id);
     crate::services::task_guard::clear_task(id);
     crate::agent::session_ctx::drop_session(id);
-    crate::agent::jobs::drop_conversation_jobs(id);
+    revocation
+}
+
+fn delete_conversation_inner(
+    id: &str,
+    app: &AppHandle,
+    state: &tauri::State<'_, DbState>,
+    cancel: &tauri::State<'_, ChatCancel>,
+    lock: &tauri::State<'_, ChatLock>,
+    registry: &TaskRegistry,
+) -> Result<(), String> {
+    stop_conversation_runtime(
+        id,
+        state,
+        cancel,
+        lock,
+        registry,
+        "conversation_deleted",
+    )?;
 
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     // 先删没有外键级联的附属表（反馈/版本/任务轨迹/事件/待办/提醒），避免孤儿残留。
@@ -14875,6 +14898,90 @@ fn delete_conversation_inner(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod stop_runtime_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn db_with_approval_tables() -> DbState {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tool_runs
+                (id TEXT, trace_id TEXT, conversation_id TEXT, tool_name TEXT, status TEXT);
+             CREATE TABLE run_events
+                (run_id TEXT, conversation_id TEXT, event_type TEXT, payload TEXT);
+             CREATE TABLE ota_approval_revocations
+                (call_id TEXT PRIMARY KEY, run_id TEXT, conversation_id TEXT,
+                 revoked_at INTEGER, reason TEXT, tool TEXT);",
+        )
+        .unwrap();
+        DbState(Arc::new(Mutex::new(conn)))
+    }
+
+    /// 审批库不可用时，持久撤销会失败；但本地停止标志、项目锁等运行态
+    /// 仍必须清干净，否则删除失败后项目锁会永久占住同项目的其他会话。
+    #[test]
+    fn failure_still_releases_local_runtime() {
+        let db = DbState(Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )));
+        let cancel = ChatCancel::default();
+        let lock = ChatLock::default();
+        lock.0.lock().unwrap().insert("proj".into(), "conv".into());
+        let registry = TaskRegistry::default();
+
+        assert!(stop_conversation_runtime(
+            "conv",
+            &db,
+            &cancel,
+            &lock,
+            &registry,
+            "conversation_deleted",
+        )
+        .is_err());
+        assert!(is_cancelled(&cancel, "conv"));
+        assert!(lock.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revokes_active_approval_before_removing_conversation() {
+        let db = db_with_approval_tables();
+        {
+            let conn = db.0.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tool_runs VALUES
+                    ('call-1','run-1','conv','ota_pack','running');
+                 INSERT INTO run_events VALUES
+                    ('run-1','conv','host_capability.explicit_approval',
+                     '{\"tool_call_id\":\"call-1\"}');",
+            )
+            .unwrap();
+        }
+        let cancel = ChatCancel::default();
+        let lock = ChatLock::default();
+        let registry = TaskRegistry::default();
+
+        stop_conversation_runtime(
+            "conv",
+            &db,
+            &cancel,
+            &lock,
+            &registry,
+            "conversation_deleted",
+        )
+        .unwrap();
+        let conn = db.0.lock().unwrap();
+        let revoked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ota_approval_revocations WHERE call_id='call-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoked, 1);
+    }
 }
 
 // ---------- 消息反馈（点赞/点踩 + 原因） ----------

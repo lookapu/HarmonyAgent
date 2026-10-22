@@ -701,6 +701,61 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     }
   }).catch(() => {})
 
+  // 设置页「清空全部内容数据」：后端先停掉全部运行中任务再清库。
+  // 这里必须整体复位，否则侧栏会话、流式桶、审批卡仍是已删除的数据。
+  listen<{ conversation_ids: string[] }>('conversations-cleared', (event) => {
+    const ids = event.payload?.conversation_ids ?? []
+    const state = get()
+    const streamings = { ...state.streamings }
+    const pendingConfirmations = { ...state.pendingConfirmations }
+    const genStatus = { ...state.genStatus }
+    for (const id of ids) {
+      delete streamings[id]
+      pendingStreamDeltas.delete(id)
+      sendTraces.get(id)?.end()
+      sendTraces.delete(id)
+      delete pendingConfirmations[id]
+      delete genStatus[id]
+      optimisticRunUserIds.delete(id)
+      activeToolCallIds.delete(id)
+      completedToolCallIds.delete(id)
+    }
+    // 所有会话都已删除，按 run id 记录的游标/墓碑一并释放
+    durableRunCursors.clear()
+    terminalRunIds.clear()
+    set({
+      streamings,
+      pendingConfirmations,
+      genStatus,
+      conversations: [],
+      currentConversation: null,
+      messages: [],
+      streaming: emptyStreaming(),
+      toolRuns: [],
+      terminalEntries: [],
+      buildLogs: [],
+      agentRuns: [],
+      plan: null,
+      toolApprovals: [],
+      pendingPlan: null,
+      approvedPlan: null,
+      todos: [],
+      askCard: null,
+      diagnoseCards: [],
+      taskLedgers: {},
+      queuedList: [],
+      unfinishedConv: null,
+      lastTaskSummary: null,
+      snapshots: [],
+      loadingSnapshots: false,
+      olderHasMore: false,
+      loadingOlder: false,
+      feedbackMap: {},
+      versionMap: {},
+      tokenStats: null,
+    })
+  }).catch(() => {})
+
   // ============ 生成媒体任务（gen-* 事件）：图片/视频/音频 ============
   // genStatus 按会话记录生成中状态：输入区状态条 / 停止按钮 / 生成中防重入依赖它
   listen<{ conversation_id: string; kind: 'image' | 'video' | 'audio' }>('gen-start', (event) => {

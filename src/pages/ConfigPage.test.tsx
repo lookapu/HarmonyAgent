@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import ConfigPage from './ConfigPage'
-import { readConfig, getConfigPath, getDataScale } from '../api/config'
+import { readConfig, getConfigPath, getDataScale, clearContentData } from '../api/config'
 import { useThemeStore } from '../stores/themeStore'
 import { useFontScaleStore } from '../stores/fontScaleStore'
 
@@ -118,6 +118,17 @@ describe('ConfigPage 三段结构', () => {
     renderPage()
     fireEvent.click(screen.getByRole('button', { name: /config.clearAll/ }))
     expect(screen.getByText('config.clearAllConfirm')).toBeInTheDocument()
+    expect(clearContentData).not.toHaveBeenCalled()
+  })
+
+  it('确认后调用清空接口并展示删除数量', async () => {
+    vi.mocked(clearContentData).mockResolvedValue([2, 7])
+    renderPage()
+    fireEvent.click(screen.getByRole('button', { name: /config.clearAll/ }))
+    const buttons = screen.getAllByRole('button', { name: /config.clearAll/ })
+    fireEvent.click(buttons[buttons.length - 1])
+    await waitFor(() => expect(clearContentData).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByText('config.clearAllDone')).toBeInTheDocument())
   })
 
   it('常规区给出字号档控件', () => {

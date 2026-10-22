@@ -211,6 +211,11 @@ impl TaskRegistry {
     /// 删除会话等场景：立即请求停止并 abort 正在运行的任务。
     /// 返回 true 表示曾有运行中任务被中止。
     pub fn abort_conversation(&self, conversation_id: &str) -> bool {
+        self.abort_conversation_with_reason(conversation_id, "conversation_deleted")
+    }
+
+    /// 同上，但把触发来源写进日志（删除会话 / 清空全部内容等）。
+    pub fn abort_conversation_with_reason(&self, conversation_id: &str, reason: &str) -> bool {
         self.mark_stop_requested(conversation_id);
         let abort = if let Ok(mut m) = self.0.lock() {
             m.remove(conversation_id).map(|h| h.abort)
@@ -223,7 +228,7 @@ impl TaskRegistry {
                 "task_aborted",
                 serde_json::json!({
                     "conversation_id": conversation_id,
-                    "reason": "conversation_deleted",
+                    "reason": reason,
                 }),
             );
             true
@@ -493,6 +498,18 @@ mod tests {
         registry.unregister("conv-run", generation);
         assert_eq!(registry.run_id("conv-run"), "");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn abort_with_reason_unregisters_and_cancels_task() {
+        let registry = TaskRegistry::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.register("conv-clear", task.abort_handle()).expect("register");
+        assert!(!registry.is_idle());
+        assert!(registry.abort_conversation_with_reason("conv-clear", "content_cleared"));
+        assert!(registry.is_idle());
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!registry.abort_conversation_with_reason("conv-clear", "content_cleared"));
     }
 
     #[test]

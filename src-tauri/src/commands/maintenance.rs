@@ -3,10 +3,18 @@
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::commands::chat::{self, ChatCancel, ChatLock};
 use crate::db::DbState;
 use crate::services::maintenance;
+use crate::utils::task_registry::TaskRegistry;
+
+fn conversation_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM conversations")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
+}
 
 /// 导出数据库完整备份快照（VACUUM INTO 到目标目录，不影响运行中的库）。
 /// dest 缺省时导出到应用数据目录 backups 子目录。
@@ -53,17 +61,61 @@ pub fn export_backup(
 
 /// 一键清空"内容类"数据：会话、消息、反馈、版本、任务/工具轨迹、请求日志、项目记忆、
 /// 审批白名单。保留配置类（providers/models/mcp/skills/权限）与 API 知识库。
+///
+/// 清库前先停止所有会话的运行中任务：否则任务会继续消耗 token，并在会话被删后
+/// 往 session_events/task_runs 写入孤儿行（下一次启动才被清扫）。
+///
 /// 返回被删除的会话数与消息数（供前端展示）。
 #[tauri::command]
 pub fn clear_content_data(
     app: AppHandle,
     state: State<'_, DbState>,
 ) -> Result<(u64, u64), String> {
+    // 先取全部会话 id（随后会删掉，必须先取）；读取失败就不清，避免无 id 可停。
+    let ids = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        conversation_ids(&conn).map_err(|e| e.to_string())?
+    };
+    let cancel = app.state::<ChatCancel>();
+    let lock = app.state::<ChatLock>();
+    let registry = app.state::<TaskRegistry>();
+    let mut stop_failures = 0usize;
+    for id in &ids {
+        if let Err(error) = chat::stop_conversation_runtime(
+            id,
+            &state,
+            &cancel,
+            &lock,
+            &registry,
+            "content_cleared",
+        ) {
+            // 审批持久撤销失败不阻塞清空：tool_runs/run_events 随后会被整体清空，
+            // 活动调用已 abort，不存在可继续执行的凭据。
+            stop_failures += 1;
+            crate::utils::logger::log_event(
+                "conversation_runtime_stop_failed",
+                serde_json::json!({
+                    "conversation_id": id,
+                    "source": "clear_content_data",
+                    "error": error,
+                }),
+            );
+        }
+    }
+
     let mut conn = state.0.lock().map_err(|e| e.to_string())?;
     let (convs, msgs) = maintenance::clear_content_data(&mut conn).map_err(|e| e.to_string())?;
     // 大范围删除后回收文件空间，避免文件继续占盘
     let _ = maintenance::vacuum(&conn);
     drop(conn);
+    // 通知前端：全部会话已删除（流式桶/当前会话/审批卡等必须一起复位）。
+    let _ = app.emit(
+        "conversations-cleared",
+        serde_json::json!({
+            "conversation_ids": ids,
+            "stop_failures": stop_failures,
+        }),
+    );
     // 会话已全部删除，生成产物（图片/视频/音频）一并回收；失败只记日志，
     // 下次启动的孤儿清扫会兜底。
     if let Ok(data_dir) = app.path().app_data_dir() {

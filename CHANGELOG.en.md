@@ -6,6 +6,47 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 69: clearing content now stops running tasks first (2026-10-22)
+
+Scenario: "Clear all content data" in Settings previously only deleted database rows
+and generated media. Running conversation tasks were never told their conversation
+was gone: they kept calling the model and consuming tokens; later writes to
+`session_events` / `task_runs` became fresh orphan rows; writes to foreign-keyed
+tables failed outright; the project-level conversation lock stayed held and blocked
+new conversations in the same project; and the frontend received no event, so the
+sidebar still showed deleted conversations and streaming state.
+
+- Extracted `stop_conversation_runtime` from conversation deletion (stop flag,
+  closing unanswered questions, durable approval revocation, aborting the tokio
+  task, releasing the project lock, clearing budget/guard/session context); both
+  deletion and clear-all use it;
+- Failure semantics changed: even when approval revocation fails, local stop and
+  runtime cleanup always finish. Conversation deletion still requires a successful
+  revocation before deleting rows; clear-all logs
+  `conversation_runtime_stop_failed` and continues, because `tool_runs` /
+  `run_events` are wiped right after and the active call has already been aborted;
+- Clear-all reads every conversation id first and stops each runtime; if reading ids
+  fails, nothing is cleared (there would be no ids to stop);
+- `TaskRegistry` gained abort-with-reason so logs distinguish
+  `conversation_deleted` from `content_cleared`;
+- On success a `conversations-cleared` event resets the frontend conversation list,
+  streaming buckets, pending confirmations, generation status, ledgers, and current
+  conversation;
+- The confirmation dialog now states that running tasks will be stopped, so the
+  interruption is not a hidden side effect.
+
+### Verification
+
+Three new Rust unit tests and one frontend interaction test: successful revocation
+writes a revocation record; failed revocation still clears the stop flag and project
+lock; abort-with-reason unregisters and cancels the task; clear-all is not called
+before confirmation and is called afterwards with the deleted counts shown. Rust
+**1293/1293** (+3) · frontend vitest **240/240** (+1) · `tsc` / `eslint` / clippy
+baseline 57/57 · i18n keys unchanged (**2297**, union **2299**) · three i18n gates,
+all 21 gate self-tests, `check-docs` and the production build pass. Tool count
+unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 68: deleting a conversation or clearing content no longer leaves side data behind (2026-10-22)
 
 Scenario one: when a conversation was deleted, `conversation_todos` and
