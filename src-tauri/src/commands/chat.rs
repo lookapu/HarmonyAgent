@@ -1304,14 +1304,21 @@ fn save_conversation_snapshot(
     if tool_count == 0 && last_model_text.trim().is_empty() {
         return Ok(());
     }
-    // 锚点 = 当前可见消息最大 rowid（hidden 归档段不参与）
-    let msg_rowid: i64 = conn
+    // 锚点 = 当前可见消息末端（rowid + id）。rowid 用于区间比较，id 用于恢复时
+    // 防 rowid 复用：messages 没有 AUTOINCREMENT，删除末端消息后新消息会复用 rowid。
+    let anchor: Option<(i64, String)> = conn
         .query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE conversation_id = ?1 AND hidden = 0",
+            "SELECT rowid, id FROM messages WHERE conversation_id = ?1 AND hidden = 0
+             ORDER BY rowid DESC LIMIT 1",
             params![conversation_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
+        .optional()
         .map_err(|e| e.to_string())?;
+    let (msg_rowid, anchor_message_id) = match anchor {
+        Some((rowid, id)) => (rowid, Some(id)),
+        None => (0, None),
+    };
     // 摘要：模型输出去换行后前 40 字符（时间轴展示用，不落正文）
     let mut label: String = last_model_text
         .split_whitespace()
@@ -1326,12 +1333,13 @@ fn save_conversation_snapshot(
     let ledger_json = ledger
         .and_then(|l| serde_json::to_string(l).ok());
     conn.execute(
-        "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, label, ledger_json, tool_count, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, anchor_message_id, label, ledger_json, tool_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             Uuid::new_v4().to_string(),
             conversation_id,
             msg_rowid,
+            anchor_message_id,
             label,
             ledger_json,
             tool_count as i64,
@@ -1360,25 +1368,36 @@ pub fn list_snapshots(
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, msg_rowid, label, tool_count, created_at FROM conversation_snapshots
+            "SELECT id, msg_rowid, anchor_message_id, label, tool_count, created_at
+             FROM conversation_snapshots
              WHERE conversation_id = ?1 ORDER BY created_at DESC, rowid DESC",
         )
         .map_err(|e| e.to_string())?;
-    let current_rowid: i64 = conn
+    let current: Option<(i64, String)> = conn
         .query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE conversation_id = ?1 AND hidden = 0",
+            "SELECT rowid, id FROM messages WHERE conversation_id = ?1 AND hidden = 0
+             ORDER BY rowid DESC LIMIT 1",
             params![conversation_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
+        .optional()
         .map_err(|e| e.to_string())?;
+    let current_rowid = current.as_ref().map(|(rowid, _)| *rowid).unwrap_or(0);
     let items = stmt
         .query_map(params![conversation_id], |r| {
+            let rowid: i64 = r.get(1)?;
+            let anchor_id: Option<String> = r.get(2)?;
+            // 新快照按消息 id 判定“当前”；旧快照没有 id，退回 rowid 比较
+            let is_current = match (anchor_id, current.as_ref()) {
+                (Some(anchor), Some((_, current_id))) => &anchor == current_id,
+                _ => rowid >= current_rowid,
+            };
             Ok(SnapshotInfo {
                 id: r.get(0)?,
-                tool_count: r.get(3)?,
-                created_at: r.get(4)?,
-                label: r.get(2)?,
-                is_current: r.get::<_, i64>(1)? >= current_rowid,
+                tool_count: r.get(4)?,
+                created_at: r.get(5)?,
+                label: r.get(3)?,
+                is_current,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1441,26 +1460,41 @@ fn restore_snapshot_conn(
     conversation_id: &str,
     snapshot_id: &str,
 ) -> Result<RestoreSnapshotResult, String> {
-    let (anchor, label, ledger_json): (i64, String, Option<String>) = conn
+    let (stored_rowid, anchor_message_id, label, ledger_json): (i64, Option<String>, String, Option<String>) = conn
         .query_row(
-            "SELECT msg_rowid, label, ledger_json FROM conversation_snapshots
+            "SELECT msg_rowid, anchor_message_id, label, ledger_json FROM conversation_snapshots
              WHERE id = ?1 AND conversation_id = ?2",
             params![snapshot_id, conversation_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(|e| format!("快照不存在或不属于该会话: {e}"))?;
-    // 锚点消息可能已被历史版本删除（新删除路径会同步清快照，这里兜住旧数据）：
-    // 恢复到一个不存在的 rowid 只会让可见起点悬空，失败关闭。
-    let anchor_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ?1 AND rowid = ?2)",
-            params![conversation_id, anchor],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if !anchor_exists {
-        return Err("快照锚点消息已删除，无法恢复到该历史点".into());
-    }
+    // 新快照按消息 id 定位锚点：messages 没有 AUTOINCREMENT，删除末端消息后
+    // rowid 会被复用，按 rowid 恢复可能落到一条完全不同的新消息上。
+    // 旧快照没有 id，退回 rowid 并校验它仍存在（新删除路径会同步清快照，这里兜旧数据）。
+    let anchor = match anchor_message_id {
+        Some(message_id) => conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE id = ?1 AND conversation_id = ?2",
+                params![message_id, conversation_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "快照锚点消息已删除，无法恢复到该历史点".to_string())?,
+        None => {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ?1 AND rowid = ?2)",
+                    params![conversation_id, stored_rowid],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !exists {
+                return Err("快照锚点消息已删除，无法恢复到该历史点".into());
+            }
+            stored_rowid
+        }
+    };
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     // 1. 归档：锚点之后的可见消息 → hidden（旧分支保留可回溯，不硬删）
     let archived = tx
@@ -15914,7 +15948,7 @@ mod snapshot_tests {
                  content TEXT NOT NULL DEFAULT '', queued INTEGER NOT NULL DEFAULT 0, agent_owned INTEGER NOT NULL DEFAULT 0,
                  hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
              CREATE TABLE conversation_snapshots (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
-                 msg_rowid INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', ledger_json TEXT,
+                 msg_rowid INTEGER NOT NULL, anchor_message_id TEXT, label TEXT NOT NULL DEFAULT '', ledger_json TEXT,
                  tool_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
              INSERT INTO conversations (id, ledger) VALUES ('c1', NULL);",
         )
@@ -15966,14 +16000,15 @@ mod snapshot_tests {
         insert_msg(&conn, "tool", "run_command\n输出", 3);
         let ledger = TaskLedger::from_tool_runs("修复构建", &[], "看日志", 0);
         save_conversation_snapshot(&conn, "c1", Some(&ledger), " 已读取构建日志，正在排查  ", 1).unwrap();
-        let (rowid, label, tc): (i64, String, i64) = conn
+        let (rowid, anchor_id, label, tc): (i64, Option<String>, String, i64) = conn
             .query_row(
-                "SELECT msg_rowid, label, tool_count FROM conversation_snapshots WHERE conversation_id = 'c1'",
+                "SELECT msg_rowid, anchor_message_id, label, tool_count FROM conversation_snapshots WHERE conversation_id = 'c1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(rowid, 3); // 锚点 = 可见消息最大 rowid（hidden 的 rowid 2 不参与）
+        assert_eq!(anchor_id.as_deref(), Some("m-3")); // 同时记录消息 id，恢复时防 rowid 复用
         assert_eq!(label, "已读取构建日志，正在排查"); // 摘要压缩空白
         assert_eq!(tc, 1);
         // 保留上限：超过 MAX_SNAPSHOTS 删最旧
@@ -16071,6 +16106,77 @@ mod snapshot_tests {
         assert_eq!(err, "快照锚点消息已删除，无法恢复到该历史点");
         assert_eq!(visible(&conn), 1, "失效快照不能改动任何消息");
         assert_eq!(ledger_of(&conn), None, "失效快照不能写回账本");
+    }
+
+    #[test]
+    fn restore_prefers_anchor_message_id_over_stale_rowid() {
+        let conn = setup();
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "A1", 2);
+        insert_msg(&conn, "tool", "A2", 3);
+        save_conversation_snapshot(&conn, "c1", None, "锚点", 1).unwrap();
+        let snap: String = conn
+            .query_row("SELECT id FROM conversation_snapshots", [], |r| r.get(0))
+            .unwrap();
+        // 模拟 rowid 漂移/复用：存储的 rowid 指向早得多的位置，消息 id 才是真锚点
+        conn.execute(
+            "UPDATE conversation_snapshots SET msg_rowid = 1 WHERE id = ?1",
+            params![snap],
+        )
+        .unwrap();
+        insert_msg(&conn, "assistant", "未来", 4);
+        insert_msg(&conn, "tool", "未来2", 5);
+
+        let res = restore_snapshot_conn(&conn, "c1", &snap).unwrap();
+
+        assert_eq!((res.archived, res.restored), (2, 0));
+        assert_eq!(visible(&conn), 3, "按消息 id 定位锚点，而不是被复用的 rowid");
+    }
+
+    #[test]
+    fn restore_rejects_id_anchor_when_rowid_was_reused() {
+        let conn = setup();
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "A1", 2);
+        insert_msg(&conn, "tool", "A2", 3);
+        save_conversation_snapshot(&conn, "c1", None, "锚点", 1).unwrap();
+        let snap: String = conn
+            .query_row("SELECT id FROM conversation_snapshots", [], |r| r.get(0))
+            .unwrap();
+        // 旧版本删除消息不清快照；再插入的新消息复用了被删锚点的 rowid
+        conn.execute("DELETE FROM messages WHERE id = 'm-3'", []).unwrap();
+        insert_msg(&conn, "assistant", "复用 rowid", 4);
+        let reused_rowid: i64 = conn
+            .query_row("SELECT rowid FROM messages WHERE id = 'm-4'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reused_rowid, 3, "前提：SQLite 复用了刚删除的最大 rowid");
+
+        let err = restore_snapshot_conn(&conn, "c1", &snap).unwrap_err();
+
+        assert_eq!(err, "快照锚点消息已删除，无法恢复到该历史点");
+        assert_eq!(visible(&conn), 3, "复用了 rowid 也不能把快照落到新消息上");
+    }
+
+    #[test]
+    fn restore_accepts_legacy_snapshot_without_anchor_id() {
+        let conn = setup();
+        insert_msg(&conn, "user", "任务", 1);
+        insert_msg(&conn, "assistant", "A1", 2);
+        insert_msg(&conn, "tool", "A2", 3);
+        // 迁移 087 之前保存的快照：只有 rowid，没有 anchor_message_id
+        conn.execute(
+            "INSERT INTO conversation_snapshots (id, conversation_id, msg_rowid, label, created_at)
+             VALUES ('s-legacy', 'c1', 3, '旧快照', 1)",
+            [],
+        )
+        .unwrap();
+        insert_msg(&conn, "assistant", "未来", 4);
+        insert_msg(&conn, "tool", "未来2", 5);
+
+        let res = restore_snapshot_conn(&conn, "c1", "s-legacy").unwrap();
+
+        assert_eq!((res.archived, res.restored), (2, 0));
+        assert_eq!(visible(&conn), 3, "旧快照继续按 rowid 恢复");
     }
 
     #[tokio::test]

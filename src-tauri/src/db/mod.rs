@@ -164,6 +164,7 @@ pub static MIGRATIONS: &[(i64, &str, &str)] = &[
     (84, "084_host_approval_revocation_tool", include_str!("../../migrations/084_host_approval_revocation_tool.sql")),
     (85, "085_usage_events", include_str!("../../migrations/085_usage_events.sql")),
     (86, "086_drop_api_details_members", include_str!("../../migrations/086_drop_api_details_members.sql")),
+    (87, "087_snapshot_anchor_message_id", include_str!("../../migrations/087_snapshot_anchor_message_id.sql")),
 ];
 
 pub(crate) fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

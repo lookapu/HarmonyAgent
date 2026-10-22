@@ -1210,10 +1210,18 @@ fn resolve_conversation_branch_anchor(
         }
         "checkpoint" => {
             let snapshot_id = effective_ref.ok_or_else(|| "检查点锚点缺少 anchor_ref".to_string())?;
-            let rowid: i64 = conn.query_row(
-                "SELECT msg_rowid FROM conversation_snapshots WHERE id=?1 AND conversation_id=?2",
-                params![snapshot_id, from_id], |row| row.get(0),
+            let (stored_rowid, anchor_message_id): (i64, Option<String>) = conn.query_row(
+                "SELECT msg_rowid, anchor_message_id FROM conversation_snapshots WHERE id=?1 AND conversation_id=?2",
+                params![snapshot_id, from_id], |row| Ok((row.get(0)?, row.get(1)?)),
             ).map_err(|_| "检查点不存在或不属于该会话".to_string())?;
+            // 新快照按消息 id 定位：rowid 可能因删除末端消息后被复用
+            let rowid = match anchor_message_id {
+                Some(mid) => conn.query_row(
+                    "SELECT rowid FROM messages WHERE id=?1 AND conversation_id=?2",
+                    params![mid, from_id], |row| row.get::<_, i64>(0),
+                ).map_err(|_| "检查点锚点消息已删除".to_string())?,
+                None => stored_rowid,
+            };
             let created_at = conn.query_row(
                 "SELECT created_at FROM messages WHERE conversation_id=?1 AND rowid=?2",
                 params![from_id, rowid], |row| row.get(0),
@@ -2117,6 +2125,34 @@ mod tests {
         assert!(build.0 <= 1004);
         assert!(commit.0 <= 1005);
         assert!(commit.1 >= build.1);
+    }
+
+    #[test]
+    fn checkpoint_anchor_prefers_message_id_over_reused_rowid() {
+        let conn = test_conn();
+        seed(&conn, "anchors-id", 20);
+        let checkpoint_rowid: i64 = conn.query_row(
+            "SELECT rowid FROM messages WHERE id='m-010'", [], |row| row.get(0),
+        ).unwrap();
+        // 存储的 msg_rowid=1 指向 m-001；按 id 解析应得到 m-010 的真实 rowid
+        conn.execute(
+            "INSERT INTO conversation_snapshots(id,conversation_id,msg_rowid,anchor_message_id,label,tool_count,created_at)
+             VALUES ('snap-id','anchors-id',1,'m-010','checkpoint',1,1)",
+            [],
+        ).unwrap();
+        let (_, rowid) = resolve_conversation_branch_anchor(&conn, "anchors-id", "checkpoint", Some("snap-id"))
+            .unwrap().unwrap();
+        assert_eq!(rowid, checkpoint_rowid, "按消息 id 解析，忽略存储的过期 rowid");
+
+        // 锚点消息已删除时不能退回过期 rowid
+        conn.execute(
+            "INSERT INTO conversation_snapshots(id,conversation_id,msg_rowid,anchor_message_id,label,tool_count,created_at)
+             VALUES ('snap-gone','anchors-id',3,'m-gone','checkpoint',1,1)",
+            [],
+        ).unwrap();
+        let err = resolve_conversation_branch_anchor(&conn, "anchors-id", "checkpoint", Some("snap-gone"))
+            .unwrap_err();
+        assert_eq!(err, "检查点锚点消息已删除");
     }
 
     fn insert_side_rows(conn: &rusqlite::Connection, conversation_id: &str) {

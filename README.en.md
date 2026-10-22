@@ -138,7 +138,7 @@ Built-in HTML server (default `http://<local-IP>:12345/`), usable directly from 
 │  Rust (Tauri 2 + hyper + rusqlite + tokio)          │
 │  - 322 Tauri IPC entry points · 64 service modules  │
 │  - agent/ 58 top-level modules · tools/ 35 files    │
-│  - SQLite + 86 migrations · full event sourcing for │
+│  - SQLite + 87 migrations · full event sourcing for │
 │    runs/steps/tools                                 │
 │  - Bundled runtimes: Node + JDK + Git (runtime/)    │
 └─────────────────────────────────────────────────────┘

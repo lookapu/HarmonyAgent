@@ -6,6 +6,38 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 77: snapshot anchors resolve by message id, so reused rowids no longer land on new messages (2026-10-22)
+
+Scenario: time-travel snapshots and branch checkpoints both recorded their anchor as
+`messages.rowid`. The `messages` table has no `AUTOINCREMENT`, so SQLite reuses the
+maximum rowid after the tail message is deleted: an old snapshot's rowid can be taken
+over by a completely different new message. Restoring such a snapshot treats the new
+message as the anchor and archives/restores the wrong branch, and branch checkpoints
+split the conversation at the wrong place. The deletion cleanup added in batch 72 only
+covers deletions performed by this app; it cannot eliminate rowid reuse itself.
+
+- Migration 087 adds `anchor_message_id` to `conversation_snapshots`: new snapshots
+  record both the rowid and the immutable message id;
+- Snapshot restore resolves the anchor by id first (validating conversation
+  ownership) and fails with an explicit error without writing anything when that
+  message is gone; checkpoints also prefer the id and report that the checkpoint
+  anchor message has been deleted when it is missing;
+- Snapshots created before the migration have a NULL `anchor_message_id` and keep
+  using the rowid for compatibility;
+- The snapshot list's "is current" check compares message ids as well, so a reused
+  rowid is not mistaken for the current point.
+
+### Verification
+
+3 Rust unit tests added (restore prefers the id, an id anchor whose rowid was reused is
+rejected, legacy snapshots stay rowid-compatible) plus 1 project unit test (checkpoint
+prefers the id, missing anchor reports an error). Rust full suite **1306/1306** (+4) ·
+frontend vitest **250/250** (unchanged, no frontend changes) · `tsc` / `eslint` /
+clippy baseline 57/57 · i18n keys unchanged (2298, union 2300) · all three i18n gates,
+21 gate self-tests, `check-docs`, and the production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**; database migration count reaches **87**.
+
+---
 ## Unreleased — Batch 76: time travel no longer leaves the future branch's view state behind (2026-10-22)
 
 Restoring an earlier snapshot archives every message after the anchor and writes the

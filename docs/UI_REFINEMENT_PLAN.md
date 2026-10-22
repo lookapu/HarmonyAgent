@@ -6905,3 +6905,52 @@ Rust 全量 **1302/1302**（不变，本批未改后端）· `tsc` / `eslint` / 
 - `refreshQueued` 失败时保留旧排队列表（与其他调用处一致），没有重试或显式提示。
 
 
+### 6.94 第七十七批：快照锚点的身份从 rowid 换成消息 id（2026-10-22）
+
+#### 6.94.1 起点：rowid 会被复用，快照会落到“另一个人的位置上”
+
+时间旅行快照与分支检查点都把 `messages.rowid` 当作锚点写入
+`conversation_snapshots.msg_rowid`。但 `messages` 表没有 `AUTOINCREMENT`：
+删除末端消息后，SQLite 会复用当前最大的 rowid。于是同一个 rowid 可以先指向被删的
+旧消息、再指向一条全新的消息：
+
+- 恢复旧快照时，实现直接按存储的 rowid 归档/恢复，错误的新消息被当成锚点，
+  整段分支的可见性都会错位；
+- 分支检查点按 `msg_rowid` 解析锚点，同样会从错误位置切开对话；
+- `list_snapshots` 的 `is_current` 用 `rowid >= current_rowid` 判断，复用后会把
+  旧快照误标成“当前点”。
+
+第七十二批的删除清理会在删除消息时同步清理指向它的快照，但那只覆盖“经由本应用
+删除”的路径；rowid 复用本身仍在，任何遗漏（旧数据、外部写入、异常中断）都会
+重新踩中。
+
+#### 6.94.2 修法：同时写 rowid 与不可变 id，读取优先按 id
+
+- 迁移 087 给 `conversation_snapshots` 增加 `anchor_message_id TEXT`；
+- 保存快照时查询最后一条可见消息的 `(rowid, id)`，两者一起写入；空会话写
+  `(0, NULL)`；
+- `restore_snapshot_conn`：`anchor_message_id` 非空时按 `(id, conversation_id)`
+  解析真实 rowid，消息已删除则返回“快照锚点消息已删除，无法恢复到该历史点”，
+  零写入；为 NULL 的旧快照继续按 rowid 兼容，并保留原有的存在性校验；
+- `resolve_conversation_branch_anchor` 的 `checkpoint` 分支同样优先按 id 解析，
+  缺失时报“检查点锚点消息已删除”，不退回过期 rowid；
+- `list_snapshots` 的 `is_current`：新快照比较消息 id，旧快照（id 为 NULL）才按
+  rowid 比较。
+
+#### 6.94.3 验证
+
+新增 4 条 Rust 单测：恢复优先按 id（存储 rowid 故意指向更早位置仍恢复到正确
+点）、id 锚点被复用时拒绝（删除末条后再插入，确认 SQLite 复用 rowid 后仍报错）、
+旧快照无 id 时按 rowid 兼容、检查点优先按 id 且锚点缺失报错。
+Rust 全量 **1306/1306**（+4）· 前端 vitest **250/250**（不变，本批未改前端）·
+`tsc` / `eslint` / clippy 基线 57/57 · i18n 键无变化（2298，并集 2300）·
+三道 i18n 门禁、21 道门禁自测、`check-docs` 与生产构建通过。
+
+#### 6.94.4 仍未覆盖
+
+- 迁移只新增列，不回填旧快照的 `anchor_message_id`：旧快照仍按 rowid 恢复；
+  若其锚点已被外部删除、rowid 又被复用，仍可能落到新消息上。回填需要按
+  `msg_rowid` 反查并确认语义（旧数据本身就可能已错位），未在本批擅自处理；
+- 分支血缘表 `conversation_branches` 另有锚点字段，不在本批处理范围；需要确认
+  它是否也存 rowid；
+- 恢复后的待确认项、执行轨迹面板回滚仍未处理（见 6.93.4）。
