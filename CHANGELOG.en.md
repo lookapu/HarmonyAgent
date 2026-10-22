@@ -6,6 +6,36 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 66: failed media tasks always release the composer (2026-10-22)
+
+Scenario: media generation emits `gen-start` and only then resolves the generation
+model, reads the provider, and builds the HTTP client. Those early failures returned
+straight through `?` without ever emitting `gen-error`; a watchdog abort or a panic
+left the task body with no chance to emit it either. The frontend clears `genStatus`
+only on `gen-done` / `gen-error`, so the "generating" state stayed forever and both
+Send and Generate stayed disabled until an app restart.
+
+- Terminal events are now centralized in the `generate_media` command: ordinary
+  failures, watchdog aborts, and panics all emit exactly one `gen-error` (success
+  still emits `gen-done` from the body);
+- Early errors such as no generation model, no active provider, or client setup
+  failure now release the status entry too;
+- Abort and panic use distinct messages; a `gen_task_join_error` log records the
+  cancelled flag and JoinError details for diagnosis;
+- The terminal event is emitted after the task is unregistered, so an immediate
+  retry after the error does not hit "a task is already running in this conversation";
+- An intentional stop still reports "Generation stopped", never a system failure.
+
+### Verification
+
+Two new Rust unit tests: abort and panic map to different user-facing messages; an
+aborted JoinHandle is indeed classified by `is_cancelled()` (rather than reported as
+a panic). Rust **1283/1283** (+2) · frontend vitest **239/239** unchanged ·
+`tsc` / `eslint` / clippy baseline green · i18n keys unchanged (**2297**, union
+**2299**) · i18n gates, all 21 gate self-tests, `check-docs` and the production build
+pass. Tool count unchanged: `TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 65: media generation can actually be stopped (2026-10-22)
 
 Scenario: while an image/video/audio generation is running, the user clicks "Stop" on

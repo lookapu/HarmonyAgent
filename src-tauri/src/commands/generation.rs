@@ -164,11 +164,50 @@ pub async fn generate_media(
     let _ = start_tx.send(());
     let result = join.await;
     registered.finish();
+    // 终态事件统一在命令层发送：主体在选模型/建客户端等早期的 `?` 返回、
+    // 以及被看门狗 abort / panic 时都没有机会发 gen-error。缺了它前端
+    // genStatus 永不释放，该会话的发送框会被一直锁住。
     match result {
-        Ok(r) => r,
-        Err(e) if e.is_cancelled() => Err("任务已被强制终止（看门狗判定异常卡死或停止未生效）。请重试。".to_string()),
-        Err(e) => Err(e.to_string()),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => {
+            emit_gen_error(&app, &conversation_id, message.clone());
+            Err(message)
+        }
+        Err(error) => {
+            let cancelled = error.is_cancelled();
+            crate::utils::logger::log_event(
+                "gen_task_join_error",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "cancelled": cancelled,
+                    "detail": error.to_string(),
+                }),
+            );
+            let message = terminal_gen_error_message(cancelled).to_string();
+            emit_gen_error(&app, &conversation_id, message.clone());
+            Err(message)
+        }
     }
+}
+
+/// 被看门狗 abort / 主体 panic 时的终态文案。两者对用户的意义不同：
+/// abort 是系统判定卡死（可重试），panic 是内部异常。
+fn terminal_gen_error_message(cancelled: bool) -> &'static str {
+    if cancelled {
+        "任务已被强制终止（看门狗判定异常卡死或停止未生效）。请重试。"
+    } else {
+        "生成任务异常终止，请重试"
+    }
+}
+
+fn emit_gen_error(app: &AppHandle, conversation_id: &str, error: String) {
+    let _ = app.emit(
+        "gen-error",
+        GenErrorEvent {
+            conversation_id: conversation_id.to_string(),
+            error,
+        },
+    );
 }
 
 /// 停止轮询间隔：图片/音频是同步请求、视频轮询每 10 秒才看一次停止标志。
@@ -283,15 +322,9 @@ async fn generate_media_body(
                 } else {
                     format!("{}生成失败: {e}", kind_label)
                 };
-                // 失败/停止都不会产出消息：清掉本次请求的独立目录，避免半成品堆积
+                // 失败/停止都不会产出消息：清掉本次请求的独立目录，避免半成品堆积。
+                // 终态 gen-error 由命令层统一发送（见 generate_media），这里只返回原因。
                 let _ = std::fs::remove_dir_all(&out_dir);
-                let _ = app.emit(
-                    "gen-error",
-                    GenErrorEvent {
-                        conversation_id: conversation_id.clone(),
-                        error: msg.clone(),
-                    },
-                );
                 return Err(msg);
             }
         }
@@ -299,19 +332,8 @@ async fn generate_media_body(
 
     // 5. 结果入库（assistant 消息，content 带媒体标记）+ gen-done
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let message = match persist_generation_message(&conn, &conversation_id, &model, kind, &files) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = app.emit(
-                "gen-error",
-                GenErrorEvent {
-                    conversation_id: conversation_id.clone(),
-                    error: e.clone(),
-                },
-            );
-            return Err(e);
-        }
-    };
+    // 入库失败不发消息，命令层统一补 gen-error；产物保留，便于排查/重试
+    let message = persist_generation_message(&conn, &conversation_id, &model, kind, &files)?;
     let _ = app.emit(
         "gen-done",
         GenDoneEvent {
@@ -489,5 +511,32 @@ mod stop_race_tests {
         let cancel = ChatCancel::default();
         let result = race_with_stop(&cancel, "conv", async { Ok::<_, String>("files") }).await;
         assert_eq!(result, Ok("files"));
+    }
+}
+
+#[cfg(test)]
+mod terminal_error_tests {
+    use super::*;
+
+    /// 看门狗 abort 与主体 panic 对用户的意义不同，不能共用一句「生成失败」。
+    #[test]
+    fn cancelled_and_panic_have_distinct_messages() {
+        assert!(terminal_gen_error_message(true).contains("强制终止"));
+        assert!(terminal_gen_error_message(false).contains("异常终止"));
+        assert_ne!(
+            terminal_gen_error_message(true),
+            terminal_gen_error_message(false)
+        );
+    }
+
+    /// 命令层依赖 `JoinError::is_cancelled` 区分两条路径；这里确认 abort
+    /// 确实产出 cancelled（而不是被当成 panic 报「内部异常」）。
+    #[tokio::test]
+    async fn aborted_task_is_classified_as_cancelled() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let error = handle.await.unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(!error.is_panic());
     }
 }
