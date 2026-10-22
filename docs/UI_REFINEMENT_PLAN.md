@@ -7196,4 +7196,55 @@ clippy 基线 57/57 · i18n 键无变化（2298，并集 2300）· 三道 i18n �
 - 工具结果消息本身随消息复制，但 `tool_runs` / 执行步骤表不复制，分支的
   「运行轨迹」面板仍从新任务开始记录。
 
+### 6.100 第八十三批：对话不再被「总超时 / 心跳掩盖 / 僵尸桶」静默杀死（2026-10-22）
+
+#### 6.100.1 起点：四道机制互相打架，长回答必死
+
+`CONVERSATION_FLOW_AUDIT_2026-10-22.md` 列了 8 个 P0 卡点，本批修前 5 个（止血批）：
+
+- **P0-1**：`net.rs` 的 `build_client` 给流式请求也套了 120s 总超时，长回答
+  （长代码/长思考/慢 Provider）被拦腰截断，上层退避重试从头重发、重复烧 token；
+- **P0-3**：心跳每 5s 刷新 `lastDeltaAt`，把「监管线程活着」和「模型在吐字」
+  混成一件事，前端看门狗只在监管线程死掉时才生效，最常见的「模型不回字、监管
+  线程正常」卡死场景前端完全不兜底；
+- **P0-5**：出错后心跳恢复桶但 `startedAt` 为 null，`sendUserMessage` 前置判定
+  `if (existing && !existing.error) return false` 命中，表现为「发不出也停不了」；
+- **A 组**：超时/停止路径 spread `emptyStreaming()` 后设 error，已生成正文瞬间
+  清空，用户看到的内容一闪而没。
+
+#### 6.100.2 修法
+
+- **流式客户端独立**：`build_stream_client` 不设总超时，改为 `connect_timeout(30s)`
+  + `read_timeout(300s)`；业务级停滞由 kernel 的 `silent_timeout(60s)` /
+  `reasoning_grace(180s)` 兜底，网络层不再抢先杀请求；`read_timeout` 选 300s 而非
+  60s，是因为纯思考宽限 180s + 静默判死 60s = 240s，网络层必须晚于业务层；
+- **心跳与产出解耦**：`StreamingState` 新增 `lastHeartbeatAt`，心跳只刷新它，
+  不再刷新 `lastDeltaAt`；看门狗拆成两条判据：心跳停滞（70s 无心跳，比内核 60s
+  略宽避免抢跑）→ 监管线程死，直接置错；产出停滞（4/8 分钟无增量）→ 模型卡住，
+  原有兜底；
+- **僵尸桶恢复**：心跳恢复错误桶时同步补写 `startedAt`（从事件 `started_at` 或
+  `Date.now()`），避免发送前置判定误拒；
+- **错误态保留正文**：超时/停止/invoke 失败路径不再 spread `emptyStreaming()`，
+  只传 `error` / `errorDetail`，`setBucket` 的 `isError` 分支保留 `prev` 的
+  content/reasoning；
+- **发送前置判定**：`if (existing && !existing.error && existing.startedAt) return false`
+  加了 `startedAt` 条件，僵尸桶（startedAt 为 null）允许重发。
+
+#### 6.100.3 验证
+
+新增 5 条 vitest：心跳不刷新产出时间戳、心跳补写 startedAt、错误态保留正文、
+僵尸桶允许重发、活跃桶拒绝重发。Rust 全量 **1320/1320**（本批无后端改动）·
+前端 vitest **257/257**（+5）· `tsc` / `eslint` / clippy 基线 57/57 · i18n 键
+无变化（2298，并集 2300）· 三道 i18n 门禁、21 道门禁自测、`check-docs` 与生产
+构建通过。
+
+#### 6.100.4 仍未覆盖（审计文档后续批次）
+
+- **P0-2**：重试阶梯全程静默，需发 `notice` 事件 + 总时限 + 阈值下调（批次 2）；
+- **P0-4**：审批/提问全屏遮罩改内联卡片 + Esc + 批量允许 + 角标（批次 3）；
+- **P0-6**：子代理派生绕过契约超时 + 不打心跳（批次 4）；
+- **P0-7**：上下文压缩全程静默（批次 2）；
+- **P0-8**：解析线程 10s 超时伪造 Done 丢弃工具调用（批次 4）；
+- **A 组剩余**：自动贴底 rAF 轮询失效、120ms 节流尾随 setTimeout 不补、停止后
+  工具卡残留 running 态。
 

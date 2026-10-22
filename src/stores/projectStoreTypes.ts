@@ -50,6 +50,9 @@ export interface StreamingState {
   startedAt: number | null
   /** 最近一次内容/思考增量时间戳（静默检测：长时间无增量时提示“模型思考中”） */
   lastDeltaAt: number | null
+  /** 最近一次心跳时间戳（仅由 chat-heartbeat 刷新；与 lastDeltaAt 解耦，
+   *  看门狗据此判断「监管线程是否还活着」，避免心跳把「有产出」的时间戳一并刷掉） */
+  lastHeartbeatAt: number | null
   /** 该会话运行中工具数（chat-tool-start +1 / chat-tool-done -1；看门狗巡检不误杀执行中任务） */
   toolRunning: number
 }

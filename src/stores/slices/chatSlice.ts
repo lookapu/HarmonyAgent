@@ -71,6 +71,9 @@ const STREAM_WATCHDOG_MS = 4 * 60 * 1000
 /** 已有内容/思考的桶放宽阈值：后端 60s 静默判死+主循环续写会刷新 lastDeltaAt，
  * 8 分钟无事件必为后端 join 永不返回（invoke 永不 reject），前端必须自行释放 */
 const STREAM_WATCHDOG_LONG_MS = 8 * 60 * 1000
+/** 心跳停滞阈值：监管线程每 5s 发一次心跳，超过该时长没收到视为监管线程死亡或任务已结束。
+ * 比内核 silent_timeout(60s) 略宽，避免与业务判死抢跑；一旦命中直接置错，不再等 4/8 分钟。 */
+const STREAM_WATCHDOG_HEARTBEAT_STALE_MS = 70 * 1000
 /** 定时器自身停顿超过该值通常意味着系统休眠或 WebView 被操作系统冻结。 */
 const WATCHDOG_RESUME_GAP_MS = 90 * 1000
 let lastWatchdogSweepAt = Date.now()
@@ -130,6 +133,7 @@ export const emptyStreaming = (): StreamingState => ({
   errorDetail: null,
   startedAt: null,
   lastDeltaAt: null,
+  lastHeartbeatAt: null,
   toolRunning: 0,
 })
 
@@ -193,7 +197,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           ...patch,
           conversationId: isError ? null : convId,
           startedAt: isError ? null : (patch.startedAt ?? prev?.startedAt ?? null),
-          lastDeltaAt: isError ? (prev?.lastDeltaAt ?? null) : Date.now(),
+          lastDeltaAt: isError
+            ? (prev?.lastDeltaAt ?? null)
+            : (patch.lastDeltaAt !== undefined ? patch.lastDeltaAt : Date.now()),
+          lastHeartbeatAt: patch.lastHeartbeatAt ?? prev?.lastHeartbeatAt ?? null,
         }
       }
       return {
@@ -322,7 +329,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         const streamings = Object.fromEntries(
           Object.entries(current.streamings).map(([id, bucket]) => [
             id,
-            bucket.error ? bucket : { ...bucket, lastDeltaAt: now },
+            bucket.error ? bucket : { ...bucket, lastDeltaAt: now, lastHeartbeatAt: now },
           ]),
         )
         return {
@@ -336,13 +343,17 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
     }
     for (const [convId, bucket] of Object.entries(s.streamings)) {
       if (bucket.error) continue
+      // 心跳停滞：监管线程已不再报告存活（任务结束但 chat-done 丢失，或后端真死）。
+      // 70s 阈值比内核 silent_timeout(60s) 略宽，一旦命中直接置错，不再等 4/8 分钟。
+      const heartbeatRef = bucket.lastHeartbeatAt ?? bucket.startedAt
+      const heartbeatStale = !!heartbeatRef && now - heartbeatRef > STREAM_WATCHDOG_HEARTBEAT_STALE_MS
       const ref = bucket.lastDeltaAt ?? bucket.startedAt
       if (!ref) continue
       // 已有内容/思考的桶：后端 60s 静默判死+续写会刷新 lastDeltaAt，8 分钟无事件
       // 必为后端 join 永不返回（invoke 永不 reject，前端永久转圈），须放宽阈值兜底释放；
       // 无内容桶保持 4 分钟（首字节前的卡死更早暴露）
       const threshold = bucket.content || bucket.reasoning ? STREAM_WATCHDOG_LONG_MS : STREAM_WATCHDOG_MS
-      if (now - ref < threshold) continue
+      if (!heartbeatStale && now - ref < threshold) continue
       // 工具执行中（含后台会话）：后端仍在工作
       if (bucket.toolRunning > 0) continue
       const isCurrent = s.currentConversation?.id === convId
@@ -357,8 +368,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const contextInfo = bucket.content || bucket.reasoning
         ? `已接收部分内容，但后端已 ${elapsedMin} 分钟无新事件`
         : `等待首字节响应已 ${elapsedMin} 分钟`
+      // 保留已生成正文/思考：错误卡与部分内容共存，避免超时瞬间清空用户已看到的内容。
       setBucket(convId, {
-        ...emptyStreaming(),
         error: '后端长时间无响应，已自动停止等待。请检查模型配置与网络后重试',
         errorDetail: {
           kind: 'timeout',
@@ -467,7 +478,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
   }).catch(() => {})
 
   // 后端监管线程每 5 秒发一次轻量心跳：刷新前端看门狗，并让 WebView 重载后
-  // 自动重建活跃桶继续接收后续增量/终态，不要求用户重启或手动“继续任务”。
+  // 自动重建活跃桶继续接收后续增量/终态，不要求用户重启或手动”继续任务”。
+  // 心跳只刷新 lastHeartbeatAt（监管线程活性），不刷新 lastDeltaAt（真实产出）；
+  // 看门狗据此拆成两条判据：心跳停滞 → 监管线程死；产出停滞 → 模型卡住。
+  // 同时补写 startedAt：错误恢复后 startedAt 为 null 会导致发送前置判定误拒。
   listen<{ conversation_id: string; run_id?: string; phase: string; started_at: number }>('chat-heartbeat', (event) => {
     const { conversation_id, run_id, started_at } = event.payload
     if (run_id && terminalRunIds.get(conversation_id) === run_id) return
@@ -478,7 +492,9 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         runId: run_id || bucket.runId,
         error: null,
         errorDetail: null,
-        lastDeltaAt: Date.now(),
+        lastHeartbeatAt: Date.now(),
+        lastDeltaAt: bucket.lastDeltaAt,
+        startedAt: bucket.startedAt ?? (started_at || Date.now()),
       })
       return
     }
@@ -487,6 +503,7 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       conversationId: conversation_id,
       runId: run_id || null,
       startedAt: started_at || Date.now(),
+      lastHeartbeatAt: Date.now(),
       lastDeltaAt: Date.now(),
     })
   }).catch(() => {})
@@ -1997,8 +2014,10 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
       const conv = get().currentConversation
       if (!conv) return false
       // 同会话流式中防重（error 态允许重发；跨会话放行——后端同项目任务排队机制生效）
+      // 活跃桶必须有 startedAt：心跳恢复后 startedAt 为 null 的僵尸桶允许重发，
+      // 避免「发不出也停不了」的静默吞动作（P0-5）。
       const existing = get().streamings[conv.id]
-      if (existing && !existing.error) return false
+      if (existing && !existing.error && existing.startedAt) return false
       // 开始发送消息性能追踪
       const sendTrace = startPerfTrace('sendMessage', { conv: conv.id.slice(0, 8) })
       sendTraces.set(conv.id, sendTrace)
@@ -2061,7 +2080,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         sendTrace.end()
         // 看门狗报错后用户可能已立即重试；旧 invoke 的延迟 reject 不得覆盖新任务桶。
         if (get().streamings[conv.id]?.startedAt === fresh.startedAt) {
-          setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+          // 保留已生成正文/思考：invoke 可能在流式中途 reject，已显示内容不应瞬间清空。
+          setBucket(conv.id, { error: String(e) })
           // invoke 可能在 user 入库前失败，也可能在入库后模型请求失败。以数据库为
           // 真源刷新最近一页，既移除幽灵乐观消息，也保留已真实入库的用户请求。
           const page = await listMessagesPage(conv.id).catch(() => null)
@@ -2111,8 +2131,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
           }
           if (Date.now() >= deadline) {
             clearInterval(timer)
+            // 保留已生成正文/思考：停止兜底触发时，用户可能已看到部分内容。
             setBucket(cid, {
-              ...emptyStreaming(),
               error: '停止未生效：后端任务已无响应。请查看应用日志定位卡点，或重启应用后重试',
               errorDetail: {
                 kind: 'timeout',
@@ -2391,7 +2411,8 @@ export const createChatSlice: StateCreator<ProjectState, [], [], ChatSlice> = (s
         const messages = await listMessages(conv.id).catch(() => null)
         if (messages && get().currentConversation?.id === conv.id) set({ messages, olderHasMore: false })
         if (get().streamings[conv.id]?.startedAt === fresh.startedAt) {
-          setBucket(conv.id, { ...emptyStreaming(), error: String(e) })
+          // regenerate 模式可能已删除旧回复；保留已生成的新内容（若有），错误卡与正文共存。
+          setBucket(conv.id, { error: String(e) })
         }
       }
     },

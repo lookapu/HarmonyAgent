@@ -6,6 +6,46 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 83: conversations no longer silently killed by total timeout / heartbeat masking / zombie buckets (2026-10-22)
+
+Scenario: long replies (long code / long thinking / slow providers) were cut short by
+reqwest's 120s total timeout, and the upper-layer retry re-sent from scratch, burning
+tokens twice; the heartbeat refreshed the "last output" timestamp every 5s, conflating
+"supervisor thread alive" with "model producing tokens", so the frontend watchdog only
+fired when the supervisor thread itself died — the most common "model silent, supervisor
+alive" hang had no frontend fallback at all; after an error the heartbeat revived the
+bucket but left `startedAt` null, so the send precondition silently refused the next
+send ("can't send, can't stop"); timeout/stop paths spread `emptyStreaming()` and
+wiped the content the user had already seen.
+
+**Fix**:
+- Streaming requests now use a dedicated client (`build_stream_client`) with no total
+  timeout — connect timeout 30s + read idle timeout 300s; business-level stall detection
+  stays with the kernel's silent_timeout(60s) / reasoning_grace(180s), so the network
+  layer no longer races the business logic;
+- Heartbeat decoupled from output: new `lastHeartbeatAt` field, heartbeat only refreshes
+  it, never `lastDeltaAt`; watchdog split into two criteria — heartbeat stale (70s with
+  no heartbeat) → supervisor thread dead, error immediately; output stale (4/8 min with
+  no delta) → model hung, existing fallback;
+- Zombie bucket revival: heartbeat now also restores `startedAt` when reviving an
+  errored bucket, so the send precondition no longer refuses legitimate retries;
+- Error state preserves content: timeout/stop/invoke-failure paths no longer spread
+  `emptyStreaming()`; already-generated content/reasoning coexist with the error card;
+- Send precondition: an active bucket must have `startedAt` set to count as a live task;
+  zombie buckets (startedAt null) allow resend, so the UI never silently swallows the
+  send action.
+
+### Verification
+
+5 frontend unit tests added (heartbeat does not refresh output timestamp, heartbeat
+restores startedAt, error state preserves content, zombie bucket allows resend, active
+bucket refuses resend). Rust full suite **1320/1320** (no backend changes) · frontend
+vitest **257/257** (+5) · `tsc` / `eslint` / clippy baseline 57/57 · i18n keys
+unchanged (2298, union 2300) · all three i18n gates, 21 gate self-tests,
+`check-docs`, and the production build pass. `TOOL_SPECS` to **204** (unchanged in
+this batch), and database migration count reaches **89** (unchanged).
+
+---
 ## Unreleased — Batch 82: checkpoint forks no longer lose task state (2026-10-22)
 
 Scenario: "fork" on the timeline creates a new conversation from a checkpoint by

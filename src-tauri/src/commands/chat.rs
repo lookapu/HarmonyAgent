@@ -8342,7 +8342,9 @@ async fn stream_chat_inner(
     let [system_prompt, system_prompt_core] = prompts;
 
     // 5. 请求 Provider + Agent 工具循环（最多 1 次初始回复 + 4 轮工具调用）
-    let client = crate::utils::net::build_client(use_proxy)?;
+    // 流式请求走专用客户端：不设总超时，避免长回答在 120s 被拦腰截断；
+    // 业务级停滞由 kernel 的 silent_timeout(60s) / reasoning_grace(180s) 兜底。
+    let client = crate::utils::net::build_stream_client(use_proxy)?;
     // MCP 连接管理器（MCP 工具转发用；mcp_hint 构建时已连接启用的服务器）
     let mcp = app.state::<crate::services::mcp_manager::McpManager>();
     let protocol = provider.protocol.clone();
@@ -10363,9 +10365,9 @@ async fn stream_once(
     let mut first_byte_logged = false;
     // 停滞治理与字节预算共用 KernelStreamGovernor（与 headless 同一状态机）：
     // wall-clock 停滞 deadline 独立于流读取 future 计时。即便 stream.next()
-    // 在某些挂起连接上不响应取消/不被唤醒（实测会导致内部 200ms 轮询与 reqwest
-    // 120s 总超时双双失效、8 分钟后才被看门狗杀），select! 也会在此 deadline
-    // 到达时强制跳出。每收到有效产出就重置；纯思考流最多顺延到首次思考 + 宽限期。
+    // 在某些挂起连接上不响应取消/不被唤醒（实测会导致内部 200ms 轮询失效、
+    // 8 分钟后才被看门狗杀），select! 也会在此 deadline 到达时强制跳出。
+    // 每收到有效产出就重置；纯思考流最多顺延到首次思考 + 宽限期。
     let mut governor = KernelStreamGovernor::new(
         KERNEL_STREAM_SILENT_TIMEOUT,
         KERNEL_STREAM_REASONING_GRACE,

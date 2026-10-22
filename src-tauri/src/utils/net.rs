@@ -71,20 +71,57 @@ pub fn restore_env_proxy(saved: &[(String, Option<String>)]) {
 
 /// 构建 reqwest 客户端；use_proxy=true 时挂载系统代理。
 /// 按 use_proxy 全局复用（连接池/TLS 会话跨对话保留，避免每次对话重复握手）。
+/// 总超时 120s 仅用于**非流式**请求（标题生成、记忆提取、健康检查等短请求）；
+/// 流式请求走 `build_stream_client`，不设总超时，避免长回答被拦腰截断。
 pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, String> {
-    use std::sync::Mutex;
-    static CACHE: Mutex<Option<(bool, reqwest::Client)>> = Mutex::new(None);
+    build_client_with(
+        use_proxy,
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)),
+        &CLIENT_CACHE,
+    )
+}
+
+/// 构建**流式**请求客户端：**不设总超时**。
+///
+/// 总超时按整段响应计时，长回答（长代码/长思考/慢 Provider）必被拦腰截断，
+/// 且上层退避重试会从头重发、重复消耗 token。改由业务层治理：
+/// kernel 的停滞看门狗在无有效产出 60s（纯思考最多 180s）时判死并走重放，
+/// 这里的 read_timeout（300s）只是网络层的最后兜底，必须晚于上述业务判死，
+/// 否则又会出现「网络层抢先杀、业务层没机会收尾」的老问题。
+pub fn build_stream_client(use_proxy: bool) -> Result<reqwest::Client, String> {
+    build_client_with(
+        use_proxy,
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(300)),
+        &STREAM_CLIENT_CACHE,
+    )
+}
+
+static CLIENT_CACHE: ClientCache = ClientCache::new();
+static STREAM_CLIENT_CACHE: ClientCache = ClientCache::new();
+
+struct ClientCache(std::sync::Mutex<Option<(bool, reqwest::Client)>>);
+impl ClientCache {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
+fn build_client_with(
+    use_proxy: bool,
+    builder: reqwest::ClientBuilder,
+    cache: &'static ClientCache,
+) -> Result<reqwest::Client, String> {
     {
-        let guard = CACHE.lock().unwrap();
+        let guard = cache.0.lock().unwrap();
         if let Some((k, c)) = guard.as_ref() {
             if *k == use_proxy {
                 return Ok(c.clone());
             }
         }
     }
-    // 总超时 120s：流式响应读取也受此约束；超时后由上层指数退避重试（最多 3 次），
-    // 避免 Provider 挂起时前端长时间停留在"正在输入…"
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120));
+    let mut builder = builder;
     if use_proxy {
         if let Some(proxy) = read_system_proxy() {
             // 本地回环必须绕过代理：本机服务（预览、局域网、本机 Provider）经代理一律连不上，
@@ -96,7 +133,7 @@ pub fn build_client(use_proxy: bool) -> Result<reqwest::Client, String> {
         }
     }
     let client = builder.build().map_err(|e| e.to_string())?;
-    let mut guard = CACHE.lock().unwrap();
+    let mut guard = cache.0.lock().unwrap();
     *guard = Some((use_proxy, client.clone()));
     Ok(client)
 }

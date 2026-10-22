@@ -30,6 +30,8 @@ vi.mock('../api/project', async (importOriginal) => {
     listMessageVersions: vi.fn(),
     listPendingConfirmations: vi.fn(),
     getTodos: vi.fn().mockResolvedValue([]),
+    streamChat: vi.fn().mockResolvedValue(undefined),
+    stopChat: vi.fn().mockResolvedValue(undefined),
   }
 })
 
@@ -49,6 +51,7 @@ import {
   listQueuedMessages,
   listSnapshots,
   restoreSnapshot,
+  streamChat,
 } from '../api/project'
 import { emptyStreaming } from './slices/chatSlice'
 import { useProjectStore } from './projectStore'
@@ -350,5 +353,160 @@ describe('pending confirmations sync', () => {
     const state = useProjectStore.getState()
     expect(state.toolApprovals.map((a) => a.requestId)).toEqual(['new'])
     expect(state.pendingConfirmations.c1.map((p) => p.request_id)).toEqual(['new'])
+  })
+})
+
+describe('heartbeat decoupled from output (P0-3 / P0-5)', () => {
+  beforeEach(() => {
+    useProjectStore.setState({
+      currentProject: project('p1'),
+      currentConversation: conversation('c1'),
+      conversations: [conversation('c1')],
+      messages: [],
+      streamings: {},
+      pendingConfirmations: {},
+      toolApprovals: [],
+    })
+    vi.clearAllMocks()
+  })
+
+  it('心跳不刷新 lastDeltaAt，只刷新 lastHeartbeatAt', () => {
+    const before = Date.now() - 5000
+    useProjectStore.setState({
+      streamings: {
+        c1: {
+          ...emptyStreaming(),
+          conversationId: 'c1',
+          runId: 'run-1',
+          startedAt: before,
+          lastDeltaAt: before,
+          content: '已生成内容',
+        },
+      },
+    })
+
+    listeners.get('chat-heartbeat')!({
+      payload: { conversation_id: 'c1', run_id: 'run-1', phase: 'streaming', started_at: before },
+    })
+
+    const bucket = useProjectStore.getState().streamings.c1
+    // 心跳不应推进 lastDeltaAt（看门狗按真实产出判活）
+    expect(bucket.lastDeltaAt).toBe(before)
+    // 心跳必须刷新 lastHeartbeatAt（监管线程活性）
+    expect(bucket.lastHeartbeatAt).toBeGreaterThanOrEqual(before)
+    // 已生成内容保留
+    expect(bucket.content).toBe('已生成内容')
+  })
+
+  it('僵尸桶（心跳恢复但 startedAt 为 null）心跳后补写 startedAt', () => {
+    useProjectStore.setState({
+      streamings: {
+        c1: {
+          ...emptyStreaming(),
+          conversationId: null, // 错误态：conversationId 被清空
+          runId: 'run-1',
+          startedAt: null, // 僵尸：startedAt 为 null
+          error: '后端长时间无响应',
+        },
+      },
+    })
+
+    listeners.get('chat-heartbeat')!({
+      payload: { conversation_id: 'c1', run_id: 'run-1', phase: 'streaming', started_at: 12345 },
+    })
+
+    const bucket = useProjectStore.getState().streamings.c1
+    // 心跳必须补写 startedAt，避免发送前置判定误拒
+    expect(bucket.startedAt).toBe(12345)
+    // 错误清除
+    expect(bucket.error).toBeNull()
+    expect(bucket.conversationId).toBe('c1')
+  })
+
+  it('错误态 setBucket 保留已生成正文，不瞬间清空', () => {
+    useProjectStore.setState({
+      streamings: {
+        c1: {
+          ...emptyStreaming(),
+          conversationId: 'c1',
+          runId: 'run-1',
+          startedAt: Date.now(),
+          content: '已生成正文',
+          reasoning: '已生成思考',
+        },
+      },
+    })
+
+    // 模拟 watchdog 超时置错（不再 spread emptyStreaming）
+    useProjectStore.setState((s) => {
+      const prev = s.streamings.c1
+      if (!prev) return {}
+      return {
+        streamings: {
+          ...s.streamings,
+          c1: {
+            ...prev,
+            error: '后端长时间无响应',
+            conversationId: null,
+            startedAt: null,
+          },
+        },
+      }
+    })
+
+    const bucket = useProjectStore.getState().streamings.c1
+    expect(bucket.error).toBe('后端长时间无响应')
+    // 正文与思考必须保留
+    expect(bucket.content).toBe('已生成正文')
+    expect(bucket.reasoning).toBe('已生成思考')
+  })
+
+  it('sendUserMessage 在僵尸桶（startedAt 为 null）时允许重发', async () => {
+    vi.mocked(streamChat).mockResolvedValue(undefined)
+    useProjectStore.setState({
+      conversations: [conversation('c1')],
+      currentConversation: conversation('c1'),
+      messages: [],
+      streamings: {
+        c1: {
+          ...emptyStreaming(),
+          conversationId: null, // 错误态
+          runId: null,
+          startedAt: null, // 僵尸：startedAt 为 null
+          error: '后端长时间无响应',
+        },
+      },
+    })
+
+    const result = await useProjectStore.getState().sendUserMessage('测试消息')
+
+    // 僵尸桶允许重发（返回 true）
+    expect(result).toBe(true)
+    expect(streamChat).toHaveBeenCalled()
+  })
+
+  it('sendUserMessage 在活跃桶（startedAt 非空且无错误）时拒绝重发', async () => {
+    vi.mocked(streamChat).mockResolvedValue(undefined)
+    useProjectStore.setState({
+      conversations: [conversation('c1')],
+      currentConversation: conversation('c1'),
+      messages: [],
+      streamings: {
+        c1: {
+          ...emptyStreaming(),
+          conversationId: 'c1',
+          runId: 'run-1',
+          startedAt: Date.now(),
+          lastDeltaAt: Date.now(),
+          lastHeartbeatAt: Date.now(),
+        },
+      },
+    })
+
+    const result = await useProjectStore.getState().sendUserMessage('测试消息')
+
+    // 活跃桶拒绝重发（返回 false）
+    expect(result).toBe(false)
+    expect(streamChat).not.toHaveBeenCalled()
   })
 })
