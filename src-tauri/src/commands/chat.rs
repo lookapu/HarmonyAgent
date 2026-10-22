@@ -1768,6 +1768,27 @@ fn message_by_id_conn(conn: &rusqlite::Connection, message_id: &str) -> Result<O
     .map_err(|e| e.to_string())
 }
 
+/// 项目锁空闲后，从同项目**其他会话**的排队消息里挑最早的一条（只读）。
+/// 队列消息可能是在别的会话占着项目锁时写入的：那一刻自动拉起会被
+/// `project_busy` 拒绝，若不在锁释放后接手，它就会一直滞留在排队条。
+fn next_queued_conversation_in_project_conn(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    exclude_conversation_id: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT m.conversation_id
+         FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         WHERE c.project_id = ?1 AND c.id <> ?2
+           AND m.role = 'user' AND m.queued = 1 AND m.hidden = 0
+         ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1",
+        rusqlite::params![project_id, exclude_conversation_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
 /// 最近一次发送的对话选项在 settings 里的键。
 fn chat_options_key(conversation_id: &str) -> String {
     format!("chat_options:{conversation_id}")
@@ -1823,9 +1844,9 @@ fn idle_queue_start_allowed(project_busy: bool, stopped: bool) -> bool {
 /// 启动复用 `stream_chat` 的认领/登记/看门狗壳：认领后随
 /// `chat-queued-consumed` 带完整消息，前端据此把只存在于排队条的提问补进
 /// 时间线；认领失败只会静默返回，消息仍在队列里可重试。
-fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_stop: bool) {
+fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_stop: bool) -> bool {
     if app.state::<TaskRegistry>().generation(conversation_id).is_some() {
-        return;
+        return false;
     }
     let stopped = respect_stop
         && app
@@ -1836,7 +1857,7 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
             .unwrap_or(true);
     let state = app.state::<DbState>();
     let (project_id, queued, options) = {
-        let Ok(conn) = state.0.lock() else { return };
+        let Ok(conn) = state.0.lock() else { return false };
         let project_id = match conn
             .query_row("SELECT project_id FROM conversations WHERE id = ?1", [conversation_id], |r| {
                 r.get::<_, String>(0)
@@ -1844,11 +1865,11 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
             .optional()
         {
             Ok(Some(project_id)) => project_id,
-            _ => return,
+            _ => return false,
         };
         let queued = match first_queued_message_conn(&conn, conversation_id) {
             Ok(Some(message)) => message,
-            _ => return,
+            _ => return false,
         };
         // 自动拉起没有前端请求可带参数：复用该会话最后一次发送的选项
         let options = load_chat_options_conn(&conn, conversation_id);
@@ -1861,7 +1882,7 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
         .map(|locks| locks.contains_key(&project_id))
         .unwrap_or(true);
     if !idle_queue_start_allowed(project_busy, stopped) {
-        return;
+        return false;
     }
     let app_for_task = app.clone();
     let conv_for_task = conversation_id.to_string();
@@ -1890,6 +1911,32 @@ fn spawn_queued_chat_if_idle(app: &AppHandle, conversation_id: &str, respect_sto
         )
         .await;
     });
+    true
+}
+
+/// 当前会话没有可接手的排队消息时，检查同项目其他会话：项目锁刚释放，
+/// 该由最早的排队消息接手，而不是让它一直等用户去点排队条。
+fn spawn_queued_chat_in_project_if_idle(app: &AppHandle, finished_conversation_id: &str) {
+    let state = app.state::<DbState>();
+    let candidate = {
+        let Ok(conn) = state.0.lock() else { return };
+        let project_id = match conn
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [finished_conversation_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        {
+            Ok(Some(project_id)) => project_id,
+            _ => return,
+        };
+        match next_queued_conversation_in_project_conn(&conn, &project_id, finished_conversation_id) {
+            Ok(Some(conversation_id)) => conversation_id,
+            _ => return,
+        }
+    };
+    spawn_queued_chat_if_idle(app, &candidate, true);
 }
 
 /// 排队消息补写 UserMessage 事件。
@@ -2430,7 +2477,8 @@ mod history_order_tests {
 mod queued_claim_tests {
     use super::{
         chat_options_key, claim_queued_message, first_queued_message_conn, idle_queue_start_allowed,
-        load_chat_options_conn, queue_batch_conn, save_chat_options_conn, ChatOptions,
+        load_chat_options_conn, next_queued_conversation_in_project_conn, queue_batch_conn,
+        save_chat_options_conn, ChatOptions,
     };
 
     fn setup() -> rusqlite::Connection {
@@ -2453,9 +2501,13 @@ mod queued_claim_tests {
                 hidden INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE conversations (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO conversations (id, updated_at) VALUES ('c1', 0);",
+            INSERT INTO conversations (id, project_id, updated_at) VALUES ('c1', 'p1', 0);",
         )
         .unwrap();
         conn
@@ -2612,6 +2664,43 @@ mod queued_claim_tests {
         .unwrap();
         assert!(load_chat_options_conn(&conn, "c1").is_none(), "损坏快照不得阻止自动拉起");
         assert!(load_chat_options_conn(&conn, "c2").is_none(), "选项按会话隔离");
+    }
+
+    #[test]
+    fn project_handoff_picks_earliest_other_conversation_queue() {
+        let conn = setup();
+        conn.execute_batch(
+            "INSERT INTO conversations (id, project_id) VALUES ('c2','p1'), ('c3','p1'), ('c4','p2');
+             INSERT INTO messages (id, conversation_id, role, content, queued, hidden, created_at)
+             VALUES ('own', 'c1', 'user', '本会话', 1, 0, 50),
+                    ('a',   'c2', 'assistant', '回复', 1, 0, 10),
+                    ('h',   'c2', 'user', '已归档', 1, 1, 20),
+                    ('b',   'c3', 'user', '项目内最早', 1, 0, 200),
+                    ('c',   'c4', 'user', '别的项目', 1, 0, 10);",
+        )
+        .unwrap();
+        assert_eq!(
+            next_queued_conversation_in_project_conn(&conn, "p1", "c1").unwrap().as_deref(),
+            Some("c3"),
+            "跳过本会话、助手行与隐藏行，取项目内最早"
+        );
+        assert_eq!(
+            next_queued_conversation_in_project_conn(&conn, "p2", "c1").unwrap().as_deref(),
+            Some("c4")
+        );
+        assert_eq!(next_queued_conversation_in_project_conn(&conn, "p3", "c1").unwrap(), None);
+    }
+
+    #[test]
+    fn project_handoff_ignores_finished_conversation_own_queue() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, queued, hidden, created_at)
+             VALUES ('own', 'c1', 'user', '本会话', 1, 0, 50)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(next_queued_conversation_in_project_conn(&conn, "p1", "c1").unwrap(), None);
     }
 }
 
@@ -3465,8 +3554,12 @@ pub async fn stream_chat(
     // 任务主体的最后一次 take_next_queued 之后仍可能有消息入队（前端在
     // chat-done 到达前还以为在流式）。注销后再查一次队首，存在就自动拉起；
     // 用户主动停止的队列不在此列（respect_stop 会看停止标志）。
-    if completed_cleanly {
-        spawn_queued_chat_if_idle(&app, &conversation_id, true);
+    // 本会话没有排队消息时，同项目其他会话的排队消息正被刚才的项目锁挡着，
+    // 由项目锁释放的这个时刻接手，避免它们滞留在排队条。
+    if completed_cleanly
+        && !spawn_queued_chat_if_idle(&app, &conversation_id, true)
+    {
+        spawn_queued_chat_in_project_if_idle(&app, &conversation_id);
     }
     if let Some(root) = idle_root {
         crate::agent::lsp_client::schedule_idle_semantic_indexing(

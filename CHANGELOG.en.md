@@ -6,6 +6,33 @@
 [简体中文](CHANGELOG.md) | English
 
 ---
+## Unreleased — Batch 63: take over other conversations' queued messages when the project lock frees (2026-10-22)
+
+Scenario: conversation A is running and the user switches to conversation B to send a
+message. B's message is queued, but the project lock is held by A, so auto-start does not
+jump ahead by design. Previously nothing picked B's message up when A finished cleanly;
+it waited until the user returned to B and clicked it again. Now A's teardown:
+
+- Checks whether this conversation has no queued message, then finds the earliest queued
+  message in another conversation of the same project (ordered by `(created_at, rowid)`)
+  and reuses the normal auto-start path (including B's last-sent conversation options);
+- Only takes over when this conversation's queue is also empty and the task finished
+  cleanly; failed or stopped teardowns do not scan, preserving "queued messages wait
+  after a failure" and "no auto-start after Stop";
+- Takes over one conversation at a time when several have queues, so they do not race
+  for the same project lock.
+
+### Verification
+
+Two new Rust unit tests: cross-conversation handoff picks the earliest while excluding
+the finished conversation, assistant rows, hidden rows, and other projects; only the
+finished conversation's own queue returns None (it cannot restart itself twice).
+Rust **1277/1277** (+2) · frontend vitest **239/239** unchanged · `tsc` / `eslint` /
+clippy baseline green · i18n keys unchanged (**2297**, union **2299**) · i18n gates,
+all 21 gate self-tests, `check-docs` and the production build pass. Tool count unchanged:
+`TOOL_SPECS` to **204**, migration count reaches **86**.
+
+---
 ## Unreleased — Batch 62: auto-start reuses the last conversation options (2026-10-22)
 
 The idle auto-start added in the previous batch has no frontend request to carry
